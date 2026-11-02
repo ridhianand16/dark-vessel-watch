@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Self-hosted streaming pipeline that detects suspicious ship behaviour from AIS data"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "clickhouse-connect>=0.8",
     "confluent-kafka>=2.16.1",
     "httpx>=0.28.1",
     "polars>=2.1.0",
