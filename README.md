@@ -6,7 +6,9 @@ It is a streaming pipeline that runs on a laptop without a network connection: R
 
 ## Where it stands
 
-The local stack runs: Redpanda, Redpanda Console, ClickHouse and PostGIS start in Compose and wait until each is healthy. Topic setup is checked at startup. The init job creates the topics and fails if any of them has the wrong partition count. Nothing flows through the pipeline yet.
+A day of Danish AIS traffic replays into Redpanda in event-time order, and every message lands in ClickHouse, including ones that are not valid JSON (they are stored with a reason code instead of being dropped). For each replay run, a per-partition check compares what the broker acknowledged with what is stored and shows that nothing was lost or duplicated. That holds when the sink is killed partway through a run or made to re-read the whole topic.
+
+Tracking, detections, Flink enrichment and the reference data are not built yet.
 
 ## Quickstart
 
@@ -14,11 +16,19 @@ Needs Docker with Compose v2, about 8 GB of free RAM, GNU make, and Python 3.12 
 
 ```sh
 cp .env.example .env
-make up      # installs git hooks, starts the stack, creates topics
-make ps      # every service should show as healthy
+make up        # git hooks, stack, topics, ClickHouse migrations, raw sink
+make ps        # every service healthy, raw-sink running
+make fetch     # download and verify the pinned AIS day (once, about 3 GB)
+
+make replay ARGS="--limit 10000 --speed 100"   # prints the run_id
+make reconcile RUN=<run_id>                     # per-partition produced vs stored
 ```
 
-Redpanda Console is at http://localhost:8080. `make down` stops the stack and keeps the data. `make nuke` stops it and deletes all data volumes.
+Redpanda Console is at http://localhost:8080. `make sink-logs` follows the sink (one line per batch). `make down` stops the stack and keeps the data. `make nuke` stops it and deletes all data volumes, including ClickHouse.
+
+Other targets: `make migrate` applies new files in `sql/clickhouse/` and does nothing when up to date. `make test` and `make typecheck` run pytest and `mypy --strict`.
+
+If the sink crashes, Docker restarts it and it re-reads from its last committed offset. `docker stop` and `docker kill` count as deliberate stops and leave it down; `make sink` starts it again.
 
 ## Architecture
 
@@ -30,4 +40,15 @@ _To be written. Each decision has an ADR in [docs/adr/](docs/adr/)._
 
 ## Numbers
 
-_To be written: throughput, end-to-end latency, alert precision and recall, and reconciliation results._
+Measured on 2026-11-02 on an Apple M1 laptop (8 GB RAM, macOS 26.5), Docker VM with 8 CPUs and 3.9 GB, using the 2026-10-28 DMA day.
+
+| What | Command | Result |
+|---|---|---|
+| Replay 10,000 rows at 100x | `make replay ARGS="--limit 10000 --speed 100"` | 3.1 s, 10,000 acknowledged |
+| Replay 200,000 rows at 100x | `make replay ARGS="--limit 200000 --speed 100"` | 13.5 s and 13.8 s (two runs), 200,000 acknowledged each. Paced by the 100x schedule, not a throughput limit |
+| Raw sink, re-reading a backlog | `rpk group seek dvw-raw-sink --to start`, then start the sink | 129,811 messages in 3.5 s, about 37,000 rows/s. 50,000-row inserts take 240 to 300 ms, offset commits 1 to 6 ms |
+| Raw sink memory | `docker stats` after the backlog | 138 MiB of its 384 MiB limit |
+| Zero loss, whole topic | `count() FINAL` vs topic high watermarks | 529,812 messages on `ais.raw`, 529,812 rows, every offset present once |
+| Zero loss with the sink killed mid-run | `docker kill` at 66,093 of 200,000 stored, then restart | `make reconcile` OK: 200,000 produced = 200,000 stored |
+
+End-to-end latency, alert precision and recall, and full-day throughput are still to be measured.

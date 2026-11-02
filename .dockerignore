@@ -1,0 +1,9 @@
+# Allow-list: the build context is the repo root, which also holds multi-GB data/.
+*
+!pyproject.toml
+!uv.lock
+!.python-version
+!common/
+!sinks/
+**/__pycache__
+**/tests

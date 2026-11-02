@@ -3,7 +3,8 @@
 # Run from the repo root via the Makefile (it passes --env-file .env).
 # Memory budget (mem_limit caps, not reservations):
 #   redpanda 1.5g (1G Seastar heap + overhead) | console 256m
-#   clickhouse 2g | postgis 512m               | total ≈ 4.25g ceiling
+#   clickhouse 2g | postgis 512m               | raw-sink 384m
+#   total ≈ 4.6g ceiling
 # Every image tag is pinned; never use :latest (reproducibility).
 
 name: dvw
@@ -137,6 +138,32 @@ services:
       timeout: 3s
       retries: 30
       start_period: 20s
+
+  # ais.raw -> dvw.ais_raw (sinks/clickhouse_raw, docs/adr/0003). Commits offsets only
+  # after the insert succeeds; redeliveries collapse on (kafka_partition, kafka_offset).
+  # Needs the table: run `make migrate` first (`make up` does).
+  raw-sink:
+    build:
+      context: ../..
+      dockerfile: sinks/clickhouse_raw/Dockerfile
+    image: dvw-raw-sink:0.1.0
+    container_name: dvw-raw-sink
+    depends_on:
+      init-topics:
+        condition: service_completed_successfully
+      clickhouse:
+        condition: service_healthy
+    environment:
+      REDPANDA_BROKERS: redpanda:9092   # internal listener
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: "8123"
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:?set in .env}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set in .env}
+    # 50k-row batches plus a 16 MB librdkafka prefetch buffer; see README for measured usage.
+    mem_limit: 384m
+    # Long enough to insert and commit an in-flight batch, including a retry or two.
+    stop_grace_period: 30s
+    restart: unless-stopped
 
 volumes:
   redpanda-data:
