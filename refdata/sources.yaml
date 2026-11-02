@@ -1,0 +1,61 @@
+# Data sources fetched by refdata/fetch.py.
+#
+# Fields:
+#   name             human-readable name
+#   url              download URL; {day} is replaced with YYYY-MM-DD where used
+#   version          source version. For daily data, the pinned day the hash belongs to.
+#   expected_sha256  SHA-256 of the downloaded file. Empty: fetch.py prints the
+#                    computed hash so it can be committed here.
+#   licence          licence / terms of use
+#   attribution      required attribution text
+#
+# Only dma_ais is implemented (M1). The rest are placeholders for M3 so the
+# schema is visible; their downloads sit behind forms / terms pages.
+
+sources:
+  dma_ais:
+    name: Danish AIS daily CSV (DMA, operated by Danish Emergency Management Agency)
+    # Index: http://aisdata.ais.dk (S3 website endpoint, HTTP only).
+    # Days from 2025-02-27 onward sit at the bucket root as aisdk-YYYY-MM-DD.zip;
+    # older days are archived under YYYY/ and would need a different template.
+    # Path-style S3 URL used for HTTPS (the website endpoint resets TLS).
+    url: https://s3.eu-central-1.amazonaws.com/aisdata.ais.dk/aisdk-{day}.zip
+    version: "2026-10-28"
+    expected_sha256: ""
+    licence: >-
+      Free re-use under the Danish act on re-use of public sector information
+      (act no. 596 of 24 June 2005). Provided as-is, no warranty. See DMA
+      "Conditions for the use of data" (dma.dk, AIS data).
+    attribution: Contains AIS data from the Danish Maritime Authority.
+
+  # eez:
+  #   name: Marine Regions World EEZ polygons
+  #   url: ""                # behind download form; place zip in data/refdata/incoming/
+  #   version: ""            # e.g. "v12"
+  #   expected_sha256: ""
+  #   licence: CC BY-NC-SA 4.0
+  #   attribution: "Flanders Marine Institute (VLIZ), Maritime Boundaries Geodatabase"
+
+  # eez_boundaries:
+  #   name: Marine Regions World EEZ boundary lines
+  #   url: ""
+  #   version: ""
+  #   expected_sha256: ""
+  #   licence: CC BY-NC-SA 4.0
+  #   attribution: "Flanders Marine Institute (VLIZ), Maritime Boundaries Geodatabase"
+
+  # wdpa_marine:
+  #   name: World Database on Protected Areas (marine subset)
+  #   url: ""                # behind terms page; place download in data/refdata/incoming/
+  #   version: ""            # e.g. "Nov2026"
+  #   expected_sha256: ""
+  #   licence: WDPA terms of use (non-commercial, no redistribution)
+  #   attribution: "UNEP-WCMC and IUCN, Protected Planet"
+
+  # wpi:
+  #   name: World Port Index (Pub 150)
+  #   url: ""
+  #   version: ""
+  #   expected_sha256: ""
+  #   licence: US Government public domain
+  #   attribution: "National Geospatial-Intelligence Agency, World Port Index"
