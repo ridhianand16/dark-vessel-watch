@@ -1,0 +1,26 @@
+# Data (never committed, see docs/SETUP.md licensing note)
+data/
+*.zip
+*.gz
+*.tgz
+*.tar
+*.7z
+*.csv
+*.shp
+*.gpkg
+
+# Secrets
+.env
+
+# Build / env
+.venv/
+target/
+__pycache__/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

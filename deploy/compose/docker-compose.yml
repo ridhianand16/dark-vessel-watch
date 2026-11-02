@@ -1,0 +1,144 @@
+# Dark Vessel Watch – local stack (M0)
+#
+# Run from the repo root via the Makefile (it passes --env-file .env).
+# Memory budget (mem_limit caps, not reservations):
+#   redpanda 1.5g (1G Seastar heap + overhead) | console 256m
+#   clickhouse 2g | postgis 512m               | total ≈ 4.25g ceiling
+# Every image tag is pinned; never use :latest (reproducibility).
+
+name: dvw
+
+services:
+  redpanda:
+    image: redpandadata/redpanda:v26.2.6
+    container_name: dvw-redpanda
+    # Advertised-listener split
+    # -------------------------
+    # A Kafka client connects to any bootstrap address, fetches cluster
+    # metadata, and then reconnects to whatever address the broker *advertises*.
+    # One address cannot work for both sides: "redpanda:9092" only resolves
+    # inside the Docker network, and "localhost:19092" inside a container
+    # points at the container itself. So we bind two named listeners:
+    #   internal  0.0.0.0:9092  advertised as redpanda:9092   -> other containers
+    #   external  0.0.0.0:19092 advertised as localhost:19092 -> host processes
+    #                                                           (replayer, Faust, rpk on host)
+    # The broker returns the advertised address of the listener the client
+    # connected through, so each side only ever sees an address it can reach.
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=1G
+      - --overprovisioned
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+      - --rpc-addr=0.0.0.0:33145
+      - --advertise-rpc-addr=redpanda:33145
+      - --default-log-level=warn
+    ports:
+      - "19092:19092"   # Kafka API, external listener
+      - "19644:9644"    # Admin API (rpk cluster ops from host)
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    mem_limit: 1536m
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health --exit-when-healthy --watch=false | grep -qE 'Healthy:.+true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  init-topics:
+    image: redpandadata/redpanda:v26.2.6
+    container_name: dvw-init-topics
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-euo", "pipefail", "-c"]
+    # --if-not-exists makes creation idempotent. We then assert the partition
+    # count, because "already exists" would silently accept a topic that was
+    # created earlier with the wrong layout (keys are MMSI; partitioning matters).
+    command:
+      - |
+        export RPK_BROKERS=redpanda:9092
+        TOPICS="ais.raw ais.enriched ais.tracks ais.alerts ais.dlq"
+        rpk topic create $$TOPICS --partitions 6 --replicas 1 --if-not-exists
+        for t in $$TOPICS; do
+          n=$$(rpk topic describe "$$t" --print-partitions | tail -n +2 | grep -c .)
+          if [ "$$n" -ne 6 ]; then
+            echo "ERROR: $$t has $$n partitions, expected 6" >&2; exit 1
+          fi
+        done
+        rpk topic list
+    restart: "no"
+
+  console:
+    image: redpandadata/console:v3.13.1
+    container_name: dvw-console
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+      REDPANDA_ADMINAPI_ENABLED: "true"
+      REDPANDA_ADMINAPI_URLS: http://redpanda:9644
+    ports:
+      - "8080:8080"
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/admin/health >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8.14.39
+    container_name: dvw-clickhouse
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:?set in .env}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set in .env}
+      CLICKHOUSE_DB: dvw
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "8123:8123"   # HTTP
+      - "9000:9000"   # native TCP
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    mem_limit: 2g
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8123/ping | grep -q Ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  postgis:
+    image: postgis/postgis:16-3.4
+    platform: linux/amd64  # postgis/postgis publishes amd64 only; runs under Rosetta on Apple Silicon
+    container_name: dvw-postgis
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set in .env}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgis-data:/var/lib/postgresql/data
+      # Mounted as a single file so the image's own 10_postgis.sh is not hidden.
+      # initdb scripts only run when the data volume is empty.
+      - ./postgis-init/20-extensions.sql:/docker-entrypoint-initdb.d/20-extensions.sql:ro
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB} -h 127.0.0.1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+
+volumes:
+  redpanda-data:
+  clickhouse-data:
+  postgis-data:
