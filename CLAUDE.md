@@ -48,4 +48,4 @@ ais.raw, ais.enriched, ais.tracks, ais.alerts, ais.dlq
 
 ## Current milestone
 
-M0 (update as we go)
+M1
