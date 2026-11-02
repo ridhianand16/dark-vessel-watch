@@ -1,0 +1,52 @@
+#!/bin/sh
+# commit-msg hook: strip tool trailers, then enforce subject format and wording.
+# Enable with: make hooks
+
+set -eu
+
+msg_file=$1
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+
+# Drop everything from the scissors line on (git commit -v), then strip
+# attribution trailers and trailing blank lines.
+sed '/^# -\{24\} >8 -\{24\}$/,$d' "$msg_file" \
+  | grep -viE '^(co-authored-by:|claude-session:|generated with)' \
+  | awk '{ lines[NR] = $0 } END {
+      n = NR
+      while (n > 0 && lines[n] ~ /^[[:space:]]*$/) n--
+      for (i = 1; i <= n; i++) print lines[i]
+    }' > "$tmp" || true
+cat "$tmp" > "$msg_file"
+
+# Check the message as git will record it: no comment lines.
+body=$(grep -v '^#' "$msg_file" || true)
+subject=$(printf '%s\n' "$body" | sed -n '/[^[:space:]]/{p;q;}')
+
+reject() {
+  echo "commit-msg: $1" >&2
+  exit 1
+}
+
+case $subject in
+  "Merge "*) ;;
+  *)
+    printf '%s\n' "$subject" \
+      | grep -qE '^(feat|fix|refactor|perf|test|docs|build|chore)\([a-z0-9-]+\): [a-z].{0,70}[^.]$' \
+      || reject "subject must match 'type(scope): lowercase summary' (max ~80 chars, no trailing period): $subject"
+    ;;
+esac
+
+word=$(printf '%s\n' "$body" | grep -oiE \
+  'milestone|(^|[^[:alnum:]_])m[0-9]([^[:alnum:]_]|$)|step [0-9]|as requested|comprehensive|robust|seamless|leverage' \
+  | head -n 1 | sed 's/^[^[:alnum:]]*//; s/[^[:alnum:]]*$//' || true)
+[ -z "$word" ] || reject "message contains banned wording: '$word'"
+
+# Emoji: any 4-byte UTF-8 sequence (lead byte F0-F4) or the 3-byte
+# symbol/dingbat blocks U+2600-U+27BF (E2 98-9F xx) and U+2B00-U+2BFF (E2 AC-AF xx).
+emoji_re=$(printf '[\360-\364]|\342[\230-\237]|\342[\254-\257]')
+if printf '%s\n' "$body" | LC_ALL=C grep -qE "$emoji_re"; then
+  reject "message contains an emoji"
+fi
+
+exit 0
