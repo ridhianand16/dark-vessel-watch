@@ -1,6 +1,6 @@
 COMPOSE := docker compose -f deploy/compose/docker-compose.yml --env-file .env
 
-.PHONY: up down nuke topics ps fetch
+.PHONY: hooks up down nuke topics ps fetch
 
 .env:
 	@echo "Missing .env. Run: cp .env.example .env" >&2; exit 1
@@ -12,10 +12,15 @@ env_get = $(shell sed -n 's/^$(1)=//p' .env 2>/dev/null)
 AIS_DAY ?= $(call env_get,AIS_DAY)
 AIS_DATA_DIR ?= $(or $(call env_get,AIS_DATA_DIR),./data/ais)
 
+## Point git at the repo's hooks (commit-msg format and trailer stripping).
+hooks:
+	git config core.hooksPath .githooks
+	chmod +x .githooks/*
+
 ## Start the stack, wait until every service is healthy, then create topics.
 ## init-topics is run separately: `up --wait` treats a one-shot container that
 ## exits (even with 0) as a failure.
-up: .env
+up: hooks .env
 	$(COMPOSE) up -d --wait --wait-timeout 180 $(SERVICES)
 	$(COMPOSE) run --rm init-topics
 
