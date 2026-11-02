@@ -1,6 +1,6 @@
 COMPOSE := docker compose -f deploy/compose/docker-compose.yml --env-file .env
 
-.PHONY: hooks up down nuke topics ps fetch replay migrate test typecheck
+.PHONY: hooks up down nuke topics ps fetch replay migrate sink sink-logs reconcile test typecheck
 
 .env:
 	@echo "Missing .env. Run: cp .env.example .env" >&2; exit 1
@@ -24,6 +24,8 @@ hooks:
 up: hooks .env
 	$(COMPOSE) up -d --wait --wait-timeout 180 $(SERVICES)
 	$(COMPOSE) run --rm init-topics
+	$(MAKE) migrate
+	$(COMPOSE) up -d --build raw-sink
 
 ## Stop and remove containers; named volumes (topic data, DBs) are kept.
 down: .env
@@ -50,11 +52,18 @@ fetch: .env
 replay: .env
 	uv run python -m ingest.replayer --file $(AIS_CSV) $(ARGS)
 
+## (Re)build and start the ais.raw -> ClickHouse sink.
+sink: .env
+	$(COMPOSE) up -d --build raw-sink
+
+sink-logs: .env
+	$(COMPOSE) logs -f raw-sink
+
 ## Apply new ClickHouse migrations in sql/clickhouse/ (no-op when up to date).
 migrate: .env
 	uv run python -m sql.migrate
 
-PY_DIRS := common ingest refdata sql
+PY_DIRS := common ingest refdata sql sinks
 
 test:
 	uv run pytest -q $(PY_DIRS)
