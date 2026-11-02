@@ -63,7 +63,14 @@ sink-logs: .env
 migrate: .env
 	uv run python -m sql.migrate
 
-PY_DIRS := common ingest refdata sql sinks
+## Check one replay run against ClickHouse, per partition. Waits up to WAIT seconds
+## while rows are only missing (sink catching up). make reconcile RUN=<run_id>
+WAIT ?= 30
+reconcile: .env
+	@test -n "$(RUN)" || { echo "usage: make reconcile RUN=<run_id>  (see data/runs/)" >&2; exit 2; }
+	uv run python -m reconcile.run_check $(RUN) --wait $(WAIT)
+
+PY_DIRS := common ingest refdata sql sinks reconcile
 
 test:
 	uv run pytest -q $(PY_DIRS)
