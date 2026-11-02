@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
-import os
 import sys
 import time
 import uuid
@@ -22,29 +21,14 @@ from typing import Any
 
 from confluent_kafka import Producer
 
+from common.env import REPO_ROOT, dotenv_value
 from ingest.replayer.delivery import DeliveryTracker
 from ingest.replayer.pacing import MAX_SPEED, MIN_SPEED, Pacer
 from ingest.replayer.record import build_message
 from ingest.replayer.source import SourceError, read_layout, sorted_lines
 
 TOPIC = "ais.raw"
-REPO_ROOT = Path(__file__).resolve().parents[2]
 FLUSH_TIMEOUT_S = 120.0
-
-
-def dotenv_value(key: str, path: Path = REPO_ROOT / ".env") -> str | None:
-    """Environment first, then .env. Minimal KEY=VALUE reader; no python-dotenv dependency."""
-    if key in os.environ:
-        return os.environ[key]
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
-        return None
-    for line in lines:
-        k, sep, v = line.partition("=")
-        if sep and k.strip() == key:
-            return v.strip().strip('"').strip("'")
-    return None
 
 
 def speed_arg(s: str) -> float:
