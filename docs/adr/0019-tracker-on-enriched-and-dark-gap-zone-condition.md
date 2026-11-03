@@ -107,3 +107,24 @@ are behind the bookmark either way.
   what the tracker's checks can see: an exact repeat, not a near-repeat Flink missed.
 - The tracker now depends on the Flink job for input. Running it without Flink needs
   `TRACKER_INPUT_TOPIC=ais.raw`, and then raises no DARK_GAP.
+
+## Note (2026-11-04): vessel state version 2 to 3, and upgrades
+
+Adding the zone tags raised the vessel state from version 2 to 3. What that means for
+deploying it:
+
+- **Safe with one tracker.** There is one tracker process (one Faust worker, one agent).
+  Stopping the version 2 tracker and starting this one is safe: `VesselState.from_dict`
+  reads version 1 and 2 states and fills `zone` with None, and every state it writes is
+  version 3. The changelog topic can hold both versions for a while; compaction keeps
+  the latest per vessel, and either one reads.
+- **Until a vessel reports again**, an upgraded state has no zone tags, so a gap that
+  starts before its next accepted fix raises no DARK_GAP (no tags means near nothing).
+- **A new run_id resets the state.** The first fix of a vessel in a new replay run
+  starts a fresh track from that fix (`restarted`), with that fix's tags. So any old
+  state matters only for the rest of the run that was in progress during the upgrade.
+- **Mixed versions are not supported.** A version 2 tracker raises on a version 3 state
+  (`unsupported vessel state version`) and exits with 70, and Docker restarts it into
+  the same error. That rules out rolling upgrades with old and new workers side by
+  side, and a rollback that keeps the state. Rolling back needs the tracker's state
+  cleared (its changelog topic and the tracker-data volume) or a new run.
