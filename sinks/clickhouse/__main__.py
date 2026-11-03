@@ -9,7 +9,8 @@ from confluent_kafka import Consumer
 
 from common.clickhouse import client_from_env
 from common.env import setting
-from sinks.clickhouse.sink import ClickHouseSink, consumer_config
+from common.kafka_batch import consumer_config
+from sinks.clickhouse.sink import ClickHouseSink
 from sinks.clickhouse.specs import SPECS
 
 
@@ -26,7 +27,7 @@ def main(argv: list[str] | None = None) -> int:
     if not client.command(f"EXISTS TABLE {spec.table}"):
         log.error("%s does not exist. Run: make migrate", spec.table)
         return 1
-    sink = ClickHouseSink(spec, Consumer(consumer_config(spec, brokers)), client)
+    sink = ClickHouseSink(spec, Consumer(consumer_config(spec.group_id, brokers)), client)
     signal.signal(signal.SIGTERM, sink.request_stop)
     signal.signal(signal.SIGINT, sink.request_stop)
     log.info("consuming %s as group %s from %s into %s", spec.topic, spec.group_id, brokers, spec.table)
