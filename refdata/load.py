@@ -13,11 +13,15 @@ One transaction:
     4. write the metric copies (zones_25832, eez_boundaries_25832): densify the
        repaired rows, transform to EPSG:25832, and run the same checks on them
        (ADR 0013);
-    5. drop the live tables and move the staging ones in, then record the load in
+    5. cut the metric copies into pieces of at most 256 vertices for the Flink
+       enrichment job (zone_pieces_25832, eez_boundary_pieces_25832), run the same
+       checks on them, and check each zone's pieces add up to its area and each
+       boundary's to its length (ADR 0017);
+    6. drop the live tables and move the staging ones in, then record the load in
        refdata_packages as the only active package.
 
 Any failure rolls everything back and the live zones stay as they were. Readers are
-only blocked from step 5 to the commit. Reloading the same package replaces the rows
+only blocked from step 6 to the commit. Reloading the same package replaces the rows
 with identical ones and adds a refdata_packages row.
 """
 
@@ -27,7 +31,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import psycopg
 from psycopg import sql
@@ -44,7 +48,25 @@ LIVE = "public"
 SRID = 4326
 METRIC_SRID = 25832  # ETRS89 / UTM zone 32N, metres
 METRIC_TABLES = {table: f"{table}_{METRIC_SRID}" for table in TABLES}
-ALL_TABLES = (*TABLES, *METRIC_TABLES.values())  # everything the swap replaces
+
+
+class Pieces(NamedTuple):
+    table: str
+    key: str  # ties a piece to its source row
+    columns: tuple[str, ...]  # copied from the source row
+
+
+# Metric copy -> its pieces (ADR 0017).
+PIECE_TABLES = {
+    "zones_25832": Pieces("zone_pieces_25832", "zone_id", ("kind", "package_version")),
+    "eez_boundaries_25832": Pieces("eez_boundary_pieces_25832", "id", ("package_version",)),
+}
+ALL_TABLES = (  # everything the swap replaces
+    *TABLES,
+    *METRIC_TABLES.values(),
+    *(p.table for p in PIECE_TABLES.values()),
+)
+
 # Densify before the metric transform. Source segments run to ~50 km; transformed as-is
 # they become straight lines in UTM and drift metres off the path they had in 4326. At
 # these lengths the drift is centimetres (ADR 0013). Boundary lines are densified along
@@ -55,6 +77,12 @@ DENSIFY = {
     "zones": sql.SQL("ST_Segmentize(geom, 0.05)"),  # degrees: ~5.5 km of latitude
     "eez_boundaries": sql.SQL("ST_Segmentize(geom::geography, 5000)::geometry"),  # metres
 }
+# Vertices per piece. A lookup scans every vertex of the few pieces whose box holds the
+# point; fewer vertices means more pieces and a deeper tree (ADR 0017).
+PIECE_VERTICES = 256
+# Pieces must add up to their zone's area and their boundary's length. Cutting adds
+# vertices on the cut lines, rounded to double precision: nanometres.
+COVER_TOLERANCE = 1e-9  # relative
 LOCK_TIMEOUT = "5s"  # give up on the swap rather than queue readers behind a long query
 
 
@@ -122,6 +150,56 @@ def _insert_metric_copy(conn: psycopg.Connection[Any], table: str) -> None:
     )
 
 
+def _insert_pieces(conn: psycopg.Connection[Any], metric: str) -> None:
+    """Cut a checked metric layer into pieces of at most PIECE_VERTICES vertices.
+
+    ST_Subdivide can return multi-part pieces; ST_Dump splits them so every piece is one
+    polygon or one line. Pieces are numbered in ST_Subdivide's order, so a reload of the
+    same package numbers them the same way.
+    """
+    p = PIECE_TABLES[metric]
+    cols = sql.SQL("").join(sql.SQL(", ") + sql.Identifier(c) for c in p.columns)
+    conn.execute(
+        sql.SQL(
+            "INSERT INTO {dst} ({key}, piece{cols}, geom)"
+            " SELECT {key}, row_number() OVER (PARTITION BY {key} ORDER BY s.n, d.path){cols}, d.geom"
+            " FROM {src} z, LATERAL ST_Subdivide(z.geom, {max}) WITH ORDINALITY AS s(g, n),"
+            " LATERAL ST_Dump(s.g) AS d"
+        ).format(
+            dst=sql.Identifier(STAGING, p.table),
+            src=sql.Identifier(STAGING, metric),
+            key=sql.Identifier(p.key),
+            cols=cols,
+            max=sql.Literal(PIECE_VERTICES),
+        )
+    )
+
+
+def _check_pieces(conn: psycopg.Connection[Any], metric: str) -> list[str]:
+    """Every source row has pieces, and they add up to its area (polygons) or length (lines)."""
+    pieces, key = PIECE_TABLES[metric].table, PIECE_TABLES[metric].key
+    measure = sql.SQL("ST_Area" if metric.startswith("zones") else "ST_Length")
+    bad = conn.execute(
+        sql.SQL(
+            "SELECT z.{key}::text, {m}(z.geom), p.total, p.n"
+            " FROM {src} z LEFT JOIN (SELECT {key}, sum({m}(geom)) AS total, count(*) AS n"
+            "                         FROM {dst} GROUP BY {key}) p USING ({key})"
+            " WHERE p.n IS NULL OR abs(p.total - {m}(z.geom)) > {tol} * {m}(z.geom)"
+            " ORDER BY 1 LIMIT 10"
+        ).format(
+            src=sql.Identifier(STAGING, metric),
+            dst=sql.Identifier(STAGING, pieces),
+            key=sql.Identifier(key),
+            m=measure,
+            tol=sql.Literal(COVER_TOLERANCE),
+        )
+    ).fetchall()
+    return [
+        f"{pieces}: {k} has no pieces" if n is None else f"{pieces}: {k} pieces add up to {total}, source has {whole}"
+        for k, whole, total, n in bad
+    ]
+
+
 def load(package: Path, public_key: Path = PUBLIC_KEY, area: Path = AREA) -> LoadReport:
     t0 = time.monotonic()
     pkg = verify_package(package, public_key)
@@ -165,6 +243,20 @@ def load(package: Path, public_key: Path = PUBLIC_KEY, area: Path = AREA) -> Loa
             if n != rows[table]:
                 raise StagingCheckFailed(f"{metric}: {n} rows, {table} has {rows[table]}; not swapping")
             rows[metric] = n
+
+        # Cut after the metric copies pass, so the pieces come from checked geometry. The
+        # same checks again (a cut can, in principle, produce an invalid sliver), then
+        # coverage: the pieces of each row must add up to it, with nothing dropped. The
+        # coverage check stands in for the extent check (refdata/staging.py).
+        for metric in PIECE_TABLES:
+            _insert_pieces(conn, metric)
+        pieces = [p.table for p in PIECE_TABLES.values()]
+        check_staging(conn, STAGING, pieces, bbox, srid=METRIC_SRID, check_extent=False)
+        problems = [p for metric in PIECE_TABLES for p in _check_pieces(conn, metric)]
+        if problems:
+            raise StagingCheckFailed("zone pieces rejected, not swapping:\n  " + "\n  ".join(problems))
+        for p in PIECE_TABLES.values():
+            rows[p.table] = _count(conn, STAGING, p.table)
 
         for table in ALL_TABLES:
             conn.execute(sql.SQL("ANALYZE {}").format(sql.Identifier(STAGING, table)))

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import psycopg
@@ -9,7 +10,7 @@ import pytest
 
 from common.postgis import conninfo
 from refdata.area import BBox
-from refdata.load import load
+from refdata.load import PIECE_VERTICES, load
 from refdata.package import VerifyError
 from refdata.staging import StagingCheckFailed
 from refdata.tests.fake_package import (
@@ -79,7 +80,10 @@ def test_loading_twice_gives_same_rows_and_two_registry_rows(
     first = load(pkg, public_key, area)
     after_first = live()
     second = load(pkg, public_key, area)
-    assert first.rows == second.rows == {"zones": 4, "eez_boundaries": 1, "zones_25832": 4, "eez_boundaries_25832": 1}
+    assert first.rows == second.rows == {
+        "zones": 4, "eez_boundaries": 1, "zones_25832": 4, "eez_boundaries_25832": 1,
+        "zone_pieces_25832": 4, "eez_boundary_pieces_25832": 1,
+    }  # fmt: skip
     assert live()[:7] == after_first[:7]
     assert live()[6:] == ("zones-test00000001", 2, 0)  # two loads recorded, no staging schema left
     with psycopg.connect(conninfo()) as conn:
@@ -87,7 +91,8 @@ def test_loading_twice_gives_same_rows_and_two_registry_rows(
         indexes = {
             r[0]
             for r in conn.execute(
-                "SELECT indexname FROM pg_indexes WHERE tablename IN ('zones', 'zones_25832', 'eez_boundaries_25832')"
+                "SELECT indexname FROM pg_indexes WHERE tablename IN ('zones', 'zones_25832', 'eez_boundaries_25832',"
+                " 'zone_pieces_25832', 'eez_boundary_pieces_25832')"
             )
         }
         (srids,) = conn.execute(
@@ -100,6 +105,8 @@ def test_loading_twice_gives_same_rows_and_two_registry_rows(
         "zones_pkey", "zones_geom_idx", "zones_kind_idx",
         "zones_25832_pkey", "zones_25832_geom_idx", "zones_25832_kind_idx",
         "eez_boundaries_25832_pkey", "eez_boundaries_25832_geom_idx",
+        "zone_pieces_25832_pkey", "zone_pieces_25832_geom_idx",
+        "eez_boundary_pieces_25832_pkey", "eez_boundary_pieces_25832_geom_idx",
     }  # fmt: skip
     assert srids == [25832, 25832]
     assert active == 1
@@ -160,6 +167,41 @@ def test_nearest_point_from_the_metric_copy_gives_the_geodesic_distance_near_bor
     assert 10_000 < geodesic < 30_000
     assert utm - geodesic > 0.001 * geodesic  # the scale error this method exists to remove
     assert abs(nearest_then_geodesic - geodesic) < 0.5
+
+
+def test_large_zone_is_cut_into_pieces_that_cover_it_exactly(
+    db: str, tmp_path: Path, key: SigningKey, public_key: Path, area: Path
+) -> None:
+    # A 3,000-vertex ring (a ragged coastline) around 11.5 E 57 N: more than PIECE_VERTICES.
+    ring = [
+        (11.5 + (0.3 + 0.02 * (i % 7)) * math.cos(t), 57.0 + (0.2 + 0.02 * (i % 5)) * math.sin(t))
+        for i, t in ((i, 2 * math.pi * i / 3000) for i in range(3000))
+    ]
+    ring.append(ring[0])
+    rows = default_rows()
+    rows["mpa"].append(("wdpa:coast", "mpa", "Coast", "wdpa_marine:Nov2026", gpkg_blob(multipolygon(ring))))
+    report = load(make_package(tmp_path / "p", key, BBOX, rows=rows), public_key, area)
+    assert report.rows["zone_pieces_25832"] > 5 + 10
+    with psycopg.connect(conninfo()) as conn:
+        row = conn.execute(
+            "SELECT count(*), max(ST_NPoints(geom)), min(piece), max(piece), bool_and(kind = 'mpa'),"
+            "       sum(ST_Area(geom)) / (SELECT ST_Area(geom) FROM zones_25832 WHERE zone_id = 'wdpa:coast')"
+            " FROM zone_pieces_25832 WHERE zone_id = 'wdpa:coast'"
+        ).fetchone()
+        assert row is not None
+        n, max_points, first, last, all_mpa, area_ratio = row
+        assert n > 10 and max_points <= PIECE_VERTICES
+        assert (first, last, all_mpa) == (1, n, True)
+        assert abs(area_ratio - 1) < 1e-9
+        # A point is in the zone exactly when it is in one of its pieces.
+        disagree = conn.execute(
+            "WITH pts AS (SELECT ST_Transform(ST_SetSRID(ST_Point(11.1 + x * 0.01, 56.7 + y * 0.01), 4326), 25832) p"
+            "             FROM generate_series(0, 80) x, generate_series(0, 60) y)"
+            " SELECT count(*) FROM pts WHERE"
+            " ST_Intersects(p, (SELECT geom FROM zones_25832 WHERE zone_id = 'wdpa:coast'))"
+            " <> EXISTS (SELECT 1 FROM zone_pieces_25832 WHERE zone_id = 'wdpa:coast' AND ST_Intersects(p, geom))"
+        ).fetchone()
+    assert disagree == (0,)
 
 
 def test_zone_along_the_bbox_edge_stays_inside_it_in_the_metric_copy(
