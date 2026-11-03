@@ -253,8 +253,10 @@ services:
   # subtasks in its 4 slots). The job itself is submitted by flink-submit. Checkpoints and
   # savepoints go to the flink-data volume, which both must see at the same path.
   flink-jobmanager:
-    build:
+    build: &flink-build
       context: ../../flink/enrichment
+      additional_contexts:
+        contracts: ../../contracts   # contracts/ais_enriched.json, for the Java tests
     image: dvw-flink:0.1.0
     container_name: dvw-flink-jobmanager
     profiles: [flink]
@@ -291,8 +293,7 @@ services:
     restart: unless-stopped
 
   flink-taskmanager:
-    build:
-      context: ../../flink/enrichment
+    build: *flink-build
     image: dvw-flink:0.1.0
     container_name: dvw-flink-taskmanager
     profiles: [flink]
@@ -316,8 +317,7 @@ services:
   # zone package (the startup gate, docs/adr/0018); the job's zone source then reads that
   # package with the same settings, which travel inside the job graph.
   flink-submit:
-    build:
-      context: ../../flink/enrichment
+    build: *flink-build
     image: dvw-flink:0.1.0
     container_name: dvw-flink-submit
     profiles: [flink]

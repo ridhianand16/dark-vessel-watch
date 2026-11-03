@@ -345,7 +345,7 @@ def test_leaks_are_counted() -> None:
         erec(10),
         erec(11),  # duplicate of 10: Flink should have dropped it
         erec(12, lat=None),  # Flink sends this to ais.dlq
-        erec(13, key=BUOY, mmsi=992191234, station_class="aton"),  # valid, skipped, no leak
+        erec(13, key=BUOY, mmsi=992191234, station_class="aid_to_navigation"),  # valid, skipped, no leak
         erec(14, key=BUOY, mmsi=992191234, station_class="ship"),  # Flink and mmsi.py disagree
     ])
     assert counts[Leak.DUPLICATE.value] == 1
@@ -364,3 +364,19 @@ def test_enriched_partition_must_match_raw() -> None:
     moved = RawRecord(r.key, r.value, 4, r.offset)
     with pytest.raises(PartitionMismatch):
         process_batch([moved], lambda i: None, CFG, enriched=True)
+
+
+CRAFT = 982190001  # 98: craft associated with a parent ship, a ship station
+
+
+def test_enriched_craft_with_parent_is_tracked() -> None:
+    """Flink tags 98-prefix MMSIs craft_with_parent, not ship. That is a ship class, so
+    the record is tracked and no station-class leak is counted."""
+    key = str(CRAFT).encode()
+    result = process_batch(
+        [erec(10, key=key, mmsi=CRAFT, station_class="craft_with_parent")], lambda i: None, CFG, enriched=True
+    )
+    assert [k for k, _ in result.tracks] == [key]
+    assert result.counts["started"] == 1
+    assert result.counts[Leak.STATION_CLASS.value] == 0
+    assert result.counts["station_class_mismatch"] == 0

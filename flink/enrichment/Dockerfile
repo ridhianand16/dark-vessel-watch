@@ -5,12 +5,17 @@
 # Stage 1 builds the fat jar with Maven and runs the unit tests; a failing test fails the
 # image build. Maven's repository is a BuildKit cache mount, so rebuilds (and `make
 # test-flink`) only go online when pom.xml gains a dependency.
+#
+# The tests also check contracts/ais_enriched.json, which lives outside this context. The
+# build gets it as a second, named context: `contracts` (compose additional_contexts, or
+# docker build --build-context contracts=contracts). Without it the build fails.
 FROM maven:3.10.0-eclipse-temurin-17 AS build
 WORKDIR /src
 COPY pom.xml .
 RUN --mount=type=cache,target=/root/.m2 mvn -B -q dependency:go-offline
+COPY --from=contracts ais_enriched.json /contracts/ais_enriched.json
 COPY src/ src/
-RUN --mount=type=cache,target=/root/.m2 mvn -B package
+RUN --mount=type=cache,target=/root/.m2 mvn -B package -Ddvw.contract=/contracts/ais_enriched.json
 
 FROM flink:1.20.5-scala_2.12-java17
 COPY --from=build /src/target/enrichment.jar /opt/dvw/enrichment.jar

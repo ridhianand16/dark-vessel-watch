@@ -1,0 +1,16 @@
+{
+  "description": "Rules the Flink enrichment job (writer of ais.enriched) and the Faust tracker (its reader) must agree on. Both sides' tests load this file and fail on any difference. Change it only together with both implementations.",
+  "station_classes": [
+    {"wire": "ship", "is_ship": true, "example_mmsis": [219026147, 257000000, 200000000, 799999999, 300000000, 412345678, 538001234, 636012345]},
+    {"wire": "craft_with_parent", "is_ship": true, "example_mmsis": [982190001, 980000000, 989999999]},
+    {"wire": "coast", "is_ship": false, "example_mmsis": [2190047, 2190000, 0]},
+    {"wire": "group", "is_ship": false, "example_mmsis": [21900000, 99999999]},
+    {"wire": "sar_aircraft", "is_ship": false, "example_mmsis": [111219500]},
+    {"wire": "handheld", "is_ship": false, "example_mmsis": [812345678, 800000000]},
+    {"wire": "aid_to_navigation", "is_ship": false, "example_mmsis": [992191234, 999000001, 990000000]},
+    {"wire": "sart", "is_ship": false, "example_mmsis": [970123456]},
+    {"wire": "mob", "is_ship": false, "example_mmsis": [972123456]},
+    {"wire": "epirb", "is_ship": false, "example_mmsis": [974123456]},
+    {"wire": "other", "is_ship": false, "example_mmsis": [100000000, 110999999, 112000000, 971000000, 973000000, 975000000, 900000000, 979999999, 199999999, 1000000000, -1]}
+  ]
+}

@@ -2,44 +2,65 @@ package dvw.enrichment;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 
-/** Same cases as stream/faust_app/tests/test_mmsi.py, so the two implementations agree. */
+/**
+ * StationClass agrees with contracts/ais_enriched.json. The tracker's test_contract.py
+ * checks stream/faust_app/mmsi.py against the same file, so the two cannot drift apart.
+ */
 class StationClassTest {
+    private static final JsonNode CLASSES = Contract.load().get("station_classes");
+
+    private static List<JsonNode> classes() {
+        List<JsonNode> out = new ArrayList<>();
+        CLASSES.forEach(out::add);
+        return out;
+    }
+
+    @Test
+    void wireValuesAreExactlyTheContract() {
+        List<String> contract = classes().stream().map(c -> c.get("wire").asText()).toList();
+        List<String> ours = Arrays.stream(StationClass.values()).map(c -> c.wire).toList();
+        assertEquals(contract, ours);
+    }
+
+    @Test
+    void shipClassesAreExactlyTheContract() {
+        Set<String> contract = classes().stream()
+                .filter(c -> c.get("is_ship").asBoolean())
+                .map(c -> c.get("wire").asText())
+                .collect(Collectors.toCollection(TreeSet::new));
+        Set<String> ours = Arrays.stream(StationClass.values())
+                .filter(c -> c.isShip)
+                .map(c -> c.wire)
+                .collect(Collectors.toCollection(TreeSet::new));
+        assertEquals(contract, ours);
+    }
+
+    static Stream<Arguments> exampleMmsis() {
+        return classes().stream().flatMap(c -> {
+            List<Arguments> args = new ArrayList<>();
+            c.get("example_mmsis").forEach(m -> args.add(
+                    Arguments.of(m.asLong(), c.get("wire").asText(), c.get("is_ship").asBoolean())));
+            return args.stream();
+        });
+    }
+
     @ParameterizedTest
-    @CsvSource({
-        "219026147, ship",
-        "257000000, ship",
-        "200000000, ship",
-        "799999999, ship",
-        "300000000, ship",
-        "412345678, ship",
-        "538001234, ship",
-        "636012345, ship",
-        "982190001, craft_with_parent",
-        "2190047, coast",
-        "2190000, coast",
-        "21900000, group",
-        "99999999, group",
-        "111219500, sar_aircraft",
-        "100000000, other",
-        "110999999, other",
-        "112000000, other",
-        "812345678, handheld",
-        "992191234, aid_to_navigation",
-        "999000001, aid_to_navigation",
-        "970123456, sart",
-        "972123456, mob",
-        "974123456, epirb",
-        "971000000, other",
-        "973000000, other",
-        "975000000, other",
-        "900000000, other",
-        "1000000000, other",
-        "-1, other",
-    })
-    void stationClass(long mmsi, String expected) {
-        assertEquals(expected, StationClass.of(mmsi).wire);
+    @MethodSource("exampleMmsis")
+    void exampleMmsi(long mmsi, String wire, boolean isShip) {
+        assertEquals(wire, StationClass.of(mmsi).wire);
+        assertEquals(isShip, StationClass.of(mmsi).isShip);
     }
 }

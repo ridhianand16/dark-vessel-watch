@@ -10,8 +10,8 @@ way one record goes through three stages:
                      the key, or no run_id; on ais.enriched also missing or mistyped
                      src_partition, src_offset, station_class or zone tags
        not_a_ship    MMSI is not a ship station (mmsi.py): buoys, base stations, SARTs
-       station_class_mismatch  ais.enriched only: the Flink job's station_class and
-                     mmsi.py disagree about whether this is a ship
+       station_class_mismatch  ais.enriched only: the Flink job's station_class is
+                     not the class mmsi.py gives the MMSI (contracts/ais_enriched.json)
        no_event_ts   event_ts missing
        no_position   lat/lon missing or out of range (AIS sends 91/181 for "not available")
    On ais.enriched the Flink job has already dropped invalid records (to ais.dlq) and
@@ -110,6 +110,7 @@ from stream.faust_app.kalman import (
     step,
 )
 from stream.faust_app.mmsi import is_ship
+from stream.faust_app.mmsi import station_class as mmsi_station_class  # decode() has a local station_class
 
 RAW_SCHEMA_VERSION = 1
 TRACKS_SCHEMA_VERSION = 1
@@ -139,7 +140,6 @@ class Result(StrEnum):
 
 ACCEPTED = frozenset({Result.STARTED, Result.RESTARTED, Result.UPDATED, Result.REINITIALISED})
 DEFAULT_DETECTION = DetectionConfig()
-SHIP = "ship"
 
 
 class Leak(StrEnum):
@@ -233,7 +233,9 @@ def decode(key: bytes | None, value: bytes | None, enriched: bool = False) -> Fi
         station_class, zone = msg.get("station_class"), _zone(msg)
         if src_partition is None or src_offset is None or not isinstance(station_class, str) or zone is None:
             return Skip.DECODE_ERROR
-        if (station_class == SHIP) != is_ship(mmsi):
+        # The exact class, not "ship or not": craft_with_parent is a ship too
+        # (contracts/ais_enriched.json), and any other disagreement is a contract break.
+        if station_class != mmsi_station_class(mmsi).value:
             return Skip.CLASS_MISMATCH
     if not is_ship(mmsi):
         return Skip.NOT_A_SHIP

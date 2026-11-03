@@ -211,7 +211,7 @@ test-py:
 
 ## Compile the Flink job and run its unit tests, in Docker (no host JDK or Maven needed).
 test-flink:
-	docker build --target build -q flink/enrichment >/dev/null
+	docker build --build-context contracts=contracts --target build -q flink/enrichment >/dev/null
 
 typecheck:
 	uv run mypy --strict $(PY_DIRS)
