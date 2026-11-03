@@ -3,8 +3,10 @@
     uv run python -m ingest.replayer --file data/ais/aisdk-2026-10-28.csv --speed 50
     make replay ARGS="--limit 10000 --speed 100"
 
-Writes data/runs/<run_id>/produced.json at the end (also after Ctrl-C or delivery
-failures, with status != "complete"). With --inject anomalies.yaml it mixes labelled
+Writes data/runs/<run_id>/produced.json with status "running" when the replay starts,
+and again at the end with the offsets (also after Ctrl-C or delivery failures, with
+status != "complete"). The reconciliation job waits on "running" and refuses anything
+else that is not "complete". With --inject anomalies.yaml it mixes labelled
 synthetic vessels into the stream (inject.py) and also writes labels.json there. Exit codes: 0 every message acknowledged,
 1 delivery errors or undelivered messages, 2 bad arguments/input, 130 interrupted.
 """
@@ -161,6 +163,10 @@ def main(argv: list[str] | None = None) -> int:
     tracker = DeliveryTracker()
     pacer = Pacer(args.speed, sleep=lambda s: poll_until(producer, s))
     started_at, t0 = utc_now(), time.monotonic()
+    out = args.runs_dir / run_id / "produced.json"
+    # Marks the run as in progress, so a reconciliation started now waits for it. A
+    # replayer killed with SIGKILL leaves this behind; the job then times out.
+    write_json_atomic(out, {"run_id": run_id, "status": "running", "topic": args.topic, "started_at": started_at})
     sent = injected = in_reserved_range = 0
     status = "complete"
     rows = merged(csv_rows(args.file, layout, args.limit), plan.rows if plan else [])
@@ -192,7 +198,6 @@ def main(argv: list[str] | None = None) -> int:
         status = "failed"
     elapsed = time.monotonic() - t0
 
-    out = args.runs_dir / run_id / "produced.json"
     write_json_atomic(
         out,
         {
