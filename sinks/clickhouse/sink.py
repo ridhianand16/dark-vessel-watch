@@ -1,7 +1,9 @@
 """Consume one topic and insert every record into one ClickHouse table.
 
     uv run python -m sinks.clickhouse raw      # ais.raw -> dvw.ais_raw (Compose: raw-sink)
-    uv run python -m sinks.clickhouse alerts   # ais.alerts -> dvw.alerts (Compose: alerts-sink)
+    uv run python -m sinks.clickhouse alerts   # ais.alerts -> dvw.alerts
+    uv run python -m sinks.clickhouse tracks   # ais.tracks -> dvw.tracks
+    uv run python -m sinks.clickhouse alerts tracks   # both, one process (Compose: tracks-alerts-sink)
 
 What differs between instances is a SinkSpec (specs.py): topic, consumer group, table,
 columns and the row mapper. Batching, retries and offset commits are the shared loop
@@ -10,8 +12,9 @@ in common/kafka_batch.py.
 Delivery: at-least-once into an idempotent table. Offsets are committed only after the
 batch insert has succeeded. A crash between insert and commit re-delivers that batch;
 the table's ReplacingMergeTree key collapses the copies (raw: Kafka coordinates,
-alerts: alert_id). Exit codes: 0 after a clean shutdown, 1 when inserts keep failing
-or the table is missing, 2 for an unknown sink name (argparse).
+alerts: alert_id, tracks: mmsi, event_ts and the fix's ais.raw coordinates). Exit
+codes: 0 after a clean shutdown, 1 when inserts keep failing (in any sink of a shared
+process) or a table is missing, 2 for an unknown sink name (argparse).
 """
 
 from __future__ import annotations

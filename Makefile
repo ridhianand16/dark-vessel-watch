@@ -1,6 +1,6 @@
 COMPOSE := docker compose -f deploy/compose/docker-compose.yml --env-file .env
 
-.PHONY: hooks up down nuke topics ps console fetch fetch-refdata area refdata refdata-image refdata-key refdata-build refdata-verify refdata-load replay migrate migrate-postgis sink sink-logs alerts-sink alerts-sink-logs vessels-sink vessels-sink-logs tracker tracker-logs reconcile score flink-up flink-savepoint flink-restart flink-logs flink-check compare-tracks latency test test-py test-flink typecheck
+.PHONY: hooks up down nuke topics ps console fetch fetch-refdata area refdata refdata-image refdata-key refdata-build refdata-verify refdata-load replay migrate migrate-postgis sink sink-logs tracks-alerts-sink tracks-alerts-sink-logs vessels-sink vessels-sink-logs tracker tracker-logs reconcile score flink-up flink-savepoint flink-restart flink-logs flink-check compare-tracks latency test test-py test-flink typecheck
 
 .env:
 	@echo "Missing .env. Run: cp .env.example .env" >&2; exit 1
@@ -22,14 +22,14 @@ hooks:
 	chmod +x .githooks/*
 
 ## Start the whole pipeline: Redpanda, ClickHouse, PostGIS, topics, migrations, the
-## three sinks, the tracker (reads ais.enriched) and the Flink enrichment job that
+## sinks, the tracker (reads ais.enriched) and the Flink enrichment job that
 ## writes ais.enriched. init-topics is run separately: `up --wait` treats a one-shot
 ## container that exits (even with 0) as a failure.
 up: hooks .env
 	$(COMPOSE) up -d --wait --wait-timeout 180 $(SERVICES)
 	$(COMPOSE) run --rm init-topics
 	$(MAKE) migrate migrate-postgis
-	$(COMPOSE) up -d --build raw-sink alerts-sink vessels-sink tracker
+	$(COMPOSE) up -d --build --remove-orphans raw-sink tracks-alerts-sink vessels-sink tracker
 	$(MAKE) flink-up
 
 ## Stop and remove containers; named volumes (topic data, DBs) are kept.
@@ -111,12 +111,13 @@ sink: .env
 sink-logs: .env
 	$(COMPOSE) logs -f raw-sink
 
-## (Re)build and start the ais.alerts -> ClickHouse sink (same image as raw-sink).
-alerts-sink: .env
-	$(COMPOSE) up -d --build alerts-sink
+## (Re)build and start ais.alerts -> dvw.alerts and ais.tracks -> dvw.tracks, one process
+## (same image as raw-sink). Inserts into dvw.tracks feed the rollups.
+tracks-alerts-sink: .env
+	$(COMPOSE) up -d --build tracks-alerts-sink
 
-alerts-sink-logs: .env
-	$(COMPOSE) logs -f alerts-sink
+tracks-alerts-sink-logs: .env
+	$(COMPOSE) logs -f tracks-alerts-sink
 
 ## (Re)build and start the ais.tracks -> PostGIS vessels_current sink (same image).
 vessels-sink: .env

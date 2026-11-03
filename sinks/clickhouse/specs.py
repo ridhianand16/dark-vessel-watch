@@ -9,7 +9,7 @@ start (harmless, the tables are idempotent, but slow for ais.raw).
 from __future__ import annotations
 
 from common.kafka_batch import BatchSettings
-from sinks.clickhouse import alerts, raw
+from sinks.clickhouse import alerts, raw, tracks
 from sinks.clickhouse.sink import SinkSpec
 
 SPECS: dict[str, SinkSpec] = {
@@ -34,6 +34,17 @@ SPECS: dict[str, SinkSpec] = {
             # the Flink job's 3 s checkpoints take most (ADR 0014): a lone alert waits
             # at most max_wait_s for company before it is inserted.
             settings=BatchSettings(max_rows=10_000, max_wait_s=0.2),
+        ),
+        SinkSpec(
+            name="tracks",
+            topic="ais.tracks",
+            group_id="dvw-tracks-sink",
+            table="dvw.tracks",
+            columns=tracks.COLUMNS,
+            to_row=tracks.to_row,
+            # Runs in the same process as the alerts sink (Compose: tracks-alerts-sink).
+            # 20k rows of about 25 values keep the batch near 30 MB of Python objects.
+            settings=BatchSettings(max_rows=20_000, max_wait_s=1.0),
         ),
     )
 }

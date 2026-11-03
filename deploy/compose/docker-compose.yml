@@ -3,9 +3,9 @@
 # Run from the repo root via the Makefile (it passes --env-file .env).
 # Memory budget (mem_limit caps, not reservations) for the 3.9 GiB Docker VM:
 #   redpanda 768m (512M Seastar memory + overhead) | clickhouse 1.25g | postgis 512m
-#   raw-sink 384m | tracker 512m | alerts-sink 192m | vessels-sink 192m
+#   raw-sink 384m | tracker 512m | tracks-alerts-sink 320m | vessels-sink 192m
 #   flink-jobmanager 768m | flink-taskmanager 1280m        (`make up` starts them, via `make flink-up`)
-#   total ≈ 5.8g ceiling; measured use with everything running is in the README
+#   total ≈ 5.9g ceiling; measured use with everything running is in the README
 #   console 256m, only when needed (profile console, `make console`)
 #   flink-submit 384m, one-shot; refdata-tools 1g, only while `make refdata` builds a package
 #   Run GDAL package builds with Flink stopped.
@@ -154,7 +154,7 @@ services:
     build:
       context: ../..
       dockerfile: sinks/Dockerfile
-    image: dvw-sinks:0.3.0
+    image: dvw-sinks:0.4.0
     container_name: dvw-raw-sink
     command: ["raw"]
     depends_on:
@@ -174,23 +174,27 @@ services:
     stop_grace_period: 30s
     restart: unless-stopped
 
-  # ais.alerts -> dvw.alerts: same image and delivery code as raw-sink, another SinkSpec
-  # (sinks/clickhouse/specs.py, docs/adr/0006). Resent alerts collapse on alert_id.
-  alerts-sink:
+  # ais.alerts -> dvw.alerts and ais.tracks -> dvw.tracks in one process: same image and
+  # delivery code as raw-sink, two SinkSpecs (sinks/clickhouse/specs.py, docs/adr/0006,
+  # 0020), one thread and consumer group each. If either sink fails the process exits and
+  # Docker restarts both. Resent alerts collapse on alert_id, tracks on the fix's identity.
+  # Inserts into dvw.tracks fire the 1-minute and 1-hour rollup views.
+  tracks-alerts-sink:
     build:
       context: ../..
       dockerfile: sinks/Dockerfile
-    image: dvw-sinks:0.3.0
-    container_name: dvw-alerts-sink
-    command: ["alerts"]
+    image: dvw-sinks:0.4.0
+    container_name: dvw-tracks-alerts-sink
+    command: ["alerts", "tracks"]
     depends_on:
       init-topics:
         condition: service_completed_successfully
       clickhouse:
         condition: service_healthy
     environment: *sink-env
-    # Batches of at most 10k small rows; the 16 MB prefetch buffer dominates.
-    mem_limit: 192m
+    # Two 16 MB librdkafka prefetch buffers, a 20k-row tracks batch (~30 MB of Python
+    # objects) and one interpreter. Two separate containers would be 192m + 256m.
+    mem_limit: 320m
     stop_grace_period: 30s
     restart: unless-stopped
 
@@ -202,7 +206,7 @@ services:
     build:
       context: ../..
       dockerfile: sinks/Dockerfile
-    image: dvw-sinks:0.3.0
+    image: dvw-sinks:0.4.0
     container_name: dvw-vessels-sink
     entrypoint: ["python", "-m", "sinks.postgis_vessels"]
     command: []
