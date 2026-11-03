@@ -1,6 +1,6 @@
 COMPOSE := docker compose -f deploy/compose/docker-compose.yml --env-file .env
 
-.PHONY: hooks up down nuke topics ps console fetch fetch-refdata area refdata refdata-image refdata-key refdata-build refdata-verify refdata-load replay migrate migrate-postgis sink sink-logs tracks-alerts-sink tracks-alerts-sink-logs vessels-sink vessels-sink-logs tracker tracker-logs reconcile score flink-up flink-savepoint flink-restart flink-logs flink-check compare-tracks latency backfill-rollups test test-py test-flink typecheck
+.PHONY: hooks up down nuke topics ps console fetch fetch-refdata area refdata refdata-image refdata-key refdata-build refdata-verify refdata-load replay migrate migrate-postgis sink sink-logs tracks-alerts-sink tracks-alerts-sink-logs vessels-sink vessels-sink-logs tracker tracker-logs reconcile score flink-up flink-savepoint flink-restart flink-logs flink-check compare-tracks latency backfill-rollups ttl-demo test test-py test-flink typecheck
 
 .env:
 	@echo "Missing .env. Run: cp .env.example .env" >&2; exit 1
@@ -142,6 +142,11 @@ migrate: .env
 ## see new inserts). Safe to repeat, also while the sink runs. RUN=<run_id> for one run.
 backfill-rollups: .env
 	uv run python -m sql.backfill_rollups $(if $(RUN),--run $(RUN))
+
+## Show the ingested_at TTL deleting rows, on a scratch table with the TTL in minutes.
+## Touches no real table.
+ttl-demo: .env
+	uv run python -m sql.ttl_demo
 
 ## Apply new PostGIS migrations in sql/postgis/ (no-op when up to date).
 migrate-postgis: .env
