@@ -24,13 +24,15 @@ A Flink job now sits on `ais.raw` as well ([Flink enrichment](#flink-enrichment)
 
 The same job tags every record with its zones: EEZ, protected areas, port, and geodesic distances to the nearest EEZ boundary and protected area. It reads the active zone package from PostGIS when it starts, and records that arrive before the zones are held back rather than tagged "no zone" ([ADR 0018](docs/adr/0018-flink-zone-tagging-read-at-startup.md)). On a 400-record sample the tags agree with PostGIS exactly, and the distances agree to within 0.5 m.
 
-Not built yet: moving the tracker from `ais.raw` to `ais.enriched`, the DARK_GAP zone check that reads these tags (it still passes everywhere), and MMSI_CLASH.
+The tracker now reads `ais.enriched` instead of `ais.raw`, with `read_committed`, so it only ever sees output of completed Flink checkpoints ([ADR 0019](docs/adr/0019-tracker-on-enriched-and-dark-gap-zone-condition.md)). DARK_GAP uses the zone tags: a gap counts only if the vessel was last seen within 10 nm of an EEZ boundary or a protected area, and not in port. The same 10,000 rows read through either topic give identical tracks for 1,278 of 1,279 vessels. The one exception is a report Flink's dedup drops on purpose ([Tracker on ais.enriched](#tracker-on-aisenriched)).
+
+Not built yet: excluding gaps at the edge of receiver coverage, and MMSI_CLASH.
 
 ## Detections
 
 | Alert | Fires when | Carries |
 |---|---|---|
-| DARK_GAP | A vessel last moving faster than 2 kn has not been heard for more than 30 min of event time | Last filtered position, the Kalman-predicted position 30 min after the last fix, and its uncertainty |
+| DARK_GAP | A vessel last moving faster than 2 kn has not been heard for more than 30 min of event time, and its last accepted fix was within 10 nm of an EEZ boundary or a protected area and not in port | Last filtered position, the Kalman-predicted position 30 min after the last fix, its uncertainty, and the zone tags of the last fix |
 | TELEPORT | A fix implies more than 50 kn from the last accepted fix (ignoring jumps under 1 km or 10 s), or lands too far from the Kalman prediction (NIS above 50 and at least 1 km off) | The fix as received, the predicted position, which rule fired |
 
 How it works, briefly:
@@ -40,21 +42,31 @@ How it works, briefly:
 - **The outlier does not reach the filter.** A rejected fix still counts as "heard", so a vessel sending implausible positions is not dark.
 - **Deterministic ids.** `alert_id` is a UUIDv5 of type, MMSI, run and the fix that triggered it. A crash can make the tracker resend an alert. The resent copy has the same id, and `dvw.alerts` keeps one row.
 
-Stubbed until the zones are loaded: the spec's DARK_GAP also requires the vessel to be near an EEZ boundary or protected area, not in port, and not at the edge of receiver coverage. Today that predicate returns true everywhere, so every qualifying gap fires, including coverage holes and gaps in port at more than 2 kn. Real-traffic DARK_GAP counts are therefore an upper bound. MMSI_CLASH is not implemented.
+- **Zones come from Flink.** The zone condition reads the tags the Flink job put on the vessel's last accepted fix (`dist_eez_boundary_m`, `dist_mpa_m`, `in_port`); the tracker never queries PostGIS. 10 nm is `DARK_GAP_ZONE_NM`. A rejected TELEPORT fix does not count, because its position is the one judged implausible. A record without tags (the tracker pointed at `ais.raw`) raises no DARK_GAP.
+
+Still missing from the spec's DARK_GAP: "not at the edge of receiver coverage". Real-traffic DARK_GAP counts therefore still include coverage holes near boundaries and protected areas. MMSI_CLASH is not implemented.
 
 ### Injected anomalies
 
-`--inject ingest/replayer/anomalies.yaml` adds eight synthetic vessels (MMSIs 200000001 to 200000022, a block the real data does not use):
+`--inject ingest/replayer/anomalies.yaml` adds ten synthetic vessels (MMSIs 200000001 to 200000023, a block the real data does not use):
 
-- three that switch AIS off for 45 min while under way, then reappear on their dead-reckoned track;
+- three that switch AIS off for 45 min while under way, then reappear on their dead-reckoned track. They go dark 4.0 nm from a protected area, 6.1 nm from an EEZ boundary, and 3.4 nm from a protected area;
 - three whose reported position jumps 30 km in one report and stays there;
-- two decoys that must not alert: a moored vessel silent for 45 min, and a 0.5 km jump.
+- four decoys that must not alert: a moored vessel silent for 45 min, a 0.5 km jump, a vessel under way that goes dark in open North Sea water (38 nm from a boundary, 29 nm from a protected area), and one under way at 3 kn that goes dark inside Copenhagen port, next to a protected area.
 
 Labels go to `data/runs/<run_id>/labels.json`. `make score RUN=<run_id>` compares them with `dvw.alerts FINAL` and prints TP, FP and FN per alert type. A match must be the exact `alert_id`, so an alert raised one report late counts as a miss.
 
 The events need 54 min of event time, which is about 650,000 rows of the DMA day (200,000 rows are only 16.7 min). The replayer refuses a run that is too short and says so.
 
-Results on the 2026-10-28 day, 700,000 rows at 50x, three runs:
+Results on the 2026-10-28 day, tracker on `ais.enriched` with the zone condition, 700,000 rows at 10x (2026-11-04, run `20261103T221808Z-476749`):
+
+| Run | DARK_GAP TP / FP / FN | TELEPORT TP / FP / FN | Alerts on real vessels |
+|---|---|---|---|
+| clean, 10 injected events (4 decoys) | 3 / 0 / 0 | 3 / 0 / 0 | 13 DARK_GAP, 5 TELEPORT |
+
+Each DARK_GAP hit carries the zone it was raised on: DARK 1 at 4.0 nm from a protected area, DARK 2 at 6.1 nm from an EEZ boundary, DARK 3 at 3.4 nm from a protected area, the same distances PostGIS gives. The far-from-everything and in-port decoys raised nothing. 24 rows in `dvw.alerts FINAL`, 24 distinct `alert_id`.
+
+Earlier, with the tracker on `ais.raw` and no zone condition, 700,000 rows at 50x, three runs:
 
 | Run | DARK_GAP TP / FP / FN | TELEPORT TP / FP / FN | Alerts on real vessels |
 |---|---|---|---|
@@ -62,7 +74,7 @@ Results on the 2026-10-28 day, 700,000 rows at 50x, three runs:
 | clean, again | 3 / 0 / 0 | 3 / 0 / 0 | 17 DARK_GAP, 5 TELEPORT |
 | tracker killed (`SIGKILL`) after the 3rd injected alert, 370,000 records unprocessed, then restarted | 3 / 0 / 0 | 3 / 0 / 0 | 17 DARK_GAP, 5 TELEPORT |
 
-Precision and recall are 1.00 for both types on this set. That says the rules fire once on the events they are meant for and not on the two decoys. It says nothing yet about real traffic, where the 17 gaps have not been checked against coverage or ports.
+Precision and recall are 1.00 for both types on this set. That says the rules fire once on the events they are meant for and not on the decoys. On real traffic the zone condition cut DARK_GAP from 17 to 13 on the same rows; the 13 have not been checked against receiver coverage.
 
 ## Zones
 
@@ -149,13 +161,40 @@ Distances follow ADR 0013. The job finds the nearest point in UTM, then measures
 
 **Running it.** It is a session cluster in Compose: a JobManager (768 MB), one TaskManager with 4 slots (1280 MB), parallelism 4, heap state, and checkpoints on a Docker volume. A one-shot `flink-submit` container submits the job. To fit that in the 3.9 GiB Docker VM, Redpanda dropped to 512 MB and ClickHouse to 1.25 GB, and Console only runs on demand. Records keep the MMSI key and use the producer's default murmur2 partitioner, so each vessel stays in the same partition number it had in `ais.raw` (ADR 0001).
 
+## Tracker on ais.enriched
+
+The tracker reads `ais.enriched` (`TRACKER_INPUT_TOPIC`), with `read_committed`, through a small Faust transport. Faust only reads committed when its own output is transactional too, and the tracker stays at-least-once ([ADR 0019](docs/adr/0019-tracker-on-enriched-and-dark-gap-zone-condition.md)).
+
+- **The bookmark is still a raw offset.** Each vessel's state remembers the last `ais.raw` offset applied, so a redelivered record is skipped (ADR 0004). On `ais.enriched` that offset comes from the record's `src_offset`, never its own offset: Flink drops about 40% of records, so enriched offsets run far behind raw ones and would look old. Tracks keep `src_partition`/`src_offset`, so every sink's dedup key is unchanged.
+- **Safety net.** The tracker keeps its own validity, ship and duplicate checks. Anything they catch on `ais.enriched` is counted as a Flink leak (`leak_invalid`, `leak_station_class`, `leak_duplicate`, logged as `flink_leaks`). Over the 701,815-record run it stayed 0.
+- **Same tracks.** The same 10,000 rows read from `ais.raw` and then from `ais.enriched` give identical tracks for 1,278 of 1,279 vessels (`make compare-tracks`). The other one sent two reports in the same second 0.2 m apart; Flink's dedup key rounds to 5 decimals and drops the second, the tracker's exact check had taken it.
+
+Reconciliation, end to end, each per run and `ais.raw` partition over the run's offset range:
+
+```
+produced            = rows in dvw.ais_raw FINAL                   make reconcile
+raw                 = enriched + dlq + sum(dedup_counts.count)     make flink-check
+enriched (tracker)  = sum of one skip reason or result per record  tracker counters, flink_leaks = 0
+```
+
+**How a new zone package is applied.** Zones reach DARK_GAP only through the Flink job's tags, and the job reads the active package once at start. So:
+
+```sh
+make refdata          # build, verify and load the new package; it becomes the active one
+make flink-restart    # stop with a savepoint, start from it: the job re-reads the active package
+```
+
+Records tagged before the restart keep the old package's tags, and every record says which one in `zones_version`; so does each DARK_GAP's `details.zone`. The tracker needs no restart. Rollback is the same with `make refdata-load PKG=<older package>`.
+
+**Switching a running tracker between topics.** Stop it, `rpk group seek dvw-tracker --to end --topics ais.enriched --allow-new-topics`, start it. Without the seek it starts at the earliest offset and re-tracks every earlier run.
+
 ## Quickstart
 
 Needs Docker with Compose v2, about 8 GB of free RAM, GNU make, and Python 3.12 with [uv](https://docs.astral.sh/uv/). The AIS data is not in the repository: `make fetch` downloads it and checks its SHA-256.
 
 ```sh
 cp .env.example .env
-make up        # git hooks, stack, topics, migrations, the three sinks, tracker
+make up        # git hooks, stack, topics, migrations, the three sinks, tracker (reads ais.enriched)
 make ps        # every service healthy, raw-sink running
 make fetch     # download and verify the pinned AIS day (once, about 3 GB)
 
@@ -163,7 +202,7 @@ make replay ARGS="--limit 10000"                # 10x by default; prints the run
 make reconcile RUN=<run_id>                     # per-partition produced vs stored
 ```
 
-The Flink job (about 2 GB more; the image build compiles the job and runs its tests):
+The tracker reads `ais.enriched`, so tracks and alerts need the Flink job (about 2 GB more; the image build compiles the job and runs its tests). Without it, set `TRACKER_INPUT_TOPIC=ais.raw` in `.env` and `make tracker`: tracks work, DARK_GAP does not.
 
 ```sh
 make flink-up                                   # JobManager, TaskManager, submit the job; UI on http://localhost:8081
@@ -184,13 +223,14 @@ The first start reads `ais.raw` from the beginning, because there are no committ
 Labelled anomalies:
 
 ```sh
-# needs at least ~650k rows, see Detections.
-# 50x only to shorten the run; the tracker falls behind and catches up, and the score waits for it.
-make replay ARGS="--limit 700000 --speed 50 --inject ingest/replayer/anomalies.yaml"
-make score RUN=<run_id> WAIT=600                # TP/FP/FN per alert type
+# needs at least ~650k rows, see Detections. About 6 minutes at 10x.
+make replay ARGS="--limit 700000 --inject ingest/replayer/anomalies.yaml"
+make score RUN=<run_id> WAIT=600                # TP/FP/FN per alert type, and the zone of each DARK_GAP
+make latency RUN=<run_id>                       # replayer send to track sent, and to TELEPORT stored
+make compare-tracks A=<run_id> B=<run_id>       # two runs of the same rows, vessel by vessel
 ```
 
-Reference data for the zones (the tracker does not read them yet):
+Reference data for the zones:
 
 ```sh
 make fetch-refdata   # verify the EEZ, WDPA and WPI files; prints where to download any that are missing
@@ -204,7 +244,7 @@ make area            # only if the AIS day changes: recompute refdata/area.yaml 
 
 EEZ (Marine Regions form), WDPA (Protected Planet terms page) and WPI (NASA Harvest mirror of the NGA release) have to be downloaded by hand into `data/refdata/incoming/<source>/<version>/`, under the file names in `refdata/sources.yaml`. `make fetch-refdata` prints the page and the exact path for each missing file, and fails on any file whose SHA-256 does not match `refdata/sources.yaml`.
 
-`make console` starts Redpanda Console on http://localhost:8080. It is not part of `make up`, to save 256 MB. `make sink-logs`, `make alerts-sink-logs` and `make vessels-sink-logs` follow the three sinks (one line per batch; the vessels sink also logs how many rows each batch `written` and how many were `stale`). `make tracker-logs` follows the tracker, which logs its counters every 30 s (`tracks=... read=... not_a_ship=... duplicate=...`). Every record read gets exactly one skip reason or result, so those counters add up to `read`. `make down` stops the stack and keeps the data. `make nuke` stops it and deletes all data volumes, including ClickHouse.
+`make console` starts Redpanda Console on http://localhost:8080. It is not part of `make up`, to save 256 MB. `make sink-logs`, `make alerts-sink-logs` and `make vessels-sink-logs` follow the three sinks (one line per batch; the vessels sink also logs how many rows each batch `written` and how many were `stale`). `make tracker-logs` follows the tracker, which logs its counters every 30 s (`input=ais.enriched tracks=... flink_leaks=0 read=... not_a_ship=...`). Every record read gets exactly one skip reason or result, so those counters add up to `read`. `flink_leaks` counts records the tracker's own checks caught that Flink should have removed; it should stay 0. `make down` stops the stack and keeps the data. `make nuke` stops it and deletes all data volumes, including ClickHouse.
 
 Other targets: `make migrate` and `make migrate-postgis` apply new files in `sql/clickhouse/` and `sql/postgis/` and do nothing when up to date (`make up` runs both). `make test` runs pytest and the Flink job's JUnit tests (in Docker, so no JDK or Maven needed on the host). `make typecheck` runs `mypy --strict`.
 
@@ -216,7 +256,7 @@ If a sink or the tracker crashes, Docker restarts it and it re-reads from its la
 
 1. **More tracker workers, up to 6.** `ais.raw` has 6 partitions keyed by MMSI, and vessel state is partitioned the same way, so Faust can spread the partitions over up to 6 workers without code changes. Each worker costs about 150 to 512 MiB, which is what rules it out on this laptop.
 2. **Drop numpy from the Kalman step.** The filter is 4x4, and per-record numpy calls cost more in overhead than the arithmetic does. Unrolling the predict and update steps into plain floats removes that overhead. I have not measured the gain yet. It needs a test that compares the two versions so the outputs stay identical.
-3. **Filter earlier, in Flink.** Today the tracker decodes every record, including the 9% from non-ship stations and the 35 to 40% repeated reports. The Flink job already drops the repeats and rejects before `ais.enriched`, and marks non-ship stations. Once the tracker reads `ais.enriched`, it will only see records it uses.
+3. **Filter earlier, in Flink.** Done: the tracker now reads `ais.enriched`, where the Flink job has already dropped the 35 to 40% repeated reports and the invalid records, so it decodes about 57% of what it used to. Non-ship stations (about 6% of enriched records) still reach it and are skipped there; Flink could route them elsewhere.
 
 Past 6 workers, the next limit is the partition count. Changing it needs an ADR (ADR 0001).
 
@@ -267,7 +307,17 @@ Measured on 2026-11-02 on an Apple M1 laptop (8 GB RAM, macOS 26.5), Docker VM w
 | Flink check after savepoint, restart and replay (2026-11-04) | `make flink-savepoint`, `make flink-restart`, `make replay SPEED=100 ARGS="--limit 100000"` | OK on all 6 partitions: 58,241 enriched + 1,178 DLQ + 40,581 duplicates, no offset twice, 0 untagged |
 | Memory with everything running (2026-11-04) | `docker stats` every 5 s during the 200,000-row replay, Console on too | Total 1.9 to 2.1 GiB of the 3.9 GiB VM. TaskManager 660 MiB (935 MiB peak after the 3.1 million backlog), ClickHouse 614, JobManager 352, Redpanda 276, tracker 92, the rest under 75 each |
 
-End-to-end latency and full-day throughput are still to be measured.
+| Tracker on `ais.enriched`, same 10,000 rows as from `ais.raw` (2026-11-04) | replay with the old tracker, switch, replay again, `make compare-tracks A=... B=...` | 1,278 of 1,279 vessels identical, 1 differing by Flink's 5-decimal dedup. Tracker `read=5683` = Flink's enriched count, `flink_leaks=0` |
+| End-to-end latency at 10x, 10,000 rows (2026-11-04) | `make replay ARGS="--limit 10000"`, `make latency RUN=...` | send to track sent: p50 2.2 s, p99 3.5 s, max 3.6 s (5,353 tracks) |
+| End-to-end latency at 10x, 701,815 rows (2026-11-04) | `make replay ARGS="--limit 700000 --inject ..."`, `make latency RUN=...` | send to track sent: p50 2.8 s, p99 8.2 s, max 10.4 s (392,977 tracks). Per 30 s window p99 is 3.4 to 4.9 s, except two windows at 9.0 and 8.6 s. Send to TELEPORT stored in ClickHouse: max 3.0 s (8 alerts) |
+
+The 5 s p99 target holds in steady state but not over the whole 700k run. In the first spike Flink itself wrote records up to 6.3 s after they were sent; in the second Flink wrote on time and the delay came after, at the checkpoint commit or in the tracker. The cause of either is not known yet; checkpoint and GC metrics (observability) are the next step. Full-day throughput is still to be measured.
+
+## Known issues
+
+- **p99 latency over 5 s on long runs**, see [Numbers](#numbers).
+- **Tracker offset commits lagged once after a run.** After the 700k run the tracker had processed every record, but its committed offsets on two `ais.enriched` partitions stayed about 1,000 behind for several minutes, stuck at a gap left by Flink's transaction markers, then caught up. A 10,000-row run afterwards committed to the end within 30 s on every partition, so it is not systematic. Nothing is lost (a restart re-reads those records and the bookmark skips them), but `make score` can report INCOMPLETE meanwhile. Suspected: Faust's offset-gap handling under `read_committed`.
+- DARK_GAP does not yet exclude the edge of receiver coverage. MMSI_CLASH is not built.
 
 ## Attribution
 
