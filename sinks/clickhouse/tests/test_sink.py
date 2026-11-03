@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any, cast
 
 import pytest
 from clickhouse_connect.driver.client import Client
 from confluent_kafka import Consumer, TopicPartition
 
-from sinks.clickhouse_raw.sink import InsertFailed, RawSink, Settings
+from sinks.clickhouse.sink import ClickHouseSink, InsertFailed, Settings, SinkSpec
+from sinks.clickhouse.specs import SPECS
 
 
 class FakeMessage:
@@ -58,6 +60,8 @@ class FakeClient:
     def __init__(self, failures: int) -> None:
         self.failures = failures
         self.inserted: list[int] = []
+        self.tables: list[str] = []
+        self.last_rows: list[list[object]] = []
         self.consumer: FakeConsumer | None = None
 
     def insert(self, table: str, rows: list[list[object]], **kwargs: Any) -> None:
@@ -67,13 +71,18 @@ class FakeClient:
             self.failures -= 1
             raise ConnectionError("clickhouse down")
         self.inserted.append(len(rows))
+        self.tables.append(table)
+        self.last_rows = rows
 
 
-def make(batches: list[list[FakeMessage]], failures: int, attempts: int = 3) -> tuple[RawSink, FakeConsumer, FakeClient]:
+def make(
+    batches: list[list[FakeMessage]], failures: int, attempts: int = 3, name: str = "raw"
+) -> tuple[ClickHouseSink, FakeConsumer, FakeClient]:
     consumer, client = FakeConsumer(batches), FakeClient(failures)
     client.consumer = consumer
     s = Settings(max_rows=10, max_wait_s=0.01, insert_attempts=attempts, backoff_base_s=0.0)
-    sink = RawSink(cast(Consumer, consumer), cast(Client, client), s)
+    spec = replace(SPECS[name], settings=s)
+    sink = ClickHouseSink(spec, cast(Consumer, consumer), cast(Client, client))
     consumer.on_drained = lambda: setattr(sink, "stopping", True)
     return sink, consumer, client
 
@@ -108,3 +117,25 @@ def test_empty_batch_does_nothing() -> None:
     sink._collect()
     sink.flush()
     assert consumer.events == [] and client.inserted == []
+
+
+def test_spec_picks_topic_and_table() -> None:
+    sink, consumer, client = make([[FakeMessage(4, 1)]], failures=0, name="alerts")
+    sink._collect()
+    sink.flush()
+    assert client.tables == ["dvw.alerts"]
+    assert consumer.commits == [[(4, 2)]]
+    # FakeMessage's value is not an alert: stored anyway, under a per-record id.
+    assert client.last_rows[0][sink.spec.columns.index("alert_id")] == "invalid:4:1"
+
+
+def test_spec_requires_decode_error_column() -> None:
+    with pytest.raises(ValueError, match="decode_error"):
+        replace(SPECS["raw"], columns=("run_id",))
+
+
+@pytest.mark.parametrize("spec", SPECS.values(), ids=SPECS.keys())
+def test_every_mapper_fills_every_column(spec: SinkSpec) -> None:
+    for value in (None, b"", b"\xff", b"[]", b'{"schema_version": 1}', FakeMessage(0, 0).value()):
+        row = spec.to_row(value, 0, 0, 0)
+        assert len(row) == len(spec.columns)

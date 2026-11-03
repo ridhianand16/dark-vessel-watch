@@ -95,15 +95,8 @@ def read_layout(path: Path) -> CsvLayout:
     return CsvLayout(columns, field_index, _detect_timestamp_format(first_row[ts_idx]))
 
 
-def sorted_lines(
-    path: Path, layout: CsvLayout, limit: int | None, chunk_size: int = 50_000
-) -> Iterator[tuple[list[str | None], list[int | None]]]:
-    """Yield (lines, event_ts_ms) batches in event-time order.
-
-    With a limit, polars turns sort + head into a top-k, so a smoke test does not
-    sort the whole file. Measured on the 3.2 GB / 18.9M-row DMA day: full sort peaks
-    at about 1 GB RSS.
-    """
+def _timestamped(path: Path, layout: CsvLayout) -> pl.LazyFrame:
+    """Every line with its row number and parsed event_ts (null if it does not parse)."""
     ts_idx = layout.field_index["event_ts"]
     ts_text = (
         pl.col("line")
@@ -112,7 +105,7 @@ def sorted_lines(
         .str.strip_chars()
         .str.strip_chars('"')
     )
-    lf = (
+    return (
         pl.scan_csv(
             path,
             has_header=False,
@@ -128,10 +121,31 @@ def sorted_lines(
             event_ts=ts_text.str.strptime(pl.Datetime("ms"), layout.timestamp_format, strict=False)
             .dt.epoch("ms")
         )
-        .sort(["event_ts", "line_no"], nulls_last=True)
-        .select("line", "event_ts")
     )
+
+
+def sorted_lines(
+    path: Path, layout: CsvLayout, limit: int | None, chunk_size: int = 50_000
+) -> Iterator[tuple[list[str | None], list[int | None]]]:
+    """Yield (lines, event_ts_ms) batches in event-time order.
+
+    With a limit, polars turns sort + head into a top-k, so a smoke test does not
+    sort the whole file. Measured on the 3.2 GB / 18.9M-row DMA day: full sort peaks
+    at about 1 GB RSS.
+    """
+    lf = _timestamped(path, layout).sort(["event_ts", "line_no"], nulls_last=True).select("line", "event_ts")
     if limit is not None:
         lf = lf.head(limit)
     for batch in lf.collect_batches(chunk_size=chunk_size):
         yield batch["line"].to_list(), batch["event_ts"].to_list()
+
+
+def event_span(path: Path, layout: CsvLayout, limit: int | None) -> tuple[int, int] | None:
+    """(first, last) event_ts in ms of the rows sorted_lines() would yield, or None if
+    none has a timestamp. One extra pass over the file, without sorting it."""
+    ts = pl.col("event_ts").drop_nulls()
+    if limit is not None:
+        ts = ts.bottom_k(limit)
+    row = _timestamped(path, layout).select(first=ts.min(), last=ts.max()).collect().row(0)
+    first, last = row
+    return None if first is None else (int(first), int(last))
