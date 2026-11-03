@@ -36,7 +36,9 @@ way one record goes through three stages:
        duplicate     same event_ts and position as the last fix heard (the same
                      report heard by several base stations, about 40% of DMA rows);
                      feeding it again would make the filter overconfident, and
-                     counting a repeated outlier again would reach the reinit limit
+                     counting a repeated outlier again would reach the reinit limit.
+                     Positions are compared rounded to 5 decimals (about 1 m) the way
+                     the Flink job's dedup rounds them (contracts/ais_enriched.json)
        out_of_order  event_ts earlier than the last fix heard in the same run
    started/restarted/updated/reinitialised are "accepted" and produce one ais.tracks
    message. A fix that ends a silence longer than DARK_GAP_S also raises DARK_GAP, if
@@ -116,6 +118,8 @@ RAW_SCHEMA_VERSION = 1
 TRACKS_SCHEMA_VERSION = 1
 STATE_VERSION = 3
 INVALID_KEY = b"invalid"
+DUPLICATE_DECIMALS = 5
+_DUPLICATE_SCALE = 10.0**DUPLICATE_DECIMALS
 
 
 class Skip(StrEnum):
@@ -186,6 +190,23 @@ class Fix:
     """ais.raw coordinates, from an ais.enriched record; None when read from ais.raw."""
     zone: ZoneTags | None = None
     """The Flink job's zone tags; None when read from ais.raw."""
+
+
+def duplicate_coord(v: float) -> int:
+    """A coordinate as it enters the duplicate key: v * 10^5 rounded to the nearest
+    integer, ties toward positive infinity, as Java's Math.round does in the Flink job.
+    Python's round() sends ties to even and would disagree on exact halves."""
+    x = v * _DUPLICATE_SCALE
+    f = math.floor(x)
+    return f + 1 if x - f >= 0.5 else f  # x - f is exact for |x| < 2^52
+
+
+def _same_report(fix: Fix, prev: VesselState) -> bool:
+    return (
+        fix.event_ts == prev.heard_ts
+        and duplicate_coord(fix.lat) == duplicate_coord(prev.heard_lat)
+        and duplicate_coord(fix.lon) == duplicate_coord(prev.heard_lon)
+    )
 
 
 def _int(v: object) -> int | None:
@@ -467,7 +488,7 @@ def apply(
 
     if fix.event_ts < prev.heard_ts:
         return Outcome(Result.OUT_OF_ORDER, None, None)
-    if fix.event_ts == prev.heard_ts and fix.lat == prev.heard_lat and fix.lon == prev.heard_lon:
+    if _same_report(fix, prev):
         return Outcome(Result.DUPLICATE, None, None)
 
     alerts: list[tuple[AlertType, bytes]] = []

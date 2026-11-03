@@ -171,6 +171,20 @@ def test_exact_duplicate_is_ignored_but_same_time_new_position_is_not() -> None:
     assert results == [Result.STARTED, Result.DUPLICATE, Result.UPDATED]
 
 
+def test_duplicate_compares_positions_rounded_like_flink() -> None:
+    """Same second, 0.2 m east: the same report to the Flink job's dedup (5 decimals), so
+    a duplicate here too. 1.1 m east rounds to another key and is a new fix."""
+    _, results, _ = run(rec(10, lon=10.000001), rec(11, lon=10.000004), rec(12, lon=10.00002))
+    assert results == [Result.STARTED, Result.DUPLICATE, Result.UPDATED]
+
+
+def test_duplicate_rounding_sends_halves_up_like_java() -> None:
+    """55.000005 rounds up to 5500001 in Java, so it is not the same report as 55.0;
+    Python's round() would have said 5500000, a duplicate."""
+    _, results, _ = run(rec(10, lat=55.0), rec(11, lat=55.000005))
+    assert results == [Result.STARTED, Result.UPDATED]
+
+
 def test_redelivered_offset_is_ignored() -> None:
     state, results, tracks = run(rec(10), rec(11, event_ts=T0 + 60_000, lon=10.00497), rec(11), rec(10))
     assert results[2:] == [Result.REDELIVERED, Result.REDELIVERED]

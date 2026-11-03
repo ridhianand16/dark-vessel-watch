@@ -1,5 +1,6 @@
-"""mmsi.py agrees with contracts/ais_enriched.json, the rules the Flink job and the tracker
-share. The Flink job's StationClassTest loads the same file."""
+"""mmsi.py and the tracker's duplicate check agree with contracts/ais_enriched.json, the
+rules the Flink job and the tracker share. The Flink job's StationClassTest and DedupTest
+load the same file."""
 
 from __future__ import annotations
 
@@ -10,10 +11,12 @@ from typing import Any
 import pytest
 
 from stream.faust_app.mmsi import SHIP_CLASSES, StationClass, is_ship, station_class
+from stream.faust_app.tracker import DUPLICATE_DECIMALS, duplicate_coord
 
 CONTRACT_PATH = Path(__file__).resolve().parents[3] / "contracts" / "ais_enriched.json"
 CONTRACT: dict[str, Any] = json.loads(CONTRACT_PATH.read_text())
 CLASSES: list[dict[str, Any]] = CONTRACT["station_classes"]
+DUPLICATE_KEY: dict[str, Any] = CONTRACT["duplicate_key"]
 
 
 def test_station_classes_are_exactly_the_contract() -> None:
@@ -31,3 +34,14 @@ def test_ship_classes_are_exactly_the_contract() -> None:
 def test_example_mmsis(mmsi: int, wire: str, ship: bool) -> None:
     assert station_class(mmsi).value == wire
     assert is_ship(mmsi) is ship
+
+
+def test_duplicate_decimals_are_the_contract() -> None:
+    assert DUPLICATE_DECIMALS == DUPLICATE_KEY["coordinate_decimals"]
+
+
+@pytest.mark.parametrize(
+    ("coordinate", "rounded"), [(e["coordinate"], e["rounded"]) for e in DUPLICATE_KEY["coordinate_examples"]]
+)
+def test_duplicate_coordinate_rounding(coordinate: float, rounded: int) -> None:
+    assert duplicate_coord(coordinate) == rounded
