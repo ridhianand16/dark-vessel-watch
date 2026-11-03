@@ -20,10 +20,11 @@ def tables() -> set[str]:
 
 def test_applies_once_then_is_up_to_date(scratch_db: str, capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["--target", "postgis"]) == 0
-    assert "applied 0001_zone_package" in capsys.readouterr().out
-    assert {"schema_migrations", "zones", "eez_boundaries", "refdata_packages"} <= tables()
+    out = capsys.readouterr().out
+    assert "applied 0001_zone_package" in out and "applied 0002_vessels_current" in out
+    assert {"schema_migrations", "zones", "eez_boundaries", "refdata_packages", "vessels_current"} <= tables()
     assert main(["--target", "postgis"]) == 0
-    assert "up to date (2 applied" in capsys.readouterr().out
+    assert "up to date (3 applied" in capsys.readouterr().out
 
 
 def test_failing_file_leaves_nothing_behind(scratch_db: str, tmp_path: Path) -> None:
