@@ -119,6 +119,16 @@ def test_empty_batch_does_nothing() -> None:
     assert consumer.events == [] and client.inserted == []
 
 
+def test_spec_picks_topic_and_table() -> None:
+    sink, consumer, client = make([[FakeMessage(4, 1)]], failures=0, name="alerts")
+    sink._collect()
+    sink.flush()
+    assert client.tables == ["dvw.alerts"]
+    assert consumer.commits == [[(4, 2)]]
+    # FakeMessage's value is not an alert: stored anyway, under a per-record id.
+    assert client.last_rows[0][sink.spec.columns.index("alert_id")] == "invalid:4:1"
+
+
 def test_spec_requires_decode_error_column() -> None:
     with pytest.raises(ValueError, match="decode_error"):
         replace(SPECS["raw"], columns=("run_id",))

@@ -1,6 +1,6 @@
 COMPOSE := docker compose -f deploy/compose/docker-compose.yml --env-file .env
 
-.PHONY: hooks up down nuke topics ps fetch replay migrate sink sink-logs tracker tracker-logs reconcile test typecheck
+.PHONY: hooks up down nuke topics ps fetch replay migrate sink sink-logs alerts-sink alerts-sink-logs tracker tracker-logs reconcile score test typecheck
 
 .env:
 	@echo "Missing .env. Run: cp .env.example .env" >&2; exit 1
@@ -25,7 +25,7 @@ up: hooks .env
 	$(COMPOSE) up -d --wait --wait-timeout 180 $(SERVICES)
 	$(COMPOSE) run --rm init-topics
 	$(MAKE) migrate
-	$(COMPOSE) up -d --build raw-sink tracker
+	$(COMPOSE) up -d --build raw-sink alerts-sink tracker
 
 ## Stop and remove containers; named volumes (topic data, DBs) are kept.
 down: .env
@@ -58,6 +58,13 @@ sink: .env
 
 sink-logs: .env
 	$(COMPOSE) logs -f raw-sink
+
+## (Re)build and start the ais.alerts -> ClickHouse sink (same image as raw-sink).
+alerts-sink: .env
+	$(COMPOSE) up -d --build alerts-sink
+
+alerts-sink-logs: .env
+	$(COMPOSE) logs -f alerts-sink
 
 ## (Re)build and start the Faust tracker: ais.raw -> ais.tracks.
 tracker: .env

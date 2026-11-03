@@ -4,8 +4,8 @@
 # Memory budget (mem_limit caps, not reservations):
 #   redpanda 1.5g (1G Seastar heap + overhead) | console 256m
 #   clickhouse 2g | postgis 512m               | raw-sink 384m
-#   tracker 512m
-#   total ≈ 5.1g ceiling
+#   tracker 512m  | alerts-sink 192m
+#   total ≈ 5.3g ceiling
 # Every image tag is pinned; never use :latest (reproducibility).
 
 name: dvw
@@ -155,7 +155,7 @@ services:
         condition: service_completed_successfully
       clickhouse:
         condition: service_healthy
-    environment:
+    environment: &sink-env
       REDPANDA_BROKERS: redpanda:9092   # internal listener
       CLICKHOUSE_HOST: clickhouse
       CLICKHOUSE_PORT: "8123"
@@ -164,6 +164,26 @@ services:
     # 50k-row batches plus a 16 MB librdkafka prefetch buffer; see README for measured usage.
     mem_limit: 384m
     # Long enough to insert and commit an in-flight batch, including a retry or two.
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  # ais.alerts -> dvw.alerts: same image and delivery code as raw-sink, another SinkSpec
+  # (sinks/clickhouse/specs.py, docs/adr/0006). Resent alerts collapse on alert_id.
+  alerts-sink:
+    build:
+      context: ../..
+      dockerfile: sinks/clickhouse/Dockerfile
+    image: dvw-clickhouse-sink:0.2.0
+    container_name: dvw-alerts-sink
+    command: ["alerts"]
+    depends_on:
+      init-topics:
+        condition: service_completed_successfully
+      clickhouse:
+        condition: service_healthy
+    environment: *sink-env
+    # Batches of at most 10k small rows; the 16 MB prefetch buffer dominates.
+    mem_limit: 192m
     stop_grace_period: 30s
     restart: unless-stopped
 
