@@ -60,6 +60,8 @@ def rec(offset: int, key: bytes | None = KEY, partition: int = 3, **overrides: A
         (KEY, value(schema_version=2), Skip.DECODE_ERROR),
         (b"219000000", value(), Skip.DECODE_ERROR),  # key and value disagree
         (KEY, value(run_id=None), Skip.DECODE_ERROR),
+        (b"992191234", value(mmsi=992191234), Skip.NOT_A_SHIP),  # aid to navigation
+        (b"2190047", value(mmsi=2190047, event_ts=None), Skip.NOT_A_SHIP),  # before no_event_ts
         (KEY, value(event_ts=None), Skip.NO_EVENT_TS),
         (KEY, value(lat=None), Skip.NO_POSITION),
         (KEY, value(lat=91.0, lon=181.0), Skip.NO_POSITION),  # AIS "not available"
@@ -204,6 +206,7 @@ def test_batch_counts_outputs_and_writes() -> None:
     store = Store()
     tracks, counts = store.apply(batch())
     assert counts == {
+        "read": 7,
         "started": 2,
         "updated": 2,
         "duplicate": 1,
@@ -213,6 +216,28 @@ def test_batch_counts_outputs_and_writes() -> None:
     assert [k for k, _ in tracks] == [KEY, OTHER, KEY, KEY]
     assert sorted(store.loads) == sorted([KEY, OTHER])  # once per key
     assert VesselState.from_bytes(store.data[KEY]).last_offset == 15
+
+
+BUOY = b"992191234"  # 99: aid to navigation
+
+
+def test_buoy_gets_no_track_and_is_counted() -> None:
+    store = Store()
+    records = [
+        rec(20, key=BUOY, mmsi=992191234),
+        rec(21, key=BUOY, mmsi=992191234, event_ts=T0 + 60_000),
+        rec(22),
+    ]
+    tracks, counts = store.apply(records)
+    assert [k for k, _ in tracks] == [KEY]
+    assert BUOY not in store.data and BUOY not in store.loads
+    assert counts == {"read": 3, "not_a_ship": 2, "started": 1}
+
+
+def test_counts_add_up_to_read() -> None:
+    _, counts = Store().apply(batch())
+    per_record = {s.value for s in Skip} | {r.value for r in Result}
+    assert sum(v for k, v in counts.items() if k in per_record) == counts["read"]
 
 
 def test_redelivery_after_crash_is_exact_or_skipped() -> None:

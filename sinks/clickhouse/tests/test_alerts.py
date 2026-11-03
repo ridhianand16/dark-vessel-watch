@@ -17,7 +17,7 @@ def alert(**overrides: Any) -> dict[str, Any]:
         "schema_version": 1,
         "alert_id": ALERT_ID,
         "type": "DARK_GAP",
-        "mmsi": 999000001,
+        "mmsi": 200000001,
         "run_id": "20261103T120000Z-abc123",
         "ts": 1_761_611_400_000,
         "lat": 56.4,
@@ -38,7 +38,7 @@ def row_for(value: bytes | None, partition: int = 2, offset: int = 41) -> dict[s
 def test_valid_alert() -> None:
     r = row_for(json.dumps(alert()).encode())
     assert r["decode_error"] == ""
-    assert (r["alert_id"], r["type"], r["mmsi"], r["ts"]) == (ALERT_ID, "DARK_GAP", 999000001, 1_761_611_400_000)
+    assert (r["alert_id"], r["type"], r["mmsi"], r["ts"]) == (ALERT_ID, "DARK_GAP", 200000001, 1_761_611_400_000)
     assert (r["pred_lat"], r["pred_lon"]) == (56.45, 11.9)
     assert json.loads(r["details"]) == {"last_seen_ts": 1_761_609_600_000, "gap_s": 1800.0}
     assert (r["kafka_partition"], r["kafka_offset"], r["kafka_ts"]) == (2, 41, KAFKA_TS)

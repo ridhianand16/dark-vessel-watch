@@ -8,7 +8,9 @@ It is a streaming pipeline that runs on a laptop without a network connection: R
 
 A day of Danish AIS traffic replays into Redpanda in event-time order, and every message lands in ClickHouse, including ones that are not valid JSON (they are stored with a reason code instead of being dropped). For each replay run, a per-partition check compares what the broker acknowledged with what is stored and shows that nothing was lost or duplicated. That holds when the sink is killed partway through a run or made to re-read the whole topic.
 
-A Faust worker tracks every vessel with a Kalman filter and writes one `ais.tracks` message per accepted fix: filtered position and velocity, and how far the fix landed from the prediction (the innovation). It is at-least-once with outputs stored before state, so a crash can repeat a track message but not lose one ([ADR 0004](docs/adr/0004-tracker-at-least-once-outputs-before-state.md)).
+A Faust worker tracks every ship with a Kalman filter and writes one `ais.tracks` message per accepted fix: filtered position and velocity, and how far the fix landed from the prediction (the innovation). It is at-least-once with outputs stored before state, so a crash can repeat a track message but not lose one ([ADR 0004](docs/adr/0004-tracker-at-least-once-outputs-before-state.md)). Base stations, buoys, SAR aircraft and distress beacons also send AIS. The tracker recognises them by MMSI range (ITU-R M.585) and skips them with a `not_a_ship` count. Their rows stay in the raw store ([ADR 0008](docs/adr/0008-10x-replay-target-and-ship-only-tracking.md)).
+
+The pipeline is sized for replay at 10x on one worker per service, on an 8 GB laptop. That is the speed the latency target applies to and the speed `make replay` uses by default. [Going faster](#going-faster) explains what it would take to go further.
 
 The same worker raises DARK_GAP and TELEPORT alerts on `ais.alerts`, each with a deterministic `alert_id` so a reprocessed alert is the same alert ([ADR 0005](docs/adr/0005-detections-in-the-tracker-event-time.md)). A second instance of the ClickHouse sink stores them in `dvw.alerts`, deduplicated on `alert_id` ([ADR 0006](docs/adr/0006-alerts-sink-config-driven.md)). The replayer can mix labelled synthetic vessels into a run, and a scorer checks that each injected anomaly raised exactly its alert ([ADR 0007](docs/adr/0007-injected-anomalies-and-scoring.md)). That holds when the tracker is killed partway through a run.
 
@@ -32,7 +34,7 @@ Stubbed until the zones exist (M3): the spec's DARK_GAP also requires the vessel
 
 ### Injected anomalies
 
-`--inject ingest/replayer/anomalies.yaml` adds eight synthetic vessels (MMSIs 999000001 to 999000022, a block the real data does not use):
+`--inject ingest/replayer/anomalies.yaml` adds eight synthetic vessels (MMSIs 200000001 to 200000022, a block the real data does not use):
 
 - three that switch AIS off for 45 min while under way, then reappear on their dead-reckoned track;
 - three whose reported position jumps 30 km in one report and stays there;
@@ -62,19 +64,30 @@ make up        # git hooks, stack, topics, ClickHouse migrations, raw sink, trac
 make ps        # every service healthy, raw-sink running
 make fetch     # download and verify the pinned AIS day (once, about 3 GB)
 
-make replay ARGS="--limit 10000 --speed 100"   # prints the run_id
+make replay ARGS="--limit 10000"                # 10x by default; prints the run_id
 make reconcile RUN=<run_id>                     # per-partition produced vs stored
 
-# with labelled anomalies (needs at least ~650k rows, see Detections)
+# with labelled anomalies (needs at least ~650k rows, see Detections).
+# 50x only to shorten the run; the tracker falls behind and catches up, and the score waits for it.
 make replay ARGS="--limit 700000 --speed 50 --inject ingest/replayer/anomalies.yaml"
 make score RUN=<run_id> WAIT=600                # TP/FP/FN per alert type
 ```
 
-Redpanda Console is at http://localhost:8080. `make sink-logs` and `make alerts-sink-logs` follow the two sinks (one line per batch). `make tracker-logs` follows the tracker, which logs its counters every 30 s (`tracks=... duplicate=... no_position=...`). `make down` stops the stack and keeps the data. `make nuke` stops it and deletes all data volumes, including ClickHouse.
+Redpanda Console is at http://localhost:8080. `make sink-logs` and `make alerts-sink-logs` follow the two sinks (one line per batch). `make tracker-logs` follows the tracker, which logs its counters every 30 s (`tracks=... read=... not_a_ship=... duplicate=...`). Every record read gets exactly one skip reason or result, so those counters add up to `read`. `make down` stops the stack and keeps the data. `make nuke` stops it and deletes all data volumes, including ClickHouse.
 
 Other targets: `make migrate` applies new files in `sql/clickhouse/` and does nothing when up to date. `make test` and `make typecheck` run pytest and `mypy --strict`.
 
 If a sink or the tracker crashes, Docker restarts it and it re-reads from its last committed offset. `docker stop` and `docker kill` count as deliberate stops and leave it down; `make sink`, `make alerts-sink` or `make tracker` starts it again.
+
+## Going faster
+
+10x is the target, not the ceiling of the design. One tracker worker reads about 4,200 records/s, and the DMA day averages about 219 rows/s of event time, so 10x (about 2,200 rows/s) leaves headroom and 50x (about 11,000 rows/s) does not. In order of cost, these are the ways to go faster:
+
+1. **More tracker workers, up to 6.** `ais.raw` has 6 partitions keyed by MMSI, and vessel state is partitioned the same way, so Faust can spread the partitions over up to 6 workers without code changes. Each worker costs about 150 to 512 MiB, which is what rules it out on this laptop.
+2. **Drop numpy from the Kalman step.** The filter is 4x4, and per-record numpy calls cost more in overhead than the arithmetic does. Unrolling the predict and update steps into plain floats removes that overhead. I have not measured the gain yet. It needs a test that compares the two versions so the outputs stay identical.
+3. **Filter earlier, in Flink.** Today the tracker decodes every record, including the 9% from non-ship stations and the 35% repeated reports. The Flink validation job will drop those before `ais.enriched`, so the tracker only sees records it will use.
+
+Past 6 workers, the next limit is the partition count. Changing it needs an ADR (ADR 0001).
 
 ## Architecture
 
@@ -96,7 +109,8 @@ Measured on 2026-11-02 on an Apple M1 laptop (8 GB RAM, macOS 26.5), Docker VM w
 | Raw sink memory | `docker stats` after the backlog | 138 MiB of its 384 MiB limit |
 | Zero loss, whole topic | `count() FINAL` vs topic high watermarks | 529,812 messages on `ais.raw`, 529,812 rows, every offset present once |
 | Tracker, reading the existing backlog | start the tracker on 529,812 `ais.raw` messages | about 4,200 records/s (one worker). Counters add up to 529,812. 150 MiB of its 512 MiB limit |
-| Tracker, 10,000-row replay | `make replay ARGS="--limit 10000 --speed 100"` | 5,684 track messages (the rest are repeated fixes and missing positions), one per `(src_partition, src_offset)`. Innovation median 0.9 m, p99 22 m |
+| Tracker counters, 10,000-row replay at 10x (2026-11-03) | `make replay ARGS="--limit 10000"`, then `make tracker-logs` | `read=10000` = 4,075 updated + 1,279 restarted (vessels already tracked in an earlier run) + 3,507 duplicate + 910 not_a_ship + 229 no_position. 5,354 track messages. The 910 non-ship records are 682 coast stations and 228 aids to navigation, all still in `dvw.ais_raw`. Replay took 7.5 s. `make reconcile` OK on all 6 partitions |
+| Tracker, 10,000-row replay (2026-11-02, before the ship filter) | `make replay ARGS="--limit 10000 --speed 100"` | 5,684 track messages (the rest are repeated fixes and missing positions), one per `(src_partition, src_offset)`. Innovation median 0.9 m, p99 22 m |
 | Zero loss with the sink killed mid-run | `docker kill` at 66,093 of 200,000 stored, then restart | `make reconcile` OK: 200,000 produced = 200,000 stored |
 | Replay 700,000 rows + 1,665 synthetic at 50x | `make replay ARGS="--limit 700000 --speed 50 --inject ..."` | 74 to 77 s, 701,665 acknowledged. About 4 s of that is the up-front span check |
 | Injected anomalies, tracker killed mid-run | `docker kill dvw-tracker` after the 3rd injected alert, `make tracker` | 6 of 6 alerts, no extras, same 28 alerts as the clean runs. 3,823 records skipped as `redelivered` on restart. `make reconcile` OK |
