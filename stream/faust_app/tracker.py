@@ -656,10 +656,11 @@ def process_batch(
         fix = decode(rec.key, rec.value, enriched)
         if isinstance(fix, Skip):
             out.counts[fix.value] += 1
-            if enriched and fix in LEAK_SKIPS:
-                out.counts[Leak.INVALID.value] += 1
-            elif fix is Skip.CLASS_MISMATCH:
-                out.counts[Leak.STATION_CLASS.value] += 1
+            if enriched:  # decode() returns CLASS_MISMATCH only for enriched records
+                if fix in LEAK_SKIPS:
+                    out.counts[Leak.INVALID.value] += 1
+                elif fix is Skip.CLASS_MISMATCH:
+                    out.counts[Leak.STATION_CLASS.value] += 1
             continue
         key = rec.key
         assert key is not None  # decode() returns Skip.INVALID_KEY otherwise

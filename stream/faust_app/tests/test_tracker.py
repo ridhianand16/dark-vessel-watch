@@ -6,7 +6,9 @@ from typing import Any
 import pytest
 
 from stream.faust_app.kalman import KalmanConfig
+from stream.faust_app.mmsi import StationClass
 from stream.faust_app.tracker import (
+    LEAK_SKIPS,
     Leak,
     PartitionMismatch,
     RawRecord,
@@ -210,14 +212,16 @@ class Store:
         self.data: dict[bytes, bytes] = {}
         self.loads: list[bytes] = []
 
-    def apply(self, records: list[RawRecord]) -> tuple[list[tuple[bytes, bytes]], dict[str, int]]:
+    def apply(
+        self, records: list[RawRecord], enriched: bool = False
+    ) -> tuple[list[tuple[bytes, bytes]], dict[str, int]]:
         def load(i: int) -> bytes | None:
             key = records[i].key
             assert key is not None
             self.loads.append(key)
             return self.data.get(key)
 
-        result = process_batch(records, load, CFG)
+        result = process_batch(records, load, CFG, enriched=enriched)
         for _, key, blob in result.writes:
             self.data[key] = blob
         return result.tracks, dict(result.counts)
@@ -366,6 +370,61 @@ def test_leaks_are_counted() -> None:
     assert counts[Leak.INVALID.value] == 1
     assert counts[Leak.STATION_CLASS.value] == 1
     assert counts["not_a_ship"] == 1 and counts["station_class_mismatch"] == 1
+    per_record = {s.value for s in Skip} | {r.value for r in Result}
+    assert sum(v for k, v in counts.items() if k in per_record) == counts["read"] == 5
+
+
+# One enriched record per skip that Flink should have made impossible.
+LEAK_SKIP_RECORDS: list[tuple[RawRecord, Skip]] = [
+    (erec(10, key=b"invalid"), Skip.INVALID_KEY),
+    (erec(10, src_offset=None), Skip.DECODE_ERROR),
+    (erec(10, event_ts=None), Skip.NO_EVENT_TS),
+    (erec(10, lat=None), Skip.NO_POSITION),
+]
+
+
+def test_leak_skip_cases_cover_every_leak_skip() -> None:
+    assert {skip for _, skip in LEAK_SKIP_RECORDS} == LEAK_SKIPS
+
+
+@pytest.mark.parametrize(("record", "skip"), LEAK_SKIP_RECORDS)
+def test_every_invalid_skip_on_enriched_is_one_leak(record: RawRecord, skip: Skip) -> None:
+    _, counts, state = enriched_batch([record])
+    assert counts == {"read": 1, skip.value: 1, Leak.INVALID.value: 1}
+    assert state is None
+
+
+CRAFT_KEY = b"982190001"
+
+
+@pytest.mark.parametrize(
+    ("key", "mmsi", "tagged"),
+    [
+        (KEY, MMSI, "craft_with_parent"),  # ship tagged as the other ship class
+        (CRAFT_KEY, 982190001, "ship"),  # and the reverse
+        (BUOY, 992191234, "ship"),  # non-ship tagged ship
+        (KEY, MMSI, "aid_to_navigation"),  # ship tagged non-ship
+        (BUOY, 992191234, "coast"),  # both non-ship, still not the same class
+        (KEY, MMSI, "aton"),  # not a wire value at all
+    ],
+)
+def test_class_mismatch_on_enriched_is_skipped_and_counted(key: bytes, mmsi: int, tagged: str) -> None:
+    tracks, counts, _ = enriched_batch([erec(10, key=key, mmsi=mmsi, station_class=tagged)])
+    assert tracks == []
+    assert counts == {"read": 1, "station_class_mismatch": 1, Leak.STATION_CLASS.value: 1}
+
+
+@pytest.mark.parametrize("tagged", [*(c.value for c in StationClass), "aton"])
+@pytest.mark.parametrize(("key", "mmsi"), [(KEY, MMSI), (CRAFT_KEY, 982190001), (BUOY, 992191234)])
+def test_class_mismatch_is_unreachable_on_raw(key: bytes, mmsi: int, tagged: str) -> None:
+    """decode() only reads station_class on the enriched path. On ais.raw, a record that
+    happens to carry any station_class decodes by mmsi.py alone: never a mismatch, never
+    a leak."""
+    r = rec(10, key=key, mmsi=mmsi, station_class=tagged)
+    assert decode(r.key, r.value) != Skip.CLASS_MISMATCH
+    _, counts = Store().apply([r])
+    assert "station_class_mismatch" not in counts
+    assert not any(k.startswith("leak_") for k in counts)
 
 
 def test_no_leaks_counted_on_raw_input() -> None:
@@ -394,3 +453,61 @@ def test_enriched_craft_with_parent_is_tracked() -> None:
     assert result.counts["started"] == 1
     assert result.counts[Leak.STATION_CLASS.value] == 0
     assert result.counts["station_class_mismatch"] == 0
+
+
+# --- ais.enriched: crash and redelivery (ADR 0004 with the src_offset bookmark) ----
+
+
+def enriched_records() -> list[RawRecord]:
+    return [
+        erec(10),
+        erec(11, event_ts=T0 + 60_000, lon=10.00497),
+        erec(12, event_ts=T0 + 120_000, lon=10.00994),
+    ]
+
+
+def test_enriched_redelivery_after_crash_is_exact_or_skipped() -> None:
+    """The two crash cases in ADR 0004 on ais.enriched. State not yet written: the batch
+    runs again from the old state and gives the same bytes. State written but offsets
+    not committed: every record comes again and is behind the src_offset bookmark."""
+    first = Store()
+    tracks_1, _ = first.apply(enriched_records(), enriched=True)
+    assert [json.loads(v)["src_offset"] for _, v in tracks_1] == [10, 11, 12]
+
+    not_written = Store()
+    tracks_2, _ = not_written.apply(enriched_records(), enriched=True)
+    assert tracks_2 == tracks_1
+
+    tracks_3, counts_3 = first.apply(enriched_records(), enriched=True)
+    assert tracks_3 == []
+    assert counts_3 == {"read": 3, "redelivered": 3}
+    assert VesselState.from_bytes(first.data[KEY]).last_offset == 12
+
+
+def test_flink_rewrite_at_new_enriched_offsets_is_skipped_by_src_offset() -> None:
+    """Flink recovery writes records again at new ais.enriched offsets (their first,
+    aborted, copies are never read). The bookmark is src_offset, so the new copies are
+    behind it whatever their own offset, and only the record after them is applied."""
+    store = Store()
+    store.apply(enriched_records()[:2], enriched=True)
+    rewritten = [RawRecord(r.key, r.value, r.partition, r.offset + 1_000) for r in enriched_records()[:2]]
+    tracks, counts = store.apply([*rewritten, enriched_records()[2]], enriched=True)
+    assert counts == {"read": 3, "redelivered": 2, "updated": 1}
+    assert [json.loads(v)["src_offset"] for _, v in tracks] == [12]
+
+
+def test_partition_mismatch_stops_the_batch_before_any_output() -> None:
+    """A record in the wrong partition, after good ones in the same batch: the whole
+    batch raises, so app.py sends nothing and writes no state for any of it."""
+    good = enriched_records()[:2]
+    moved = RawRecord(KEY, enriched_records()[2].value, 4, 7)
+    store = Store()
+    with pytest.raises(PartitionMismatch, match="ais.enriched/4@7 came from ais.raw/3"):
+        store.apply([*good, moved], enriched=True)
+    assert store.data == {}
+
+
+def test_partition_is_not_checked_on_raw() -> None:
+    """ais.raw records carry no src_partition; a src_partition field is ignored there."""
+    _, counts = Store().apply([rec(10, src_partition=5, src_offset=99)])
+    assert counts == {"read": 1, "started": 1}
