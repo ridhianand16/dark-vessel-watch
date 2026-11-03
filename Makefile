@@ -47,10 +47,12 @@ fetch: .env
 	@test -n "$(AIS_DAY)" || { echo "AIS_DAY is not set in .env" >&2; exit 1; }
 	uv run python refdata/fetch.py --source dma_ais --day $(AIS_DAY) --dest $(AIS_DATA_DIR)
 
-## Replay the pinned AIS day into ais.raw. Brokers default to REDPANDA_BROKERS in .env.
-## Extra flags via ARGS, e.g. make replay ARGS="--limit 10000 --speed 100"
+## Replay the pinned AIS day into ais.raw at SPEED (default 10x, the speed the
+## pipeline is sized for). Brokers default to REDPANDA_BROKERS in .env.
+## Extra flags via ARGS, e.g. make replay ARGS="--limit 10000"; a --speed in ARGS wins.
+SPEED ?= 10
 replay: .env
-	uv run python -m ingest.replayer --file $(AIS_CSV) $(ARGS)
+	uv run python -m ingest.replayer --file $(AIS_CSV) --speed $(SPEED) $(ARGS)
 
 ## (Re)build and start the ais.raw -> ClickHouse sink.
 sink: .env
