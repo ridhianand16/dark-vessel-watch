@@ -14,7 +14,7 @@ The pipeline is sized for replay at 10x on one worker per service, on an 8 GB la
 
 The same worker raises DARK_GAP and TELEPORT alerts on `ais.alerts`, each with a deterministic `alert_id` so a reprocessed alert is the same alert ([ADR 0005](docs/adr/0005-detections-in-the-tracker-event-time.md)). A second instance of the ClickHouse sink stores them in `dvw.alerts`, deduplicated on `alert_id` ([ADR 0006](docs/adr/0006-alerts-sink-config-driven.md)). The replayer can mix labelled synthetic vessels into a run, and a scorer checks that each injected anomaly raised exactly its alert ([ADR 0007](docs/adr/0007-injected-anomalies-and-scoring.md)). That holds when the tracker is killed partway through a run.
 
-The zones DARK_GAP needs come from three reference datasets: Marine Regions EEZ polygons and boundary lines, protected areas from WDPA, and ports from the World Port Index. Each is pinned by SHA-256 in `refdata/sources.yaml`. `make fetch-refdata` verifies them and prints exactly where to download and place the two that sit behind a form or a monthly URL ([ADR 0009](docs/adr/0009-zone-sources-pinned-and-area-from-the-feed.md)). The zone package will cover only the area the feed sees. `make area` computes that from the AIS day: 2.69 to 17.53 E, 53.52 to 59.57 N, which is the trimmed extent of 18.9 million valid positions plus a 20 nm margin. Plain min/max would have reached 60 S, because of 179 stray fixes. The checks a new package must pass in a staging schema before it replaces the live zones are written and tested against PostGIS ([ADR 0010](docs/adr/0010-zone-package-staging-swap-and-port-radius.md)).
+The zones DARK_GAP needs come from three reference datasets: Marine Regions EEZ polygons and boundary lines, protected areas from WDPA, and ports from the World Port Index. Each is pinned by SHA-256 in `refdata/sources.yaml`. All three are downloaded by hand: EEZ sits behind a form, WDPA moves monthly, and NGA refuses scripted WPI downloads. `make fetch-refdata` verifies them and prints exactly where to get and place any that are missing ([ADR 0009](docs/adr/0009-zone-sources-pinned-and-area-from-the-feed.md)). The zone package will cover only the area the feed sees. `make area` computes that from the AIS day: 2.69 to 17.53 E, 53.52 to 59.57 N, which is the trimmed extent of 18.9 million valid positions plus a 20 nm margin. Plain min/max would have reached 60 S, because of 179 stray fixes. The checks a new package must pass in a staging schema before it replaces the live zones are written and tested against PostGIS ([ADR 0010](docs/adr/0010-zone-package-staging-swap-and-port-radius.md)).
 
 Not built yet: the package builder and loader (so the DARK_GAP zone check still passes everywhere), MMSI_CLASH and Flink enrichment.
 
@@ -78,11 +78,11 @@ make score RUN=<run_id> WAIT=600                # TP/FP/FN per alert type
 Reference data for the zones (not needed by the steps above yet):
 
 ```sh
-make fetch-refdata   # verify EEZ, WDPA and WPI files; prints where to download any that are missing
+make fetch-refdata   # verify the EEZ, WDPA and WPI files; prints where to download any that are missing
 make area            # only if the AIS day changes: recompute refdata/area.yaml from the CSV
 ```
 
-EEZ (Marine Regions form) and WDPA (Protected Planet terms page) have to be downloaded by hand into `data/refdata/incoming/<source>/<version>/`. `make fetch-refdata` prints the page and the exact path for each missing file, and fails on any file whose SHA-256 does not match `refdata/sources.yaml`.
+EEZ (Marine Regions form), WDPA (Protected Planet terms page) and WPI (NASA Harvest mirror of the NGA release) have to be downloaded by hand into `data/refdata/incoming/<source>/<version>/`, under the file names in `refdata/sources.yaml`. `make fetch-refdata` prints the page and the exact path for each missing file, and fails on any file whose SHA-256 does not match `refdata/sources.yaml`.
 
 Redpanda Console is at http://localhost:8080. `make sink-logs` and `make alerts-sink-logs` follow the two sinks (one line per batch). `make tracker-logs` follows the tracker, which logs its counters every 30 s (`tracks=... read=... not_a_ship=... duplicate=...`). Every record read gets exactly one skip reason or result, so those counters add up to `read`. `make down` stops the stack and keeps the data. `make nuke` stops it and deletes all data volumes, including ClickHouse.
 
@@ -134,8 +134,8 @@ End-to-end latency and full-day throughput are still to be measured.
 The pipeline runs on data I do not own. None of it is in this repository. `make fetch` and `make fetch-refdata` get it from the source, and the hashes in `refdata/sources.yaml` pin the exact files.
 
 - **AIS positions:** Contains AIS data from the Danish Maritime Authority. Free re-use under the Danish act on re-use of public sector information.
-- **EEZ polygons and boundaries:** Flanders Marine Institute (2023). Maritime Boundaries Geodatabase: Maritime Boundaries and Exclusive Economic Zones (200NM), version 12. https://doi.org/10.14284/632. CC BY-NC-SA 4.0.
-- **Marine protected areas:** UNEP-WCMC and IUCN (2026), Protected Planet: The World Database on Protected Areas (WDPA) and World Database on Other Effective Area-based Conservation Measures (WD-OECM), November 2026, Cambridge, UK. www.protectedplanet.net. Non-commercial use; no redistribution.
-- **Ports:** National Geospatial-Intelligence Agency, World Port Index (Pub. 150). US Government work, public domain.
+- **EEZ polygons and boundaries:** Flanders Marine Institute (2023). Maritime Boundaries Geodatabase: Maritime Boundaries and Exclusive Economic Zones (200NM), version 12. Available online at https://www.marineregions.org/. CC BY-NC-SA 4.0.
+- **Marine protected areas:** UNEP-WCMC and IUCN (2026), Protected Planet: The World Database on Protected Areas (WDPA), November 2026, Cambridge, UK: UNEP-WCMC and IUCN. Available at: www.protectedplanet.net. Non-commercial use; no redistribution.
+- **Ports:** National Geospatial-Intelligence Agency, World Port Index (Pub 150); obtained via NASA Harvest Portal. US Government work, public domain (original); CC BY on the mirror.
 
 Because of the WDPA and Marine Regions terms, the built zone package is never committed or published. The repository ships the fetcher and the pinned hashes instead, and will ship the package builder.
