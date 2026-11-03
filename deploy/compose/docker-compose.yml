@@ -4,7 +4,8 @@
 # Memory budget (mem_limit caps, not reservations):
 #   redpanda 1.5g (1G Seastar heap + overhead) | console 256m
 #   clickhouse 2g | postgis 512m               | raw-sink 384m
-#   total ≈ 4.6g ceiling
+#   tracker 512m
+#   total ≈ 5.1g ceiling
 # Every image tag is pinned; never use :latest (reproducibility).
 
 name: dvw
@@ -165,7 +166,30 @@ services:
     stop_grace_period: 30s
     restart: unless-stopped
 
+  # ais.raw -> per-MMSI Kalman filter -> ais.tracks (stream/faust_app, docs/adr/0004).
+  # At-least-once; vessel state lives in the dvw-tracker-vessel_state-changelog topic,
+  # with a local RocksDB copy in tracker-data. `make nuke` drops both together.
+  tracker:
+    build:
+      context: ../..
+      dockerfile: stream/faust_app/Dockerfile
+    image: dvw-tracker:0.1.0
+    container_name: dvw-tracker
+    depends_on:
+      init-topics:
+        condition: service_completed_successfully
+    environment:
+      REDPANDA_BROKERS: redpanda:9092   # internal listener
+    volumes:
+      - tracker-data:/data
+    # Python + numpy + 6 small RocksDB instances (8 MB block cache each, see app.py).
+    mem_limit: 512m
+    # Long enough to finish the in-flight batch, flush the producer and commit.
+    stop_grace_period: 30s
+    restart: unless-stopped
+
 volumes:
   redpanda-data:
   clickhouse-data:
   postgis-data:
+  tracker-data:

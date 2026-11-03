@@ -5,5 +5,6 @@
 !.python-version
 !common/
 !sinks/
+!stream/
 **/__pycache__
 **/tests
