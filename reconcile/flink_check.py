@@ -10,8 +10,11 @@ For each ais.raw partition p in data/runs/<run_id>/produced.json, over its offse
 enriched(p) and dlq(p) count the ais.enriched and ais.dlq records whose src_partition is p and
 whose src_offset is in the range. duplicates(p) sums `count` over the ais.dedup_counts records
 with this run_id and src_partition p (docs/adr/0015). It also checks that no
-(src_partition, src_offset) appears twice across ais.enriched and ais.dlq, and that every
-record in the range carries this run_id (a decode_error DLQ record may have none).
+(src_partition, src_offset) appears twice across ais.enriched and ais.dlq, that every
+record in the range carries this run_id (a decode_error DLQ record may have none), and
+that every enriched record is zone-tagged: zones_version and dist_eez_boundary_m set
+(docs/adr/0018). The job buffers records until the zones are loaded, so an untagged
+record means that buffer leaked.
 
 All three topics are read with isolation.level=read_committed, so only output of completed
 Flink checkpoints counts, starting at the run's start time (offsets_for_times) minus a minute.
@@ -54,6 +57,7 @@ class Tally:
     duplicates: int = 0
     repeated: int = 0  # offsets seen a second time, in either output topic
     foreign: int = 0  # records in the range whose run_id is another run
+    untagged: int = 0  # enriched records without zone tags
     seen: bytearray = field(default_factory=bytearray, repr=False)  # one bit per offset
 
     def __post_init__(self) -> None:
@@ -66,7 +70,9 @@ class Tally:
 
     @property
     def ok(self) -> bool:
-        return self.accounted == self.produced.count and self.repeated == 0 and self.foreign == 0
+        return (
+            self.accounted == self.produced.count and self.repeated == 0 and self.foreign == 0 and self.untagged == 0
+        )
 
     @property
     def note(self) -> str:
@@ -80,6 +86,8 @@ class Tally:
             notes.append(f"{self.repeated} offsets twice")
         if self.foreign:
             notes.append(f"{self.foreign} from another run")
+        if self.untagged:
+            notes.append(f"{self.untagged} without zone tags")
         return ", ".join(notes) or "ok"
 
     def mark(self, offset: int) -> bool:
@@ -118,6 +126,8 @@ def tally(
     for rec in enriched:
         if (t := place(rec)) is not None:
             t.enriched += 1
+            if rec.get("zones_version") is None or rec.get("dist_eez_boundary_m") is None:
+                t.untagged += 1
     for rec in dlq:
         if (t := place(rec)) is not None:
             t.dlq += 1
@@ -178,19 +188,20 @@ def run_started_ms(path: Path) -> int:
 
 def render(run_id: str, tallies: list[Tally], reasons: Counter[str]) -> str:
     head = (f"{'partition':>9} {'first':>9} {'last':>9} {'raw':>8} {'enriched':>8} {'dlq':>6} "
-            f"{'dups':>6} {'twice':>6} {'foreign':>7}  status")
+            f"{'dups':>6} {'twice':>6} {'foreign':>7} {'untagged':>8}  status")
     lines = [f"run {run_id}  (raw = enriched + dlq + dups)", head, "-" * len(head)]
     for t in tallies:
         p = t.produced
         lines.append(
             f"{p.partition:>9} {p.first_offset:>9} {p.last_offset:>9} {p.count:>8} {t.enriched:>8} {t.dlq:>6} "
-            f"{t.duplicates:>6} {t.repeated:>6} {t.foreign:>7}  {'OK' if t.ok else 'MISMATCH: ' + t.note}"
+            f"{t.duplicates:>6} {t.repeated:>6} {t.foreign:>7} {t.untagged:>8}  {'OK' if t.ok else 'MISMATCH: ' + t.note}"
         )
     lines.append("-" * len(head))
     lines.append(
         f"{'total':>9} {'':>9} {'':>9} {sum(t.produced.count for t in tallies):>8} "
         f"{sum(t.enriched for t in tallies):>8} {sum(t.dlq for t in tallies):>6} "
-        f"{sum(t.duplicates for t in tallies):>6} {sum(t.repeated for t in tallies):>6}"
+        f"{sum(t.duplicates for t in tallies):>6} {sum(t.repeated for t in tallies):>6} "
+        f"{sum(t.foreign for t in tallies):>7} {sum(t.untagged for t in tallies):>8}"
     )
     if reasons:
         lines.append("dlq reasons: " + ", ".join(f"{r} {n}" for r, n in reasons.most_common()))
@@ -216,7 +227,9 @@ def main(argv: list[str] | None = None) -> int:
                 args.run_id, produced,
                 read_topic(brokers, ENRICHED, since), read_topic(brokers, DLQ, since), read_topic(brokers, COUNTS, since),
             )
-            catching_up = all(t.accounted <= t.produced.count and not t.repeated and not t.foreign for t in tallies)
+            catching_up = all(
+                t.accounted <= t.produced.count and not t.repeated and not t.foreign and not t.untagged for t in tallies
+            )
             if all(t.ok for t in tallies) or not catching_up or time.monotonic() >= deadline:
                 break
             time.sleep(2.0)
@@ -225,7 +238,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     print(render(args.run_id, tallies, reasons))
     if all(t.ok for t in tallies):
-        print(f"flink_check: OK, {sum(t.produced.count for t in tallies)} raw = enriched + dlq + dups, no offset twice")
+        print(
+            f"flink_check: OK, {sum(t.produced.count for t in tallies)} raw = enriched + dlq + dups,"
+            " no offset twice, every enriched record zone-tagged"
+        )
         return 0
     print("flink_check: MISMATCH", file=sys.stderr)
     return 1
