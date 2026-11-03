@@ -1,6 +1,6 @@
 # 0006. Alerts sink: the raw sink, driven by a spec, into a table keyed by alert_id
 
-Status: accepted (2026-11-03)
+Status: accepted (2026-11-03); batch window amended by ADR 0019
 
 ## Context
 

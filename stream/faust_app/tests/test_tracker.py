@@ -7,6 +7,8 @@ import pytest
 
 from stream.faust_app.kalman import KalmanConfig
 from stream.faust_app.tracker import (
+    Leak,
+    PartitionMismatch,
     RawRecord,
     Result,
     Skip,
@@ -43,6 +45,26 @@ def value(**overrides: Any) -> bytes:
 
 def rec(offset: int, key: bytes | None = KEY, partition: int = 3, **overrides: Any) -> RawRecord:
     return RawRecord(key, value(**overrides), partition, offset)
+
+
+# What the Flink job adds on ais.enriched. The default position is 3 km from a
+# protected area, so DARK_GAP's zone condition holds.
+ZONE: dict[str, Any] = {
+    "station_class": "ship",
+    "zones_version": "test-1",
+    "eez_id": "eez:5674",
+    "mpa_ids": [],
+    "in_port": False,
+    "dist_eez_boundary_m": 40_000.0,
+    "dist_mpa_m": 3_000.0,
+}
+
+
+def erec(offset: int, key: bytes | None = KEY, partition: int = 3, **overrides: Any) -> RawRecord:
+    """An ais.enriched record for ais.raw `offset`. Its own offset in ais.enriched is
+    smaller, as it would be after the Flink job drops records: never the bookmark."""
+    fields = {**ZONE, "src_partition": partition, "src_offset": offset, **overrides}
+    return RawRecord(key, value(**fields), partition, offset // 2)
 
 
 # --- decode -------------------------------------------------------------------
@@ -256,3 +278,89 @@ def test_redelivery_after_crash_is_exact_or_skipped() -> None:
     tracks_3, counts_3 = first.apply(batch())
     assert tracks_3 == []
     assert counts_3["redelivered"] == 5
+
+
+# --- ais.enriched ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "missing", ["src_partition", "src_offset", "station_class", "zones_version", "mpa_ids", "in_port"]
+)
+def test_enriched_record_without_flink_fields_is_a_decode_error(missing: str) -> None:
+    overrides: dict[str, Any] = {missing: None}
+    r = erec(10, **overrides)
+    assert decode(r.key, r.value, enriched=True) == Skip.DECODE_ERROR
+    assert not isinstance(decode(r.key, r.value), Skip)  # read as ais.raw it is fine
+
+
+def test_enriched_fix_carries_source_and_zone() -> None:
+    r = erec(10, dist_eez_boundary_m=None)
+    fix = decode(r.key, r.value, enriched=True)
+    assert not isinstance(fix, Skip) and fix.zone is not None
+    assert (fix.src_partition, fix.src_offset) == (3, 10)
+    assert (fix.zone.dist_mpa_m, fix.zone.dist_eez_boundary_m, fix.zone.in_port) == (3000.0, None, False)
+
+
+def enriched_batch(records: list[RawRecord]) -> tuple[list[dict[str, object]], dict[str, int], VesselState | None]:
+    result = process_batch(records, lambda i: None, CFG, enriched=True)
+    state = {k: b for _, k, b in result.writes}.get(KEY)
+    tracks = [json.loads(v) for _, v in result.tracks]
+    return tracks, dict(result.counts), VesselState.from_bytes(state) if state is not None else None
+
+
+def test_enriched_bookmark_is_the_raw_offset() -> None:
+    """erec() gives each record an enriched offset half its raw one. Tracks and the
+    bookmark must use the raw offset."""
+    tracks, _, state = enriched_batch([erec(10), erec(11, event_ts=T0 + 60_000, lon=10.00497)])
+    assert [(t["src_partition"], t["src_offset"]) for t in tracks] == [(3, 10), (3, 11)]
+    assert state is not None and state.last_offset == 11
+
+
+def test_enriched_tracks_equal_raw_tracks() -> None:
+    """The same records through either input give byte-identical tracks."""
+    records: list[tuple[int, dict[str, Any]]] = [
+        (10, {}),
+        (11, {"event_ts": T0 + 60_000, "lon": 10.00497}),
+        (12, {"event_ts": T0 + 120_000, "lon": 10.01}),
+    ]
+    raw = process_batch([rec(o, **kw) for o, kw in records], lambda i: None, CFG)
+    enr = process_batch([erec(o, **kw) for o, kw in records], lambda i: None, CFG, enriched=True)
+    assert raw.tracks == enr.tracks
+
+
+def test_enriched_bookmark_skips_what_was_applied_from_raw() -> None:
+    """A vessel state built from ais.raw, then the same run read from ais.enriched:
+    every record is behind the bookmark (enriched offsets alone would not be)."""
+    raw = process_batch([rec(10), rec(11, event_ts=T0 + 60_000, lon=10.00497)], lambda i: None, CFG)
+    blob = raw.writes[0][2]
+    again = process_batch(
+        [erec(10), erec(11, event_ts=T0 + 60_000, lon=10.00497), erec(12, event_ts=T0 + 120_000, lon=10.01)],
+        lambda i: blob, CFG, enriched=True,
+    )
+    assert again.counts["redelivered"] == 2 and again.counts["updated"] == 1
+
+
+def test_leaks_are_counted() -> None:
+    _, counts, _ = enriched_batch([
+        erec(10),
+        erec(11),  # duplicate of 10: Flink should have dropped it
+        erec(12, lat=None),  # Flink sends this to ais.dlq
+        erec(13, key=BUOY, mmsi=992191234, station_class="aton"),  # valid, skipped, no leak
+        erec(14, key=BUOY, mmsi=992191234, station_class="ship"),  # Flink and mmsi.py disagree
+    ])
+    assert counts[Leak.DUPLICATE.value] == 1
+    assert counts[Leak.INVALID.value] == 1
+    assert counts[Leak.STATION_CLASS.value] == 1
+    assert counts["not_a_ship"] == 1 and counts["station_class_mismatch"] == 1
+
+
+def test_no_leaks_counted_on_raw_input() -> None:
+    _, counts = Store().apply(batch())
+    assert not any(k.startswith("leak_") for k in counts)
+
+
+def test_enriched_partition_must_match_raw() -> None:
+    r = erec(10)
+    moved = RawRecord(r.key, r.value, 4, r.offset)
+    with pytest.raises(PartitionMismatch):
+        process_batch([moved], lambda i: None, CFG, enriched=True)

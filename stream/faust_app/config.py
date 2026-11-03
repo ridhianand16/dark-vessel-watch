@@ -1,5 +1,7 @@
 """Tracker settings from the environment (then .env), with defaults.
 
+    TRACKER_INPUT_TOPIC             ais.enriched   ais.enriched (the Flink job's output)
+                                           or ais.raw (no zone tags, so no DARK_GAP)
     TRACKER_MEAS_SIGMA_M            20     AIS position noise per axis, metres
     TRACKER_ACCEL_PSD               0.05   process noise q, m^2/s^3
     TRACKER_INIT_SPEED_SIGMA_MS     1.0    first-fix velocity sigma with SOG/COG, m/s
@@ -14,6 +16,8 @@ from here and nowhere else:
 
     DARK_GAP_S                      1800   silence before DARK_GAP, event-time seconds
     DARK_GAP_MIN_SOG_KN             2.0    vessel must have been moving faster than this
+    DARK_GAP_ZONE_NM                10.0   last accepted fix within this distance of an
+                                           EEZ boundary or protected area (and not in port)
     DARK_SCAN_STEP_S                60     scan a partition each time its watermark
                                            advances this much event time
     TELEPORT_MAX_SPEED_KN           50.0   implied speed above this is a TELEPORT
@@ -32,11 +36,16 @@ from dataclasses import dataclass, field
 from common.env import setting
 from stream.faust_app.kalman import KalmanConfig
 
+RAW_TOPIC = "ais.raw"
+ENRICHED_TOPIC = "ais.enriched"
+NM_M = 1852.0
+
 
 @dataclass(frozen=True)
 class DetectionConfig:
     dark_gap_s: float = 1800.0
     dark_gap_min_sog_kn: float = 2.0
+    dark_gap_zone_nm: float = 10.0
     dark_scan_step_s: float = 60.0
     teleport_max_speed_kn: float = 50.0
     teleport_min_dt_s: float = 10.0
@@ -57,7 +66,7 @@ class DetectionConfig:
             v = getattr(self, name)
             if not (math.isfinite(v) and v > 0):
                 raise ValueError(f"{name} must be a positive finite number, got {v!r}")
-        for name in ("dark_gap_min_sog_kn", "teleport_min_dt_s"):
+        for name in ("dark_gap_min_sog_kn", "dark_gap_zone_nm", "teleport_min_dt_s"):
             v = getattr(self, name)
             if not (math.isfinite(v) and v >= 0):
                 raise ValueError(f"{name} must be a finite number >= 0, got {v!r}")
@@ -70,6 +79,10 @@ class DetectionConfig:
         return round(self.dark_gap_s * 1000)
 
     @property
+    def dark_gap_zone_m(self) -> float:
+        return self.dark_gap_zone_nm * NM_M
+
+    @property
     def dark_scan_step_ms(self) -> int:
         return max(1, round(self.dark_scan_step_s * 1000))
 
@@ -77,11 +90,20 @@ class DetectionConfig:
 @dataclass(frozen=True)
 class TrackerConfig:
     brokers: str
+    input_topic: str
     data_dir: str
     batch_max: int
     batch_within_s: float
     kalman: KalmanConfig = field(default_factory=KalmanConfig)
     detect: DetectionConfig = field(default_factory=DetectionConfig)
+
+    def __post_init__(self) -> None:
+        if self.input_topic not in (RAW_TOPIC, ENRICHED_TOPIC):
+            raise ValueError(f"TRACKER_INPUT_TOPIC must be {ENRICHED_TOPIC} or {RAW_TOPIC}, got {self.input_topic!r}")
+
+    @property
+    def enriched(self) -> bool:
+        return self.input_topic == ENRICHED_TOPIC
 
 
 def load() -> TrackerConfig:
@@ -89,6 +111,7 @@ def load() -> TrackerConfig:
     r = DetectionConfig()
     return TrackerConfig(
         brokers=setting("REDPANDA_BROKERS", "localhost:19092"),
+        input_topic=setting("TRACKER_INPUT_TOPIC", ENRICHED_TOPIC),
         data_dir=setting("TRACKER_DATA_DIR", "./data/tracker"),
         batch_max=int(setting("TRACKER_BATCH_MAX", "1000")),
         batch_within_s=float(setting("TRACKER_BATCH_WITHIN_S", "0.1")),
@@ -101,6 +124,7 @@ def load() -> TrackerConfig:
         detect=DetectionConfig(
             dark_gap_s=float(setting("DARK_GAP_S", str(r.dark_gap_s))),
             dark_gap_min_sog_kn=float(setting("DARK_GAP_MIN_SOG_KN", str(r.dark_gap_min_sog_kn))),
+            dark_gap_zone_nm=float(setting("DARK_GAP_ZONE_NM", str(r.dark_gap_zone_nm))),
             dark_scan_step_s=float(setting("DARK_SCAN_STEP_S", str(r.dark_scan_step_s))),
             teleport_max_speed_kn=float(setting("TELEPORT_MAX_SPEED_KN", str(r.teleport_max_speed_kn))),
             teleport_min_dt_s=float(setting("TELEPORT_MIN_DT_S", str(r.teleport_min_dt_s))),

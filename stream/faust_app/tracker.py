@@ -1,14 +1,24 @@
 """Per-vessel tracking logic. Pure: no I/O, no Faust (app.py is the Faust glue).
 
-One ais.raw record goes through three stages:
+The input is ais.enriched (the Flink enrichment job's output: the ais.raw object plus
+src_partition, src_offset, station_class and zone tags), or ais.raw directly. Either
+way one record goes through three stages:
 
 1. decode()  -> a Fix, or a Skip reason. Skipped records never touch state:
        invalid_key   key is "invalid" (unparseable MMSI) or missing
        decode_error  not UTF-8 JSON object, schema_version != 1, MMSI does not match
-                     the key, or no run_id
+                     the key, or no run_id; on ais.enriched also missing or mistyped
+                     src_partition, src_offset, station_class or zone tags
        not_a_ship    MMSI is not a ship station (mmsi.py): buoys, base stations, SARTs
+       station_class_mismatch  ais.enriched only: the Flink job's station_class and
+                     mmsi.py disagree about whether this is a ship
        no_event_ts   event_ts missing
        no_position   lat/lon missing or out of range (AIS sends 91/181 for "not available")
+   On ais.enriched the Flink job has already dropped invalid records (to ais.dlq) and
+   duplicates, so the tracker's own checks are a safety net. A record they catch
+   anyway is counted as a leak (Leak): leak_invalid for any skip other than
+   not_a_ship, leak_station_class, and leak_duplicate for a duplicate result. Non-ship
+   stations are valid in ais.enriched and are skipped here as on ais.raw.
 2. apply()   -> an Outcome for that vessel, given its stored state:
        started       first fix of this MMSI: new track, anchored at this fix
        restarted     first fix of this MMSI in a new run_id: state reset, as above
@@ -18,8 +28,11 @@ One ais.raw record goes through three stages:
                      a TELEPORT alert
        reinitialised the Nth rejection in a row (teleport_max_rejects): the vessel
                      really is over there, so the filter restarts at this fix
-       redelivered   offset <= the last offset applied to this vessel: the record was
-                     already processed before a restart (ADR 0004); nothing changes
+       redelivered   ais.raw offset <= the last one applied to this vessel: the record
+                     was already processed before a restart (ADR 0004); nothing changes.
+                     On ais.enriched the offset is the record's src_offset, never its
+                     own: the Flink job drops records, so enriched offsets run behind
+                     raw ones and comparing the two would skip records
        duplicate     same event_ts and position as the last fix heard (the same
                      report heard by several base stations, about 40% of DMA rows);
                      feeding it again would make the filter overconfident, and
@@ -27,7 +40,8 @@ One ais.raw record goes through three stages:
        out_of_order  event_ts earlier than the last fix heard in the same run
    started/restarted/updated/reinitialised are "accepted" and produce one ais.tracks
    message. A fix that ends a silence longer than DARK_GAP_S also raises DARK_GAP, if
-   the gap scan has not already (one alert per gap: VesselState.gap_alerted).
+   the gap scan has not already (one alert per gap: VesselState.gap_alerted). The
+   zone condition uses the zone tags of the last accepted fix (detect.near_zone).
 3. process_batch() runs both over a batch of records, keeping a working copy of each
    vessel's state, and returns the track and alert messages plus the final state per
    vessel, and the batch's max event_ts per (partition, run_id) for the watermarks.
@@ -56,6 +70,7 @@ ais.tracks v1 value (JSON, UTF-8), key = str(mmsi) like every topic:
                             (a reinitialised track keeps counting; innovation and
                             dt_s are null on it, like on a first fix)
     src_partition, src_offset  int  ais.raw coordinates: the message's identity for dedup
+                            (on ais.enriched, copied from the record)
     trace_id         str?   passed through from ais.raw
     replay_send_ts   int?   passed through, for end-to-end latency
 """
@@ -77,10 +92,10 @@ from stream.faust_app.detect import (
     AlertType,
     Watermarks,
     WatermarkKey,
-    ZonePredicate,
+    ZoneTags,
     dark_gap_due,
     encode_alert,
-    everywhere,
+    near_zone,
     teleport_rules,
 )
 from stream.faust_app.geo import TangentPlane, haversine_m
@@ -98,7 +113,7 @@ from stream.faust_app.mmsi import is_ship
 
 RAW_SCHEMA_VERSION = 1
 TRACKS_SCHEMA_VERSION = 1
-STATE_VERSION = 2
+STATE_VERSION = 3
 INVALID_KEY = b"invalid"
 
 
@@ -106,6 +121,7 @@ class Skip(StrEnum):
     INVALID_KEY = "invalid_key"
     DECODE_ERROR = "decode_error"
     NOT_A_SHIP = "not_a_ship"
+    CLASS_MISMATCH = "station_class_mismatch"
     NO_EVENT_TS = "no_event_ts"
     NO_POSITION = "no_position"
 
@@ -123,10 +139,31 @@ class Result(StrEnum):
 
 ACCEPTED = frozenset({Result.STARTED, Result.RESTARTED, Result.UPDATED, Result.REINITIALISED})
 DEFAULT_DETECTION = DetectionConfig()
+SHIP = "ship"
+
+
+class Leak(StrEnum):
+    """What the tracker's own checks catch on ais.enriched that the Flink job should
+    have removed. Each should stay 0; app.py logs them as flink_leaks."""
+
+    INVALID = "leak_invalid"
+    STATION_CLASS = "leak_station_class"
+    DUPLICATE = "leak_duplicate"
+
+
+LEAK_SKIPS = frozenset(Skip) - {Skip.NOT_A_SHIP, Skip.CLASS_MISMATCH}
+
+
+class PartitionMismatch(Exception):
+    """An ais.enriched record in another partition than its ais.raw source. ADR 0001
+    makes them equal; if they are not, per-vessel order and the gap scan's partition
+    ownership no longer hold, so the tracker stops rather than guess."""
 
 
 @dataclass(frozen=True)
 class RawRecord:
+    """One consumed record (ais.raw or ais.enriched) and where it was read."""
+
     key: bytes | None
     value: bytes | None
     partition: int
@@ -144,6 +181,11 @@ class Fix:
     cog: float | None
     trace_id: str | None
     replay_send_ts: int | None
+    src_partition: int | None = None
+    src_offset: int | None = None
+    """ais.raw coordinates, from an ais.enriched record; None when read from ais.raw."""
+    zone: ZoneTags | None = None
+    """The Flink job's zone tags; None when read from ais.raw."""
 
 
 def _int(v: object) -> int | None:
@@ -157,7 +199,19 @@ def _float(v: object) -> float | None:
     return None
 
 
-def decode(key: bytes | None, value: bytes | None) -> Fix | Skip:
+def _zone(msg: dict[str, Any]) -> ZoneTags | None:
+    version, eez, mpas, in_port = msg.get("zones_version"), msg.get("eez_id"), msg.get("mpa_ids"), msg.get("in_port")
+    if not isinstance(version, str) or not (eez is None or isinstance(eez, str)) or type(in_port) is not bool:
+        return None
+    if not isinstance(mpas, list) or not all(isinstance(m, str) for m in mpas):
+        return None
+    d_eez, d_mpa = msg.get("dist_eez_boundary_m"), msg.get("dist_mpa_m")
+    if (d_eez is not None and _float(d_eez) is None) or (d_mpa is not None and _float(d_mpa) is None):
+        return None
+    return ZoneTags(version, eez, tuple(mpas), in_port, _float(d_eez), _float(d_mpa))
+
+
+def decode(key: bytes | None, value: bytes | None, enriched: bool = False) -> Fix | Skip:
     if key is None or key == INVALID_KEY:
         return Skip.INVALID_KEY
     if value is None:
@@ -172,6 +226,15 @@ def decode(key: bytes | None, value: bytes | None) -> Fix | Skip:
     run_id = msg.get("run_id")
     if mmsi is None or str(mmsi).encode() != key or not isinstance(run_id, str) or not run_id:
         return Skip.DECODE_ERROR
+    src_partition = src_offset = None
+    zone = None
+    if enriched:
+        src_partition, src_offset = _int(msg.get("src_partition")), _int(msg.get("src_offset"))
+        station_class, zone = msg.get("station_class"), _zone(msg)
+        if src_partition is None or src_offset is None or not isinstance(station_class, str) or zone is None:
+            return Skip.DECODE_ERROR
+        if (station_class == SHIP) != is_ship(mmsi):
+            return Skip.CLASS_MISMATCH
     if not is_ship(mmsi):
         return Skip.NOT_A_SHIP
     event_ts = _int(msg.get("event_ts"))
@@ -191,6 +254,9 @@ def decode(key: bytes | None, value: bytes | None) -> Fix | Skip:
         cog=_float(msg.get("cog")),
         trace_id=trace_id if isinstance(trace_id, str) else None,
         replay_send_ts=_int(msg.get("replay_send_ts")),
+        src_partition=src_partition,
+        src_offset=src_offset,
+        zone=zone,
     )
 
 
@@ -208,8 +274,9 @@ class VesselState:
     last_lon: float
     """The last accepted fix as received; TELEPORT measures jumps from here."""
     last_offset: int
-    """Highest ais.raw offset applied to this state. All of a vessel's records are in
-    one partition (keyed by MMSI), so offsets alone order them."""
+    """Highest ais.raw offset applied to this state, also when the input is ais.enriched
+    (its src_offset). All of a vessel's records are in one partition (keyed by MMSI),
+    and the Flink job keeps per-key order, so offsets alone order them."""
     fix_seq: int
     partition: int | None
     """ais.raw partition of the vessel's records; picks the watermark for the gap scan.
@@ -226,6 +293,9 @@ class VesselState:
     """TELEPORT rejections in a row since the last accepted fix."""
     gap_alerted: bool
     """DARK_GAP already raised for the current silence; cleared by the next fix heard."""
+    zone: ZoneTags | None
+    """Zone tags of the last accepted fix (DARK_GAP's zone condition). None when the
+    input is ais.raw, and in states from before version 3."""
 
     def to_bytes(self) -> bytes:
         return json.dumps(
@@ -245,6 +315,7 @@ class VesselState:
                 "trace_id": self.trace_id,
                 "rejects": self.rejects,
                 "gap_alerted": self.gap_alerted,
+                "zone": self.zone.to_dict() if self.zone is not None else None,
             },
             separators=(",", ":"),
         ).encode()
@@ -265,6 +336,8 @@ class VesselState:
                 rejects=0,
                 gap_alerted=False,
             )
+        if v in (1, 2):  # before zone tags
+            d.update(zone=None)
         elif v != STATE_VERSION:
             raise ValueError(f"unsupported vessel state version: {v!r}")
         return cls(
@@ -288,6 +361,7 @@ class VesselState:
             trace_id=d["trace_id"],
             rejects=d["rejects"],
             gap_alerted=d["gap_alerted"],
+            zone=ZoneTags.from_dict(d["zone"]) if d["zone"] is not None else None,
         )
 
     def speed_kn(self) -> float:
@@ -332,14 +406,12 @@ def _new_track(fix: Fix, partition: int, offset: int, fix_seq: int, cfg: KalmanC
         trace_id=fix.trace_id,
         rejects=0,
         gap_alerted=False,
+        zone=fix.zone,
     )
 
 
-def _gap_due(state: VesselState, mmsi: int, now_ts: int, dcfg: DetectionConfig, zone: ZonePredicate) -> bool:
-    # zone() last: it is the expensive check once PostGIS backs it.
-    return dark_gap_due(
-        state.heard_ts, now_ts, state.speed_kn(), state.gap_alerted, True, dcfg
-    ) and zone(mmsi, state.last_lat, state.last_lon)
+def _gap_due(state: VesselState, now_ts: int, dcfg: DetectionConfig) -> bool:
+    return dark_gap_due(state.heard_ts, now_ts, state.speed_kn(), state.gap_alerted, near_zone(state.zone, dcfg), dcfg)
 
 
 def dark_gap_alert(state: VesselState, mmsi: int, cfg: KalmanConfig, dcfg: DetectionConfig) -> bytes:
@@ -347,8 +419,10 @@ def dark_gap_alert(state: VesselState, mmsi: int, cfg: KalmanConfig, dcfg: Detec
     scan and the vessel's return produce the same bytes for the same gap.
 
     details: last_seen_ts (ms), gap_s (the threshold), last_sog_kn (the speed the rule
-    used), pred_sigma_m (position uncertainty of the prediction).
+    used), pred_sigma_m (position uncertainty of the prediction), zone (the zone tags of
+    the last accepted fix that made the rule apply, detect.ZoneTags).
     """
+    assert state.zone is not None  # near_zone() is false without tags
     ts = state.heard_ts + dcfg.dark_gap_ms
     plane = TangentPlane(state.anchor_lat, state.anchor_lon)
     pred = predict(state.estimate, (ts - state.last_event_ts) / 1000.0, cfg)
@@ -366,6 +440,7 @@ def dark_gap_alert(state: VesselState, mmsi: int, cfg: KalmanConfig, dcfg: Detec
             "gap_s": dcfg.dark_gap_s,
             "last_sog_kn": state.speed_kn(),
             "pred_sigma_m": math.sqrt((float(P[0, 0]) + float(P[1, 1])) / 2.0),
+            "zone": state.zone.to_dict(),
         },
         trace_id=state.trace_id,
     )
@@ -378,8 +453,8 @@ def apply(
     offset: int,
     cfg: KalmanConfig,
     dcfg: DetectionConfig = DEFAULT_DETECTION,
-    zone: ZonePredicate = everywhere,
 ) -> Outcome:
+    """partition and offset are the fix's ais.raw coordinates."""
     if prev is not None and offset <= prev.last_offset:
         return Outcome(Result.REDELIVERED, None, None)
 
@@ -396,7 +471,7 @@ def apply(
     alerts: list[tuple[AlertType, bytes]] = []
     # The gap is over. Raise it here if the scan has not: the scan runs only every
     # DARK_SCAN_STEP_S of event time, and not at all for a partition that goes quiet.
-    if _gap_due(prev, fix.mmsi, fix.event_ts, dcfg, zone):
+    if _gap_due(prev, fix.event_ts, dcfg):
         alerts.append((AlertType.DARK_GAP, dark_gap_alert(prev, fix.mmsi, cfg, dcfg)))
 
     plane = TangentPlane(prev.anchor_lat, prev.anchor_lon)
@@ -447,6 +522,7 @@ def apply(
         trace_id=fix.trace_id,
         rejects=0,
         gap_alerted=False,
+        zone=fix.zone,
     )
     track = encode_track(state, fix, partition, offset, innov, dt_s)
     return Outcome(Result.UPDATED, state, track, tuple(alerts))
@@ -528,8 +604,9 @@ class BatchResult:
     seen: dict[WatermarkKey, int] = field(default_factory=dict)
     """Max event_ts per (partition, run_id) over every decoded fix, for Watermarks."""
     counts: Counter[str] = field(default_factory=Counter)
-    """read (records in), one Skip or Result per record, and alert_<type> per alert.
-    The Skip and Result counts add up to read."""
+    """read (records in), one Skip or Result per record, alert_<type> per alert, and
+    on ais.enriched a Leak per record the Flink job should have removed. The Skip and
+    Result counts add up to read."""
 
 
 def process_batch(
@@ -537,9 +614,10 @@ def process_batch(
     load: Callable[[int], bytes | None],
     cfg: KalmanConfig,
     dcfg: DetectionConfig = DEFAULT_DETECTION,
-    zone: ZonePredicate = everywhere,
+    enriched: bool = False,
 ) -> BatchResult:
-    """Run a batch through decode() and apply().
+    """Run a batch through decode() and apply(). `enriched`: records are from
+    ais.enriched, so the bookmark offset is src_offset and leaks are counted.
 
     load(i) returns the stored state for records[i].key. It is called at most once per
     key, before any of that key's writes, so it always sees the state from before the
@@ -552,19 +630,33 @@ def process_batch(
     changed: set[bytes] = set()
     out.counts["read"] += len(records)
     for i, rec in enumerate(records):
-        fix = decode(rec.key, rec.value)
+        fix = decode(rec.key, rec.value, enriched)
         if isinstance(fix, Skip):
             out.counts[fix.value] += 1
+            if enriched and fix in LEAK_SKIPS:
+                out.counts[Leak.INVALID.value] += 1
+            elif fix is Skip.CLASS_MISMATCH:
+                out.counts[Leak.STATION_CLASS.value] += 1
             continue
         key = rec.key
         assert key is not None  # decode() returns Skip.INVALID_KEY otherwise
+        offset = rec.offset
+        if enriched:
+            assert fix.src_offset is not None  # decode() returns Skip.DECODE_ERROR otherwise
+            if fix.src_partition != rec.partition:
+                raise PartitionMismatch(
+                    f"ais.enriched/{rec.partition}@{rec.offset} came from ais.raw/{fix.src_partition}"
+                )
+            offset = fix.src_offset
         wk = (rec.partition, fix.run_id)
         out.seen[wk] = max(fix.event_ts, out.seen.get(wk, fix.event_ts))
         if key not in working:
             blob = load(i)
             working[key] = VesselState.from_bytes(blob) if blob is not None else None
-        outcome = apply(working[key], fix, rec.partition, rec.offset, cfg, dcfg, zone)
+        outcome = apply(working[key], fix, rec.partition, offset, cfg, dcfg)
         out.counts[outcome.result.value] += 1
+        if enriched and outcome.result is Result.DUPLICATE:
+            out.counts[Leak.DUPLICATE.value] += 1
         if outcome.state is not None:
             working[key] = outcome.state
             last_index[key] = i
@@ -597,7 +689,6 @@ def scan_dark_gaps(
     partitions: Collection[int],
     cfg: KalmanConfig,
     dcfg: DetectionConfig = DEFAULT_DETECTION,
-    zone: ZonePredicate = everywhere,
 ) -> ScanResult:
     """DARK_GAP for vessels still silent: watermark - heard_ts > DARK_GAP_S.
 
@@ -618,9 +709,8 @@ def scan_dark_gaps(
         if wm is None or d["gap_alerted"] or wm - d["heard"][0] <= dcfg.dark_gap_ms:
             continue
         state = VesselState.from_dict(d)
-        mmsi = int(key)
-        if not _gap_due(state, mmsi, wm, dcfg, zone):
+        if not _gap_due(state, wm, dcfg):
             continue
-        out.alerts.append((key, dark_gap_alert(state, mmsi, cfg, dcfg)))
+        out.alerts.append((key, dark_gap_alert(state, int(key), cfg, dcfg)))
         out.writes.append((partition, key, replace(state, gap_alerted=True).to_bytes()))
     return out

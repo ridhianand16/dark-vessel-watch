@@ -21,13 +21,17 @@ ais.alerts v1 value (JSON, UTF-8), key = str(mmsi):
     pred_lat, pred_lon  float  where the Kalman filter puts the vessel at `ts`
     details         object rule-specific, see teleport_details() / tracker.dark_gap_alert()
     trace_id        str?   of the triggering ais.raw record (DARK_GAP: the last one heard)
+
+DARK_GAP's zone condition reads the tags the Flink enrichment job puts on every
+ais.enriched record (ZoneTags). The tracker never queries PostGIS itself.
 """
 
 from __future__ import annotations
 
 import json
 import uuid
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
@@ -51,14 +55,6 @@ class TeleportRule(StrEnum):
     INNOVATION = "innovation"
 
 
-ZonePredicate = Callable[[int, float, float], bool]
-"""(mmsi, lat, lon) -> whether a gap starting there counts as DARK_GAP. M3 replaces it
-with the PostGIS rules: near an EEZ boundary or protected area, not in port, not at
-the receiver coverage edge."""
-
-
-def everywhere(mmsi: int, lat: float, lon: float) -> bool:
-    return True
 
 
 def alert_id(type_: AlertType, mmsi: int, run_id: str, trigger_ts: int) -> str:
@@ -117,6 +113,53 @@ def teleport_rules(distance_m: float, dt_s: float, innov: Innovation, cfg: Detec
 
 
 # --- DARK_GAP ---------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ZoneTags:
+    """The zone fields of one ais.enriched record (docs/adr/0018), as Flink wrote them.
+
+    Distances are geodesic metres. dist_mpa_m is 0 inside a protected area. Both are
+    None for a point the job could not project; such a point is near nothing.
+    """
+
+    zones_version: str
+    eez_id: str | None
+    mpa_ids: tuple[str, ...]
+    in_port: bool
+    dist_eez_boundary_m: float | None
+    dist_mpa_m: float | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "zones_version": self.zones_version,
+            "eez_id": self.eez_id,
+            "mpa_ids": list(self.mpa_ids),
+            "in_port": self.in_port,
+            "dist_eez_boundary_m": self.dist_eez_boundary_m,
+            "dist_mpa_m": self.dist_mpa_m,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, Any]) -> ZoneTags:
+        return cls(
+            zones_version=d["zones_version"],
+            eez_id=d["eez_id"],
+            mpa_ids=tuple(d["mpa_ids"]),
+            in_port=d["in_port"],
+            dist_eez_boundary_m=d["dist_eez_boundary_m"],
+            dist_mpa_m=d["dist_mpa_m"],
+        )
+
+
+def near_zone(tags: ZoneTags | None, cfg: DetectionConfig) -> bool:
+    """DARK_GAP's zone condition: within dark_gap_zone_nm of an EEZ boundary or a
+    protected area, and not in port. No tags (a record that did not come through the
+    Flink job) means no zone, so no DARK_GAP."""
+    if tags is None or tags.in_port:
+        return False
+    limit = cfg.dark_gap_zone_m
+    return any(d is not None and d <= limit for d in (tags.dist_eez_boundary_m, tags.dist_mpa_m))
 
 
 def dark_gap_due(

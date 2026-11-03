@@ -237,6 +237,9 @@ services:
         condition: service_completed_successfully
     environment:
       REDPANDA_BROKERS: redpanda:9092   # internal listener
+      # ais.enriched needs the Flink job (make flink-up); ais.raw tracks without it,
+      # but raises no DARK_GAP (no zone tags).
+      TRACKER_INPUT_TOPIC: ${TRACKER_INPUT_TOPIC:-ais.enriched}
     volumes:
       - tracker-data:/data
     # Python + numpy + 6 small RocksDB instances (8 MB block cache each, see app.py).

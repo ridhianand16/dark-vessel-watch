@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
+
 from typing import Any
 
-from reconcile.score_alerts import Stored, expected_ids, score
+from reconcile.score_alerts import Stored, describe_zone, expected_ids, score
 from stream.faust_app.detect import AlertType, alert_id
 
 RUN = "20261103T120000Z-abc123"
@@ -56,3 +58,12 @@ def test_wrong_time_is_fp_and_fn_decoy_alert_is_fp_real_is_unscored() -> None:
     assert s.fn == {"TELEPORT": 1}
     assert s.real == {"DARK_GAP": 1, "": 1}
     assert len(s.missed) == 1 and len(s.unexpected) == 2
+
+
+def test_describe_zone() -> None:
+    details = json.dumps({"zone": {"zones_version": "v1", "eez_id": "eez:5674", "mpa_ids": ["wdpa:1"],
+                                   "in_port": False, "dist_eez_boundary_m": 18520.0, "dist_mpa_m": 0.0}})
+    assert describe_zone(details) == (
+        "protected area 0.0 nm (inside: wdpa:1), EEZ boundary 10.0 nm, in_port False, zones v1"
+    )
+    assert describe_zone("{}") == "no zone tags"

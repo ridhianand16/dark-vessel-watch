@@ -15,7 +15,7 @@ import pytest
 from stream.faust_app.config import DetectionConfig
 from stream.faust_app.detect import ALERT_ID_NAMESPACE, AlertType, Watermarks, alert_id
 from stream.faust_app.kalman import KalmanConfig
-from stream.faust_app.tests.test_tracker import KEY, MMSI, T0, rec
+from stream.faust_app.tests.test_tracker import KEY, MMSI, T0, ZONE, erec
 from stream.faust_app.tracker import (
     RawRecord,
     Result,
@@ -37,12 +37,12 @@ RUN = "20261102T132701Z-6cdc0c"
 
 def other(offset: int, ts: int, partition: int = 3, **kw: Any) -> RawRecord:
     """A second vessel, moored, whose reports move the partition watermark."""
-    return rec(offset, key=OTHER, partition=partition, mmsi=257000000, event_ts=ts, lat=57.0, lon=11.0, sog=0.0, **kw)
+    return erec(offset, key=OTHER, partition=partition, mmsi=257000000, event_ts=ts, lat=57.0, lon=11.0, sog=0.0, **kw)
 
 
 def moving(offset: int, minute: float, **kw: Any) -> RawRecord:
     """MMSI on a straight 10 kn eastbound track from (56, 10) at T0."""
-    return rec(offset, event_ts=T0 + round(minute * MIN), lon=10.0 + DEG_PER_MIN_10KN * minute, **kw)
+    return erec(offset, event_ts=T0 + round(minute * MIN), lon=10.0 + DEG_PER_MIN_10KN * minute, **kw)
 
 
 class Pipeline:
@@ -62,7 +62,7 @@ class Pipeline:
             assert key is not None
             return self.data.get(key)
 
-        result = process_batch(recs, load, CFG, self.dcfg)
+        result = process_batch(recs, load, CFG, self.dcfg, enriched=True)
         for _, key, blob in result.writes:
             self.data[key] = blob
         alerts = [v for _, v in result.alerts]
@@ -131,8 +131,8 @@ def test_dark_gap_on_return_when_no_scan_saw_it() -> None:
     ("records", "silence_min"),
     [
         ([moving(10, 0), moving(11, 1)], 30),  # exactly 30 min is not "more than"
-        ([rec(10, sog=1.5), rec(11, event_ts=T0 + MIN, sog=1.5, lon=10.00075)], 60),  # 1.5 kn
-        ([rec(10, sog=0.0)], 120),  # moored
+        ([erec(10, sog=1.5), erec(11, event_ts=T0 + MIN, sog=1.5, lon=10.00075)], 60),  # 1.5 kn
+        ([erec(10, sog=0.0)], 120),  # moored
     ],
 )
 def test_no_dark_gap(records: list[RawRecord], silence_min: int) -> None:
@@ -142,13 +142,50 @@ def test_no_dark_gap(records: list[RawRecord], silence_min: int) -> None:
     assert p.feed(other(20, last + silence_min * MIN)) == []
 
 
-def test_dark_gap_needs_the_zone_predicate() -> None:
-    state, _, _ = run_apply(moving(10, 0), moving(11, 1))
+def scan_one(state: VesselState) -> list[dict[str, Any]]:
     wm = Watermarks(DCFG)
     wm.advance([((3, RUN), T0 + 60 * MIN)])
-    items = [(KEY, state.to_bytes())]
-    assert scan_dark_gaps(items, wm, {3}, CFG, zone=lambda m, lat, lon: False).alerts == []
-    assert len(scan_dark_gaps(items, wm, {3}, CFG, zone=lambda m, lat, lon: True).alerts) == 1
+    return [json.loads(a) for _, a in scan_dark_gaps([(KEY, state.to_bytes())], wm, {3}, CFG).alerts]
+
+
+@pytest.mark.parametrize(
+    ("zone", "alerts"),
+    [
+        ({}, 1),  # 3 km from a protected area
+        ({"dist_mpa_m": 0.0, "mpa_ids": ["wdpa:1"]}, 1),  # inside one
+        ({"dist_mpa_m": 50_000.0, "dist_eez_boundary_m": 18_000.0}, 1),  # 9.7 nm from a boundary
+        ({"dist_mpa_m": 18_520.0, "dist_eez_boundary_m": 18_520.0}, 1),  # exactly 10 nm counts
+        ({"dist_mpa_m": 18_521.0, "dist_eez_boundary_m": 40_000.0}, 0),  # far from both
+        ({"in_port": True}, 0),  # near a protected area, but in port
+        ({"dist_mpa_m": None, "dist_eez_boundary_m": None}, 0),  # could not be projected
+    ],
+)
+def test_dark_gap_zone_condition(zone: dict[str, Any], alerts: int) -> None:
+    state, _, _ = run_apply(moving(10, 0, **zone), moving(11, 1, **zone))
+    found = scan_one(state)
+    assert len(found) == alerts
+    if found:
+        assert found[0]["details"]["zone"] == {k: v for k, v in {**ZONE, **zone}.items() if k != "station_class"}
+
+
+def test_dark_gap_zone_is_the_last_accepted_fix() -> None:
+    """A rejected (implausible) fix does not move the vessel into or out of a zone."""
+    far = {"dist_mpa_m": 50_000.0}
+    state, results, _ = run_apply(moving(10, 0), moving(11, 1), moving(12, 2, lat=56.5, **far))
+    assert results[-1] == Result.REJECTED
+    assert len(scan_one(state)) == 1
+    state, _, _ = run_apply(moving(10, 0), moving(11, 1, **far))
+    assert scan_one(state) == []
+
+
+def test_no_dark_gap_without_zone_tags() -> None:
+    """Read from ais.raw there are no tags (fields in the JSON are ignored), so
+    DARK_GAP cannot apply."""
+    raw = [RawRecord(r.key, r.value, r.partition, r.offset) for r in (moving(10, 0), moving(11, 1))]
+    ((_, _, blob),) = process_batch(raw, lambda i: None, CFG).writes
+    state = VesselState.from_bytes(blob)
+    assert state.zone is None
+    assert scan_one(state) == []
 
 
 def test_scan_only_touches_given_partitions() -> None:
@@ -190,9 +227,9 @@ def run_apply(*records: RawRecord, dcfg: DetectionConfig = DCFG) -> tuple[Vessel
     results: list[Result] = []
     alerts: list[dict[str, Any]] = []
     for r in records:
-        fix = decode(r.key, r.value)
-        assert not isinstance(fix, Skip)
-        out = apply(state, fix, r.partition, r.offset, CFG, dcfg)
+        fix = decode(r.key, r.value, enriched=True)
+        assert not isinstance(fix, Skip) and fix.src_offset is not None
+        out = apply(state, fix, r.partition, fix.src_offset, CFG, dcfg)
         results.append(out.result)
         state = out.state or state
         alerts += [json.loads(a) for _, a in out.alerts]
@@ -224,7 +261,7 @@ def test_teleport_by_implied_speed_is_rejected_from_the_filter() -> None:
 def test_teleport_by_innovation_inside_the_noise_window() -> None:
     """3 km in 5 s skips the implied-speed rule (dt < 10 s), but the filter is
     confident after a short dt, so the innovation rule catches it."""
-    _, results, alerts = run_apply(moving(10, 0), moving(11, 1), rec(12, event_ts=T0 + MIN + 5_000, lat=56.027))
+    _, results, alerts = run_apply(moving(10, 0), moving(11, 1), erec(12, event_ts=T0 + MIN + 5_000, lat=56.027))
     assert results[-1] == Result.REJECTED
     assert alerts[0]["details"]["rules"] == ["innovation"]
 
@@ -232,8 +269,8 @@ def test_teleport_by_innovation_inside_the_noise_window() -> None:
 @pytest.mark.parametrize(
     "noise",
     [
-        rec(12, event_ts=T0 + MIN + 5_000, lon=10.00497 + 0.008),  # 500 m in 5 s
-        rec(12, event_ts=T0 + MIN + 20_000, lat=56.008),  # 900 m in 20 s: 87 kn, but < 1 km
+        erec(12, event_ts=T0 + MIN + 5_000, lon=10.00497 + 0.008),  # 500 m in 5 s
+        erec(12, event_ts=T0 + MIN + 20_000, lat=56.008),  # 900 m in 20 s: 87 kn, but < 1 km
     ],
 )
 def test_gps_noise_is_not_a_teleport(noise: RawRecord) -> None:
@@ -276,7 +313,7 @@ def test_same_input_gives_same_alert_id_and_bytes() -> None:
     records = [moving(10, 0), moving(11, 1), moving(12, 2, lat=56.045), moving(13, 3), moving(14, 50)]
 
     def alerts() -> list[bytes]:
-        result = process_batch(records, lambda i: None, CFG)
+        result = process_batch(records, lambda i: None, CFG, enriched=True)
         return [v for _, v in result.alerts]
 
     first, second = alerts(), alerts()
@@ -288,7 +325,9 @@ def test_same_input_gives_same_alert_id_and_bytes() -> None:
     assert ids[1] == alert_id(AlertType.DARK_GAP, MMSI, RUN, T0 + 3 * MIN)
 
     # The same events in another run are other alerts.
-    other_run = process_batch([rec(r.offset, **_fields(r), run_id="run-2") for r in records], lambda i: None, CFG)
+    other_run = process_batch(
+        [erec(r.offset * 2, **_fields(r), run_id="run-2") for r in records], lambda i: None, CFG, enriched=True
+    )
     assert {json.loads(v)["alert_id"] for _, v in other_run.alerts}.isdisjoint(ids)
 
 

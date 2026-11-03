@@ -1,12 +1,17 @@
-"""Faust worker: ais.raw -> per-MMSI Kalman tracks -> ais.tracks, and alerts -> ais.alerts.
+"""Faust worker: ais.enriched -> per-MMSI Kalman tracks -> ais.tracks, and alerts -> ais.alerts.
 
     uv run faust -A stream.faust_app.app worker -l info   # normally runs in Compose as tracker
 
 Faust in two lines: an *agent* is an async function fed by a Kafka topic's stream, and
 a *table* is a dict whose writes also go to a compacted changelog topic. The changelog
-is partitioned like the source topic, so whoever owns ais.raw partition 3 also owns
-the vessel states for partition 3, and can rebuild them from the changelog after a
-restart. RocksDB is just the local on-disk copy.
+is partitioned like the source topic, so whoever owns ais.enriched partition 3 also
+owns the vessel states for partition 3, and can rebuild them from the changelog after
+a restart. RocksDB is just the local on-disk copy.
+
+Input (TRACKER_INPUT_TOPIC): ais.enriched, written by the Flink enrichment job in
+transactions, so it is read with read_committed (read_committed.py). ais.raw still
+works, for comparing tracks before and after the Flink job; it has no zone tags, so
+no DARK_GAP is raised from it.
 
 Delivery (ADR 0004): at-least-once, and outputs before state. Records are taken in
 batches. For each batch: compute tracks and new states in memory (tracker.py), send
@@ -44,9 +49,9 @@ import faust
 import faust.streams
 from faust.types import EventT
 
-from stream.faust_app import config
+from stream.faust_app import config, read_committed
 from stream.faust_app.detect import Watermarks
-from stream.faust_app.tracker import ACCEPTED, RawRecord, process_batch, scan_dark_gaps
+from stream.faust_app.tracker import ACCEPTED, Leak, RawRecord, process_batch, scan_dark_gaps
 
 APP_ID = "dvw-tracker"
 EXIT_CRASH = 70  # EX_SOFTWARE
@@ -58,6 +63,7 @@ cfg = config.load()
 app = faust.App(
     APP_ID,
     broker=f"kafka://{cfg.brokers}",
+    broker_consumer=f"{read_committed.SCHEME}://{cfg.brokers}",
     store="rocksdb://",
     datadir=cfg.data_dir,
     topic_partitions=PARTITIONS,
@@ -68,8 +74,8 @@ app = faust.App(
     web_enabled=False,
 )
 
-raw_topic = app.topic(
-    "ais.raw",
+input_topic = app.topic(
+    cfg.input_topic,
     key_type=bytes,
     value_type=bytes,
     key_serializer="raw",
@@ -99,7 +105,7 @@ alerts_topic = app.topic(
 # Faust's RocksDB defaults are a 2 GB block cache (+500 MB compressed) per partition
 # DB. The state here is ~0.5 kB per vessel, a few MB in total, so keep them small.
 # key_type/value_type bytes means the "raw" codec: the changelog key is the same
-# str(mmsi) bytes as the ais.raw key.
+# str(mmsi) bytes as the input key.
 vessels = app.Table(
     "vessel_state",
     key_type=bytes,
@@ -141,7 +147,7 @@ async def handle(events: Sequence[EventT[bytes]]) -> None:
             blob: bytes | None = vessels.get(records[i].key)
             return blob
 
-    result = process_batch(records, load, cfg.kalman, cfg.detect)
+    result = process_batch(records, load, cfg.kalman, cfg.detect, cfg.enriched)
     acks = [await tracks_topic.send(key=k, value=v) for k, v in result.tracks]
     acks += [await alerts_topic.send(key=k, value=v) for k, v in result.alerts]
     await asyncio.gather(*acks)  # raises if any send failed: state must not move past it
@@ -180,7 +186,7 @@ async def handle_or_exit(events: Sequence[EventT[bytes]]) -> None:
         os._exit(EXIT_CRASH)
 
 
-@app.agent(raw_topic, concurrency=1)
+@app.agent(input_topic, concurrency=1)
 async def track(stream: faust.StreamT[bytes]) -> None:
     assert isinstance(stream, faust.Stream)  # StreamT (the protocol) lacks take_events
     # concurrency=1: one actor reads all assigned partitions in order, so each
@@ -199,7 +205,9 @@ async def track(stream: faust.StreamT[bytes]) -> None:
 
 async def log_counts() -> None:
     accepted = sum(counts[r.value] for r in ACCEPTED)
-    log.info("tracks=%d %s", accepted, " ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+    leaks = f" flink_leaks={sum(counts[k.value] for k in Leak)}" if cfg.enriched else ""
+    log.info("input=%s tracks=%d%s %s", cfg.input_topic, accepted, leaks,
+             " ".join(f"{k}={v}" for k, v in sorted(counts.items())))
 
 
 # Not decorator syntax: app.timer is untyped, which mypy --strict rejects on a decorator.
