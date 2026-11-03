@@ -14,9 +14,11 @@ The pipeline is sized for replay at 10x on one worker per service, on an 8 GB la
 
 The same worker raises DARK_GAP and TELEPORT alerts on `ais.alerts`, each with a deterministic `alert_id` so a reprocessed alert is the same alert ([ADR 0005](docs/adr/0005-detections-in-the-tracker-event-time.md)). A second instance of the ClickHouse sink stores them in `dvw.alerts`, deduplicated on `alert_id` ([ADR 0006](docs/adr/0006-alerts-sink-config-driven.md)). The replayer can mix labelled synthetic vessels into a run, and a scorer checks that each injected anomaly raised exactly its alert ([ADR 0007](docs/adr/0007-injected-anomalies-and-scoring.md)). That holds when the tracker is killed partway through a run.
 
-The zones DARK_GAP needs come from three reference datasets: Marine Regions EEZ polygons and boundary lines, protected areas from WDPA, and ports from the World Port Index. Each is pinned by SHA-256 in `refdata/sources.yaml`. All three are downloaded by hand: EEZ sits behind a form, WDPA moves monthly, and NGA refuses scripted WPI downloads. `make fetch-refdata` verifies them and prints exactly where to get and place any that are missing ([ADR 0009](docs/adr/0009-zone-sources-pinned-and-area-from-the-feed.md)). The zone package will cover only the area the feed sees. `make area` computes that from the AIS day: 2.69 to 17.53 E, 53.52 to 59.57 N, which is the trimmed extent of 18.9 million valid positions plus a 20 nm margin. Plain min/max would have reached 60 S, because of 179 stray fixes. The checks a new package must pass in a staging schema before it replaces the live zones are written and tested against PostGIS ([ADR 0010](docs/adr/0010-zone-package-staging-swap-and-port-radius.md)).
+The zones DARK_GAP needs come from three reference datasets: Marine Regions EEZ polygons and boundary lines, protected areas from WDPA, and ports from the World Port Index. Each is pinned by SHA-256 in `refdata/sources.yaml`. All three are downloaded by hand: EEZ sits behind a form, WDPA moves monthly, and NGA refuses scripted WPI downloads. `make fetch-refdata` verifies them and prints exactly where to get and place any that are missing ([ADR 0009](docs/adr/0009-zone-sources-pinned-and-area-from-the-feed.md)). The zone package covers only the area the feed sees. `make area` computes that from the AIS day: 2.69 to 17.53 E, 53.52 to 59.57 N, which is the trimmed extent of 18.9 million valid positions plus a 20 nm margin. Plain min/max would have reached 60 S, because of 179 stray fixes.
 
-Not built yet: the package builder and loader (so the DARK_GAP zone check still passes everywhere), MMSI_CLASH and Flink enrichment.
+`make refdata` turns those files into a signed zone package and loads it into PostGIS, offline ([Zones](#zones)). A package that fails its signature, a file hash or a staging check is refused as a whole, and the live zones stay as they were ([ADR 0010](docs/adr/0010-zone-package-staging-swap-and-port-radius.md), [ADR 0011](docs/adr/0011-signed-zone-package-built-from-pinned-sources.md)).
+
+Not built yet: the DARK_GAP zone check itself (the zones are in PostGIS, but the tracker does not read them yet, so the check still passes everywhere), `vessels_current`, MMSI_CLASH and Flink enrichment.
 
 ## Detections
 
@@ -56,6 +58,33 @@ Results on the 2026-10-28 day, 700,000 rows at 50x, three runs:
 
 Precision and recall are 1.00 for both types on this set. That says the rules fire once on the events they are meant for and not on the two decoys. It says nothing yet about real traffic, where the 17 gaps have not been checked against coverage or ports.
 
+## Zones
+
+DARK_GAP needs to know whether a vessel went quiet near an EEZ boundary or a protected area, and not in port. Those shapes come from three datasets, cut to the feed's area at full detail:
+
+| Layer | From | Rows | Vertices |
+|---|---|---|---|
+| EEZ polygons (`zones`, kind `eez`) | Marine Regions World EEZ v12 | 8 | 85,526 |
+| EEZ boundary lines (`eez_boundaries`) | Marine Regions World EEZ v12 | 103 | 13,339 |
+| Protected areas (`zones`, kind `mpa`) | WDPA November 2026, realm Coastal or Marine | 2,169 | 2,922,333 |
+| Ports (`zones`, kind `port`) | World Port Index 2019, each point a 2 nm circle | 176 | 11,327 |
+
+Vertices are `SUM(ST_NPoints(geom))` per layer after loading. Protected areas account for 96% of them, because Natura 2000 sites follow the coastline closely. That is no problem for PostGIS. It is the first number to look at before Flink keeps zones in memory.
+
+How a package is made and loaded:
+
+1. **Build** (`make refdata-build`). The build re-checks the SHA-256 of every source in `refdata/sources.yaml`. `ogr2ogr` then cuts each layer to `refdata/area.yaml`, in a container with no network. Port circles are computed on the WGS84 ellipsoid, and each vertex is within 0.5 m of 2 nm as PostGIS geography measures it. The output is one GeoPackage per layer and a `manifest.json` with every input and file hash, signed with minisign. The package version is a hash of the inputs, and two builds from the same inputs are byte-identical.
+2. **Verify** (`make refdata-verify`). The signature over the manifest is checked against the committed `refdata/keys/dvw.pub`, then every file's hash. Changing one byte in any file fails this step.
+3. **Load** (`make refdata-load`). The loader verifies again, then fills a staging schema, checks row counts and geometry validity there, and swaps the tables into place. All of that is one transaction, and each load adds a row to `refdata_packages`. Loading the same package twice gives identical zones and two registry rows.
+
+To find the nearest boundary in metres, order by geography distance. `ORDER BY geom <-> point` on geometry ranks in degrees, and at 57 N it puts a 37.6 km line ahead of a 30.2 km one:
+
+```sql
+SELECT id, round(ST_Distance(geom::geography, p::geography)) AS metres
+FROM eez_boundaries, ST_SetSRID(ST_Point(11.3, 56.9), 4326) AS p   -- mid-Kattegat
+ORDER BY 2 LIMIT 1;                                                -- line 1120, 30,241 m
+```
+
 ## Quickstart
 
 Needs Docker with Compose v2, about 8 GB of free RAM, GNU make, and Python 3.12 with [uv](https://docs.astral.sh/uv/). The AIS data is not in the repository: `make fetch` downloads it and checks its SHA-256.
@@ -75,18 +104,23 @@ make replay ARGS="--limit 700000 --speed 50 --inject ingest/replayer/anomalies.y
 make score RUN=<run_id> WAIT=600                # TP/FP/FN per alert type
 ```
 
-Reference data for the zones (not needed by the steps above yet):
+Reference data for the zones (the tracker does not read them yet):
 
 ```sh
 make fetch-refdata   # verify the EEZ, WDPA and WPI files; prints where to download any that are missing
+make refdata-image   # once, online: the GDAL + minisign image the build runs in
+make refdata-key     # once: signing key in ~/.minisign/dvw.key (refuses if refdata/keys/dvw.pub exists)
+make refdata         # offline: build, verify and load the zone package into PostGIS
 make area            # only if the AIS day changes: recompute refdata/area.yaml from the CSV
 ```
+
+`refdata/keys/dvw.pub` in the repository belongs to my key, so on another machine delete it before `make refdata-key` and use your own. `make refdata-load PKG=data/refdata/packages/<version>` loads an older package again, which is how a rollback works.
 
 EEZ (Marine Regions form), WDPA (Protected Planet terms page) and WPI (NASA Harvest mirror of the NGA release) have to be downloaded by hand into `data/refdata/incoming/<source>/<version>/`, under the file names in `refdata/sources.yaml`. `make fetch-refdata` prints the page and the exact path for each missing file, and fails on any file whose SHA-256 does not match `refdata/sources.yaml`.
 
 Redpanda Console is at http://localhost:8080. `make sink-logs` and `make alerts-sink-logs` follow the two sinks (one line per batch). `make tracker-logs` follows the tracker, which logs its counters every 30 s (`tracks=... read=... not_a_ship=... duplicate=...`). Every record read gets exactly one skip reason or result, so those counters add up to `read`. `make down` stops the stack and keeps the data. `make nuke` stops it and deletes all data volumes, including ClickHouse.
 
-Other targets: `make migrate` applies new files in `sql/clickhouse/` and does nothing when up to date. `make test` and `make typecheck` run pytest and `mypy --strict`.
+Other targets: `make migrate` and `make migrate-postgis` apply new files in `sql/clickhouse/` and `sql/postgis/` and do nothing when up to date (`make up` runs both). `make test` and `make typecheck` run pytest and `mypy --strict`.
 
 If a sink or the tracker crashes, Docker restarts it and it re-reads from its last committed offset. `docker stop` and `docker kill` count as deliberate stops and leave it down; `make sink`, `make alerts-sink` or `make tracker` starts it again.
 
@@ -127,6 +161,10 @@ Measured on 2026-11-02 on an Apple M1 laptop (8 GB RAM, macOS 26.5), Docker VM w
 | Injected anomalies, tracker killed mid-run | `docker kill dvw-tracker` after the 3rd injected alert, `make tracker` | 6 of 6 alerts, no extras, same 28 alerts as the clean runs. 3,823 records skipped as `redelivered` on restart. `make reconcile` OK |
 | Alerts topic vs table | 3 runs, then 6 alerts resent byte-identical to simulate a tracker resend | 90 messages on `ais.alerts`, 90 rows without `FINAL`, 84 with `FINAL` = 84 distinct `alert_id` |
 
+| Zone package build, from the pinned sources (2026-11-03) | `make refdata-build` | 14 s. Peak memory of the largest cut (WDPA) 691 MiB including page cache, limit 1 GB. A second build from scratch gave byte-identical files |
+| Zone package load into PostGIS under Rosetta (2026-11-03) | `make refdata-load`, three runs | 6.8 to 10.9 s each: verify 0.1 s, staging load and checks 6.3 to 9.7 s, swap 36 to 61 ms. 2,353 zones and 103 boundary lines |
+| Whole zone pipeline offline (2026-11-03) | `UV_OFFLINE=1 make refdata`, package deleted first | 19.8 s for build, verify and load |
+
 End-to-end latency and full-day throughput are still to be measured.
 
 ## Attribution
@@ -138,4 +176,4 @@ The pipeline runs on data I do not own. None of it is in this repository. `make 
 - **Marine protected areas:** UNEP-WCMC and IUCN (2026), Protected Planet: The World Database on Protected Areas (WDPA), November 2026, Cambridge, UK: UNEP-WCMC and IUCN. Available at: www.protectedplanet.net. Non-commercial use; no redistribution.
 - **Ports:** National Geospatial-Intelligence Agency, World Port Index (Pub 150); obtained via NASA Harvest Portal. US Government work, public domain (original); CC BY on the mirror.
 
-Because of the WDPA and Marine Regions terms, the built zone package is never committed or published. The repository ships the fetcher and the pinned hashes instead, and will ship the package builder.
+Because of the WDPA and Marine Regions terms, the built zone package is never committed or published. The repository ships the fetcher, the pinned hashes, the package builder and the public key instead. Anyone else builds and signs their own package from their own downloads.
