@@ -56,6 +56,15 @@ At 5 km and 0.05 degrees, densifying more changes the Kattegat result by less th
 centimetre. It adds 7,700 vertices to the 3.02 million in `zones` (0.25%) and 1,100 to
 the 13,339 boundary vertices.
 
+**25832 finds the nearest point; the reported metres are geodesic.** The Flink job uses
+the 25832 STRtree only to find the nearest point on a boundary or protected area. It
+then transforms that point back to 4326 and reports the geodesic distance from the
+vessel to it (GeographicLib, WGS84 ellipsoid). A point found in UTM is slightly off the
+true nearest point, but the distance along a line is flat at its minimum, so that error
+is second order. On the real package this matches PostGIS geography to 0.1 m at
+11.6 E, 15.5 E and 17.3 E, where UTM alone was 0.7 m, 31 m and 9 m off. Point-in-polygon
+(EEZ, protected area, port) stays planar in 25832: containment does not depend on scale.
+
 **An explicit active marker.** Migration 0003 adds `refdata_packages.active`, with a
 partial unique index that allows at most one active row. Inside the swap transaction
 the loader clears the old marker and inserts the new load with `active = true`. The
@@ -97,11 +106,15 @@ gate stays closed.
   49 MB with its indexes, and a load takes about 13 s instead of about 7 to 11 s.
 - UTM 32N is exact at 9 E and stretches with distance from it. Scale errors measured on
   the package: -0.008% at 11.6 E (Kattegat; 0.7 m on a 9 km distance) and +0.16% at
-  15.5 E (Bornholm; 31 m on 19.3 km). At the bbox's eastern edge (17.5 E) the scale
-  error is about +0.3%, so a 10 nm DARK_GAP threshold there is about 55 m short of
-  10 nm on the ground. That is small next to AIS position noise and the threshold's own
-  arbitrariness, but it is a bias, not noise, and it grows towards the Baltic. A feed
-  much further east would need a different projection and a new package.
+  15.5 E (Bornholm; 31 m on 19.3 km), about +0.3% at the bbox's eastern edge (17.5 E).
+  Because reported distances are geodesic, none of this reaches `dist_eez_boundary_m`
+  or `dist_mpa_m` or the DARK_GAP thresholds. Planar distances in 25832 are only for
+  ranking candidates. Anyone measuring directly in the 25832 tables in SQL gets the
+  scale error.
+- Each distance costs one inverse transform and one geodesic calculation per message,
+  on top of the tree lookup.
+- PostGIS geography is the reference for the Flink job's distance tests. A loader test
+  checks the method near Bornholm in SQL; the job's own test has to match it in Java.
 - The metric copies' `package_version` comes from the same rows as the 4326 tables, so
   Flink can stamp `zones_version` from either.
 - Rollback still means reloading an older package. It becomes the active one, because
