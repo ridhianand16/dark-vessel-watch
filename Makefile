@@ -1,6 +1,6 @@
 COMPOSE := docker compose -f deploy/compose/docker-compose.yml --env-file .env
 
-.PHONY: hooks up down nuke topics ps console fetch fetch-refdata area refdata refdata-image refdata-key refdata-build refdata-verify refdata-load replay migrate migrate-postgis sink sink-logs alerts-sink alerts-sink-logs vessels-sink vessels-sink-logs tracker tracker-logs reconcile score flink-up flink-savepoint flink-restart flink-logs flink-check test test-py test-flink typecheck
+.PHONY: hooks up down nuke topics ps console fetch fetch-refdata area refdata refdata-image refdata-key refdata-build refdata-verify refdata-load replay migrate migrate-postgis sink sink-logs alerts-sink alerts-sink-logs vessels-sink vessels-sink-logs tracker tracker-logs reconcile score flink-up flink-savepoint flink-restart flink-logs flink-check compare-tracks test test-py test-flink typecheck
 
 .env:
 	@echo "Missing .env. Run: cp .env.example .env" >&2; exit 1
@@ -189,6 +189,12 @@ flink-check: .env
 zone-check: .env
 	@test -n "$(RUN)" || { echo "usage: make zone-check RUN=<run_id>  (see data/runs/)" >&2; exit 2; }
 	uv run python -m reconcile.zone_check $(RUN)
+
+## Compare the ais.tracks of two replays of the same rows, vessel by vessel (e.g. the
+## tracker on ais.raw, then on ais.enriched). make compare-tracks A=<run_id> B=<run_id>
+compare-tracks: .env
+	@test -n "$(A)" -a -n "$(B)" || { echo "usage: make compare-tracks A=<run_id> B=<run_id>" >&2; exit 2; }
+	uv run python -m reconcile.compare_tracks $(A) $(B)
 
 PY_DIRS := common ingest refdata sql sinks reconcile stream
 
