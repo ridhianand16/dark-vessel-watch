@@ -1,6 +1,6 @@
 COMPOSE := docker compose -f deploy/compose/docker-compose.yml --env-file .env
 
-.PHONY: hooks up down nuke topics ps fetch fetch-refdata area refdata refdata-image refdata-key refdata-build refdata-verify refdata-load replay migrate migrate-postgis sink sink-logs alerts-sink alerts-sink-logs tracker tracker-logs reconcile score test typecheck
+.PHONY: hooks up down nuke topics ps fetch fetch-refdata area refdata refdata-image refdata-key refdata-build refdata-verify refdata-load replay migrate migrate-postgis sink sink-logs alerts-sink alerts-sink-logs vessels-sink vessels-sink-logs tracker tracker-logs reconcile score test typecheck
 
 .env:
 	@echo "Missing .env. Run: cp .env.example .env" >&2; exit 1
@@ -26,7 +26,7 @@ up: hooks .env
 	$(COMPOSE) up -d --wait --wait-timeout 180 $(SERVICES)
 	$(COMPOSE) run --rm init-topics
 	$(MAKE) migrate migrate-postgis
-	$(COMPOSE) up -d --build raw-sink alerts-sink tracker
+	$(COMPOSE) up -d --build raw-sink alerts-sink vessels-sink tracker
 
 ## Stop and remove containers; named volumes (topic data, DBs) are kept.
 down: .env
@@ -109,6 +109,13 @@ alerts-sink: .env
 
 alerts-sink-logs: .env
 	$(COMPOSE) logs -f alerts-sink
+
+## (Re)build and start the ais.tracks -> PostGIS vessels_current sink (same image).
+vessels-sink: .env
+	$(COMPOSE) up -d --build vessels-sink
+
+vessels-sink-logs: .env
+	$(COMPOSE) logs -f vessels-sink
 
 ## (Re)build and start the Faust tracker: ais.raw -> ais.tracks.
 tracker: .env

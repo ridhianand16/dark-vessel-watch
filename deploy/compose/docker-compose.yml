@@ -4,8 +4,8 @@
 # Memory budget (mem_limit caps, not reservations):
 #   redpanda 1.5g (1G Seastar heap + overhead) | console 256m
 #   clickhouse 2g | postgis 512m               | raw-sink 384m
-#   tracker 512m  | alerts-sink 192m
-#   total ≈ 5.3g ceiling
+#   tracker 512m  | alerts-sink 192m           | vessels-sink 192m
+#   total ≈ 5.5g ceiling
 #   refdata-tools 1g, only while `make refdata` builds a package (one-shot)
 # Every image tag is pinned; never use :latest (reproducibility).
 
@@ -147,8 +147,8 @@ services:
   raw-sink:
     build:
       context: ../..
-      dockerfile: sinks/clickhouse/Dockerfile
-    image: dvw-clickhouse-sink:0.2.0
+      dockerfile: sinks/Dockerfile
+    image: dvw-sinks:0.3.0
     container_name: dvw-raw-sink
     command: ["raw"]
     depends_on:
@@ -173,8 +173,8 @@ services:
   alerts-sink:
     build:
       context: ../..
-      dockerfile: sinks/clickhouse/Dockerfile
-    image: dvw-clickhouse-sink:0.2.0
+      dockerfile: sinks/Dockerfile
+    image: dvw-sinks:0.3.0
     container_name: dvw-alerts-sink
     command: ["alerts"]
     depends_on:
@@ -183,6 +183,35 @@ services:
       clickhouse:
         condition: service_healthy
     environment: *sink-env
+    # Batches of at most 10k small rows; the 16 MB prefetch buffer dominates.
+    mem_limit: 192m
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  # ais.tracks -> vessels_current in PostGIS (sinks/postgis_vessels, docs/adr/0012). Same
+  # image and delivery loop as the ClickHouse sinks. Offsets are committed after the upsert
+  # transaction commits; a row only moves to a later event_ts, so replays write nothing.
+  # Needs the table: run `make migrate-postgis` first (`make up` does).
+  vessels-sink:
+    build:
+      context: ../..
+      dockerfile: sinks/Dockerfile
+    image: dvw-sinks:0.3.0
+    container_name: dvw-vessels-sink
+    entrypoint: ["python", "-m", "sinks.postgis_vessels"]
+    command: []
+    depends_on:
+      init-topics:
+        condition: service_completed_successfully
+      postgis:
+        condition: service_healthy
+    environment:
+      REDPANDA_BROKERS: redpanda:9092   # internal listener
+      POSTGRES_HOST: postgis
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:?set in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set in .env}
     # Batches of at most 10k small rows; the 16 MB prefetch buffer dominates.
     mem_limit: 192m
     stop_grace_period: 30s
