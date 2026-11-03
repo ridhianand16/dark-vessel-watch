@@ -1,6 +1,6 @@
 COMPOSE := docker compose -f deploy/compose/docker-compose.yml --env-file .env
 
-.PHONY: hooks up down nuke topics ps console fetch fetch-refdata area refdata refdata-image refdata-key refdata-build refdata-verify refdata-load replay migrate migrate-postgis sink sink-logs tracks-alerts-sink tracks-alerts-sink-logs vessels-sink vessels-sink-logs tracker tracker-logs reconcile score flink-up flink-savepoint flink-restart flink-logs flink-check compare-tracks latency test test-py test-flink typecheck
+.PHONY: hooks up down nuke topics ps console fetch fetch-refdata area refdata refdata-image refdata-key refdata-build refdata-verify refdata-load replay migrate migrate-postgis sink sink-logs tracks-alerts-sink tracks-alerts-sink-logs vessels-sink vessels-sink-logs tracker tracker-logs reconcile score flink-up flink-savepoint flink-restart flink-logs flink-check compare-tracks latency backfill-rollups test test-py test-flink typecheck
 
 .env:
 	@echo "Missing .env. Run: cp .env.example .env" >&2; exit 1
@@ -137,6 +137,11 @@ tracker-logs: .env
 ## Apply new ClickHouse migrations in sql/clickhouse/ (no-op when up to date).
 migrate: .env
 	uv run python -m sql.migrate --target clickhouse
+
+## Fill the 1-minute and 1-hour rollups from tracks already in dvw.tracks (the views only
+## see new inserts). Safe to repeat, also while the sink runs. RUN=<run_id> for one run.
+backfill-rollups: .env
+	uv run python -m sql.backfill_rollups $(if $(RUN),--run $(RUN))
 
 ## Apply new PostGIS migrations in sql/postgis/ (no-op when up to date).
 migrate-postgis: .env
