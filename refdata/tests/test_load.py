@@ -12,7 +12,15 @@ from refdata.area import BBox
 from refdata.load import load
 from refdata.package import VerifyError
 from refdata.staging import StagingCheckFailed
-from refdata.tests.fake_package import default_rows, gpkg_blob, make_package, multipolygon, square, write_area
+from refdata.tests.fake_package import (
+    default_rows,
+    gpkg_blob,
+    make_package,
+    multilinestring,
+    multipolygon,
+    square,
+    write_area,
+)
 from refdata.tests.minisign_keys import SigningKey
 from sql.migrate import main as migrate
 
@@ -127,6 +135,31 @@ def test_metric_copy_distances_match_geography(
     # line in UTM and misses by tens of metres. What is left is UTM 32N's scale error near
     # 11 E, about 0.01 %.
     assert abs(metric - geodesic) < 0.0002 * geodesic
+
+
+def test_nearest_point_from_the_metric_copy_gives_the_geodesic_distance_near_bornholm(
+    db: str, tmp_path: Path, key: SigningKey, public_key: Path, area: Path
+) -> None:
+    # How the Flink enrichment job reports distances (ADR 0013): find the nearest point in
+    # 25832, then measure the geodesic distance to it. Near Bornholm UTM 32N stretches
+    # distances by ~0.16%; the geodesic step must remove that.
+    rows = default_rows()
+    rows["eez_boundaries"] = [(325, gpkg_blob(multilinestring([(14.6, 54.9), (15.2, 55.5), (16.0, 55.8)])))]
+    load(make_package(tmp_path / "p", key, BBOX, rows=rows), public_key, area)
+    with psycopg.connect(conninfo()) as conn:
+        row = conn.execute(
+            "WITH v AS (SELECT ST_SetSRID(ST_Point(15.5, 55.3), 4326) AS pg,"
+            "                  ST_Transform(ST_SetSRID(ST_Point(15.5, 55.3), 4326), 25832) AS pm)"
+            " SELECT ST_Distance(pm, m.geom),"
+            "        ST_Distance(pg::geography, ST_Transform(ST_ClosestPoint(m.geom, pm), 4326)::geography),"
+            "        ST_Distance(pg::geography, g.geom::geography)"
+            " FROM v, eez_boundaries_25832 m JOIN eez_boundaries g USING (id)"
+        ).fetchone()
+    assert row is not None
+    utm, nearest_then_geodesic, geodesic = row
+    assert 10_000 < geodesic < 30_000
+    assert utm - geodesic > 0.001 * geodesic  # the scale error this method exists to remove
+    assert abs(nearest_then_geodesic - geodesic) < 0.5
 
 
 def test_zone_along_the_bbox_edge_stays_inside_it_in_the_metric_copy(
