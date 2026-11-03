@@ -4,22 +4,24 @@ package dvw.enrichment;
  * Station class of an MMSI, from its leading digits (ITU-R M.585).
  *
  * <p>A port of stream/faust_app/mmsi.py with the same wire names, so the tracker can read
- * {@code station_class} from ais.enriched instead of recomputing it. The table is checked
+ * {@code station_class} from ais.enriched instead of recomputing it. The wire names, which
+ * classes are ships, and example MMSIs are in contracts/ais_enriched.json; StationClassTest
+ * and the tracker's test_contract.py both check against it. The table is checked
  * longest prefix first, so 00 wins over 0. An MMSI below 10^8 has leading zeros: 2190261
  * is 002190261, a coast station.
  */
 public enum StationClass {
-    SHIP("ship"),
-    CRAFT_WITH_PARENT("craft_with_parent"),
-    COAST("coast"),
-    GROUP("group"),
-    SAR_AIRCRAFT("sar_aircraft"),
-    HANDHELD("handheld"),
-    AID_TO_NAVIGATION("aid_to_navigation"),
-    SART("sart"),
-    MOB("mob"),
-    EPIRB("epirb"),
-    OTHER("other");
+    SHIP("ship", true),
+    CRAFT_WITH_PARENT("craft_with_parent", true),
+    COAST("coast", false),
+    GROUP("group", false),
+    SAR_AIRCRAFT("sar_aircraft", false),
+    HANDHELD("handheld", false),
+    AID_TO_NAVIGATION("aid_to_navigation", false),
+    SART("sart", false),
+    MOB("mob", false),
+    EPIRB("epirb", false),
+    OTHER("other", false);
 
     public static final long MMSI_MAX = 999_999_999L;
 
@@ -29,9 +31,12 @@ public enum StationClass {
     };
 
     public final String wire;
+    /** Whether the tracker tracks this class (mmsi.SHIP_CLASSES on the Python side). */
+    public final boolean isShip;
 
-    StationClass(String wire) {
+    StationClass(String wire, boolean isShip) {
         this.wire = wire;
+        this.isShip = isShip;
     }
 
     public static StationClass of(long mmsi) {

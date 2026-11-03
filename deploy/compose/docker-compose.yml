@@ -4,7 +4,7 @@
 # Memory budget (mem_limit caps, not reservations) for the 3.9 GiB Docker VM:
 #   redpanda 768m (512M Seastar memory + overhead) | clickhouse 1.25g | postgis 512m
 #   raw-sink 384m | tracker 512m | alerts-sink 192m | vessels-sink 192m
-#   flink-jobmanager 768m | flink-taskmanager 1280m        (profile flink, `make flink-up`)
+#   flink-jobmanager 768m | flink-taskmanager 1280m        (`make up` starts them, via `make flink-up`)
 #   total ≈ 5.8g ceiling; measured use with everything running is in the README
 #   console 256m, only when needed (profile console, `make console`)
 #   flink-submit 384m, one-shot; refdata-tools 1g, only while `make refdata` builds a package
@@ -223,8 +223,9 @@ services:
     stop_grace_period: 30s
     restart: unless-stopped
 
-  # ais.raw -> per-MMSI Kalman filter -> ais.tracks (stream/faust_app, docs/adr/0004).
-  # At-least-once; vessel state lives in the dvw-tracker-vessel_state-changelog topic,
+  # ais.enriched -> per-MMSI Kalman filter -> ais.tracks, ais.alerts (stream/faust_app,
+  # docs/adr/0004, 0019). Reads with read_committed, so it sees only the Flink job's
+  # committed transactions. At-least-once; vessel state lives in the dvw-tracker-vessel_state-changelog topic,
   # with a local RocksDB copy in tracker-data. `make nuke` drops both together.
   tracker:
     build:
@@ -237,8 +238,8 @@ services:
         condition: service_completed_successfully
     environment:
       REDPANDA_BROKERS: redpanda:9092   # internal listener
-      # ais.enriched needs the Flink job (make flink-up); ais.raw tracks without it,
-      # but raises no DARK_GAP (no zone tags).
+      # ais.enriched is written by the Flink job (started by make up); ais.raw tracks
+      # without it, but raises no DARK_GAP (no zone tags).
       TRACKER_INPUT_TOPIC: ${TRACKER_INPUT_TOPIC:-ais.enriched}
     volumes:
       - tracker-data:/data
@@ -253,11 +254,12 @@ services:
   # subtasks in its 4 slots). The job itself is submitted by flink-submit. Checkpoints and
   # savepoints go to the flink-data volume, which both must see at the same path.
   flink-jobmanager:
-    build:
+    build: &flink-build
       context: ../../flink/enrichment
+      additional_contexts:
+        contracts: ../../contracts   # contracts/ais_enriched.json, for the Java tests
     image: dvw-flink:0.1.0
     container_name: dvw-flink-jobmanager
-    profiles: [flink]
     command: ["jobmanager"]
     environment:
       FLINK_PROPERTIES: &flink-properties |
@@ -291,11 +293,9 @@ services:
     restart: unless-stopped
 
   flink-taskmanager:
-    build:
-      context: ../../flink/enrichment
+    build: *flink-build
     image: dvw-flink:0.1.0
     container_name: dvw-flink-taskmanager
-    profiles: [flink]
     command: ["taskmanager"]
     depends_on:
       flink-jobmanager:
@@ -316,11 +316,9 @@ services:
   # zone package (the startup gate, docs/adr/0018); the job's zone source then reads that
   # package with the same settings, which travel inside the job graph.
   flink-submit:
-    build:
-      context: ../../flink/enrichment
+    build: *flink-build
     image: dvw-flink:0.1.0
     container_name: dvw-flink-submit
-    profiles: [flink]
     entrypoint: ["/opt/dvw/flinkctl.sh"]
     command: ["submit"]
     depends_on:

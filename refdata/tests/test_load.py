@@ -10,7 +10,7 @@ import pytest
 
 from common.postgis import conninfo
 from refdata.area import BBox
-from refdata.load import PIECE_VERTICES, load
+from refdata.load import PIECE_VERTICES, active_version, ensure, load
 from refdata.package import VerifyError
 from refdata.staging import StagingCheckFailed
 from refdata.tests.fake_package import (
@@ -266,3 +266,18 @@ def test_package_for_another_area_is_refused(
         load(pkg, public_key, area)
     assert live()[1:5] == (0, 0, 0, 0)
     assert live()[6:8] == (None, 0)
+
+
+def test_ensure_loads_into_an_empty_database_then_does_nothing(
+    db: str, tmp_path: Path, key: SigningKey, public_key: Path, area: Path
+) -> None:
+    """What make up relies on after make nuke: the built package goes live once, and a
+    second make up leaves it alone (one registry row, not two)."""
+    assert active_version() is None
+    pkg = make_package(tmp_path / "packages", key, BBOX)
+    first = ensure(pkg, public_key, area)
+    assert first.loaded is not None and active_version() == first.version
+    before = live()
+    second = ensure(pkg, public_key, area)
+    assert second.loaded is None and second.version == first.version
+    assert live() == before

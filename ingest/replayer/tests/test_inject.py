@@ -37,7 +37,7 @@ def layout(tmp_path: Path) -> tuple[int, dict[str, int], str]:
 
 def test_shipped_file_parses() -> None:
     spec = inject.load(SHIPPED)
-    assert len(spec.vessels) == 8 and spec.required_min == 54.0
+    assert len(spec.vessels) == 10 and spec.required_min == 54.0
     assert {v.expect for v in spec.vessels} == {"DARK_GAP", "TELEPORT", None}
 
 

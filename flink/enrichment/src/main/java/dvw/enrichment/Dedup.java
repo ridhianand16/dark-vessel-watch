@@ -15,7 +15,8 @@ import org.apache.flink.util.OutputTag;
  * Drops repeats of the same report, keyed by MMSI (docs/adr/0015).
  *
  * <p>Duplicate key: (run_id, event_ts, lat, lon), coordinates rounded to 5 decimal places
- * (about 1 m), within one MMSI. The same report heard by a second base station has the same
+ * (about 1 m), within one MMSI. The rule is in contracts/ais_enriched.json, which the tracker's
+ * own duplicate check follows too; DedupTest checks {@link #coordKey} against it. The same report heard by a second base station has the same
  * position and is dropped; a second ship using the MMSI in the same second has a different
  * position and survives. The first copy goes on; later copies go to the DUPLICATES side
  * output to be counted, never silently lost.
@@ -40,6 +41,8 @@ import org.apache.flink.util.OutputTag;
  */
 public final class Dedup extends KeyedProcessFunction<Long, RawRecord, RawRecord> {
     public static final long REMEMBER_MS = 120_000L;
+    public static final int COORD_DECIMALS = 5;
+    private static final double COORD_SCALE = Math.pow(10, COORD_DECIMALS);
     public static final OutputTag<Duplicate> DUPLICATES = new OutputTag<>("duplicates") {};
 
     /** "run_id|event_ts|lat5|lon5" -> event_ts. */
@@ -58,7 +61,12 @@ public final class Dedup extends KeyedProcessFunction<Long, RawRecord, RawRecord
     }
 
     static String dedupKey(RawRecord r) {
-        return r.runId + "|" + r.eventTs + "|" + Math.round(r.lat * 1e5) + "|" + Math.round(r.lon * 1e5);
+        return r.runId + "|" + r.eventTs + "|" + coordKey(r.lat) + "|" + coordKey(r.lon);
+    }
+
+    /** A coordinate in the key: times 10^5, to the nearest integer, ties toward +infinity. */
+    static long coordKey(double coordinate) {
+        return Math.round(coordinate * COORD_SCALE);
     }
 
     @Override

@@ -90,7 +90,9 @@ def alert_latencies(run_id: str) -> list[float]:
         FROM (SELECT trace_id, min(ingested_at) AS ingested_at FROM dvw.alerts
               WHERE run_id = {run:String} AND type = 'TELEPORT' GROUP BY trace_id) AS a
         INNER JOIN (SELECT trace_id, any(replay_send_ts) AS replay_send_ts FROM dvw.ais_raw
-                    WHERE run_id = {run:String} GROUP BY trace_id) AS r USING trace_id
+                    WHERE run_id = {run:String} AND trace_id IN (
+                        SELECT trace_id FROM dvw.alerts WHERE run_id = {run:String} AND type = 'TELEPORT')
+                    GROUP BY trace_id) AS r USING trace_id
         """,
         parameters={"run": run_id},
     ).result_rows

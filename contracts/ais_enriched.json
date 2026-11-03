@@ -1,0 +1,33 @@
+{
+  "description": "Rules the Flink enrichment job (writer of ais.enriched) and the Faust tracker (its reader) must agree on. Both sides' tests load this file and fail on any difference. Change it only together with both implementations.",
+  "station_classes": [
+    {"wire": "ship", "is_ship": true, "example_mmsis": [219026147, 257000000, 200000000, 799999999, 300000000, 412345678, 538001234, 636012345]},
+    {"wire": "craft_with_parent", "is_ship": true, "example_mmsis": [982190001, 980000000, 989999999]},
+    {"wire": "coast", "is_ship": false, "example_mmsis": [2190047, 2190000, 0]},
+    {"wire": "group", "is_ship": false, "example_mmsis": [21900000, 99999999]},
+    {"wire": "sar_aircraft", "is_ship": false, "example_mmsis": [111219500]},
+    {"wire": "handheld", "is_ship": false, "example_mmsis": [812345678, 800000000]},
+    {"wire": "aid_to_navigation", "is_ship": false, "example_mmsis": [992191234, 999000001, 990000000]},
+    {"wire": "sart", "is_ship": false, "example_mmsis": [970123456]},
+    {"wire": "mob", "is_ship": false, "example_mmsis": [972123456]},
+    {"wire": "epirb", "is_ship": false, "example_mmsis": [974123456]},
+    {"wire": "other", "is_ship": false, "example_mmsis": [100000000, 110999999, 112000000, 971000000, 973000000, 975000000, 900000000, 979999999, 199999999, 1000000000, -1]}
+  ],
+  "duplicate_key": {
+    "description": "Two reports of one MMSI are the same report when run_id and event_ts are equal and lat and lon are equal after rounding. The Flink job drops the later copy; the tracker counts one that reaches it as leak_duplicate.",
+    "fields": ["run_id", "event_ts", "lat", "lon"],
+    "coordinate_decimals": 5,
+    "rounding": "round(coordinate * 10^decimals) to the nearest integer, ties toward positive infinity (Java Math.round). Not ties-to-even, which Python's round() does: the half-way examples below differ.",
+    "coordinate_examples": [
+      {"coordinate": 55.0, "rounded": 5500000},
+      {"coordinate": 55.123454, "rounded": 5512345},
+      {"coordinate": 55.123456, "rounded": 5512346},
+      {"coordinate": 55.000005, "rounded": 5500001},
+      {"coordinate": 55.000025, "rounded": 5500003},
+      {"coordinate": 10.000045, "rounded": 1000005},
+      {"coordinate": -2.999995, "rounded": -299999},
+      {"coordinate": -2.999975, "rounded": -299997},
+      {"coordinate": -12.345678, "rounded": -1234568}
+    ]
+  }
+}

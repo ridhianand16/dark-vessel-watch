@@ -10,8 +10,8 @@ way one record goes through three stages:
                      the key, or no run_id; on ais.enriched also missing or mistyped
                      src_partition, src_offset, station_class or zone tags
        not_a_ship    MMSI is not a ship station (mmsi.py): buoys, base stations, SARTs
-       station_class_mismatch  ais.enriched only: the Flink job's station_class and
-                     mmsi.py disagree about whether this is a ship
+       station_class_mismatch  ais.enriched only: the Flink job's station_class is
+                     not the class mmsi.py gives the MMSI (contracts/ais_enriched.json)
        no_event_ts   event_ts missing
        no_position   lat/lon missing or out of range (AIS sends 91/181 for "not available")
    On ais.enriched the Flink job has already dropped invalid records (to ais.dlq) and
@@ -36,7 +36,9 @@ way one record goes through three stages:
        duplicate     same event_ts and position as the last fix heard (the same
                      report heard by several base stations, about 40% of DMA rows);
                      feeding it again would make the filter overconfident, and
-                     counting a repeated outlier again would reach the reinit limit
+                     counting a repeated outlier again would reach the reinit limit.
+                     Positions are compared rounded to 5 decimals (about 1 m) the way
+                     the Flink job's dedup rounds them (contracts/ais_enriched.json)
        out_of_order  event_ts earlier than the last fix heard in the same run
    started/restarted/updated/reinitialised are "accepted" and produce one ais.tracks
    message. A fix that ends a silence longer than DARK_GAP_S also raises DARK_GAP, if
@@ -110,11 +112,14 @@ from stream.faust_app.kalman import (
     step,
 )
 from stream.faust_app.mmsi import is_ship
+from stream.faust_app.mmsi import station_class as mmsi_station_class  # decode() has a local station_class
 
 RAW_SCHEMA_VERSION = 1
 TRACKS_SCHEMA_VERSION = 1
 STATE_VERSION = 3
 INVALID_KEY = b"invalid"
+DUPLICATE_DECIMALS = 5
+_DUPLICATE_SCALE = 10.0**DUPLICATE_DECIMALS
 
 
 class Skip(StrEnum):
@@ -139,7 +144,6 @@ class Result(StrEnum):
 
 ACCEPTED = frozenset({Result.STARTED, Result.RESTARTED, Result.UPDATED, Result.REINITIALISED})
 DEFAULT_DETECTION = DetectionConfig()
-SHIP = "ship"
 
 
 class Leak(StrEnum):
@@ -188,6 +192,23 @@ class Fix:
     """The Flink job's zone tags; None when read from ais.raw."""
 
 
+def duplicate_coord(v: float) -> int:
+    """A coordinate as it enters the duplicate key: v * 10^5 rounded to the nearest
+    integer, ties toward positive infinity, as Java's Math.round does in the Flink job.
+    Python's round() sends ties to even and would disagree on exact halves."""
+    x = v * _DUPLICATE_SCALE
+    f = math.floor(x)
+    return f + 1 if x - f >= 0.5 else f  # x - f is exact for |x| < 2^52
+
+
+def _same_report(fix: Fix, prev: VesselState) -> bool:
+    return (
+        fix.event_ts == prev.heard_ts
+        and duplicate_coord(fix.lat) == duplicate_coord(prev.heard_lat)
+        and duplicate_coord(fix.lon) == duplicate_coord(prev.heard_lon)
+    )
+
+
 def _int(v: object) -> int | None:
     return v if type(v) is int else None  # not isinstance: bool is an int
 
@@ -233,7 +254,9 @@ def decode(key: bytes | None, value: bytes | None, enriched: bool = False) -> Fi
         station_class, zone = msg.get("station_class"), _zone(msg)
         if src_partition is None or src_offset is None or not isinstance(station_class, str) or zone is None:
             return Skip.DECODE_ERROR
-        if (station_class == SHIP) != is_ship(mmsi):
+        # The exact class, not "ship or not": craft_with_parent is a ship too
+        # (contracts/ais_enriched.json), and any other disagreement is a contract break.
+        if station_class != mmsi_station_class(mmsi).value:
             return Skip.CLASS_MISMATCH
     if not is_ship(mmsi):
         return Skip.NOT_A_SHIP
@@ -465,7 +488,7 @@ def apply(
 
     if fix.event_ts < prev.heard_ts:
         return Outcome(Result.OUT_OF_ORDER, None, None)
-    if fix.event_ts == prev.heard_ts and fix.lat == prev.heard_lat and fix.lon == prev.heard_lon:
+    if _same_report(fix, prev):
         return Outcome(Result.DUPLICATE, None, None)
 
     alerts: list[tuple[AlertType, bytes]] = []
@@ -633,10 +656,11 @@ def process_batch(
         fix = decode(rec.key, rec.value, enriched)
         if isinstance(fix, Skip):
             out.counts[fix.value] += 1
-            if enriched and fix in LEAK_SKIPS:
-                out.counts[Leak.INVALID.value] += 1
-            elif fix is Skip.CLASS_MISMATCH:
-                out.counts[Leak.STATION_CLASS.value] += 1
+            if enriched:  # decode() returns CLASS_MISMATCH only for enriched records
+                if fix in LEAK_SKIPS:
+                    out.counts[Leak.INVALID.value] += 1
+                elif fix is Skip.CLASS_MISMATCH:
+                    out.counts[Leak.STATION_CLASS.value] += 1
             continue
         key = rec.key
         assert key is not None  # decode() returns Skip.INVALID_KEY otherwise
