@@ -6,6 +6,7 @@ One ais.raw record goes through three stages:
        invalid_key   key is "invalid" (unparseable MMSI) or missing
        decode_error  not UTF-8 JSON object, schema_version != 1, MMSI does not match
                      the key, or no run_id
+       not_a_ship    MMSI is not a ship station (mmsi.py): buoys, base stations, SARTs
        no_event_ts   event_ts missing
        no_position   lat/lon missing or out of range (AIS sends 91/181 for "not available")
 2. apply()   -> an Outcome for that vessel, given its stored state:
@@ -93,6 +94,7 @@ from stream.faust_app.kalman import (
     predict,
     step,
 )
+from stream.faust_app.mmsi import is_ship
 
 RAW_SCHEMA_VERSION = 1
 TRACKS_SCHEMA_VERSION = 1
@@ -103,6 +105,7 @@ INVALID_KEY = b"invalid"
 class Skip(StrEnum):
     INVALID_KEY = "invalid_key"
     DECODE_ERROR = "decode_error"
+    NOT_A_SHIP = "not_a_ship"
     NO_EVENT_TS = "no_event_ts"
     NO_POSITION = "no_position"
 
@@ -169,6 +172,8 @@ def decode(key: bytes | None, value: bytes | None) -> Fix | Skip:
     run_id = msg.get("run_id")
     if mmsi is None or str(mmsi).encode() != key or not isinstance(run_id, str) or not run_id:
         return Skip.DECODE_ERROR
+    if not is_ship(mmsi):
+        return Skip.NOT_A_SHIP
     event_ts = _int(msg.get("event_ts"))
     if event_ts is None:
         return Skip.NO_EVENT_TS
@@ -523,6 +528,8 @@ class BatchResult:
     seen: dict[WatermarkKey, int] = field(default_factory=dict)
     """Max event_ts per (partition, run_id) over every decoded fix, for Watermarks."""
     counts: Counter[str] = field(default_factory=Counter)
+    """read (records in), one Skip or Result per record, and alert_<type> per alert.
+    The Skip and Result counts add up to read."""
 
 
 def process_batch(
@@ -543,6 +550,7 @@ def process_batch(
     working: dict[bytes, VesselState | None] = {}
     last_index: dict[bytes, int] = {}
     changed: set[bytes] = set()
+    out.counts["read"] += len(records)
     for i, rec in enumerate(records):
         fix = decode(rec.key, rec.value)
         if isinstance(fix, Skip):
