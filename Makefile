@@ -123,7 +123,8 @@ vessels-sink: .env
 vessels-sink-logs: .env
 	$(COMPOSE) logs -f vessels-sink
 
-## (Re)build and start the Faust tracker: ais.raw -> ais.tracks.
+## (Re)build and start the Faust tracker: ais.enriched -> ais.tracks, ais.alerts.
+## TRACKER_INPUT_TOPIC=ais.raw in .env tracks without the Flink job (no DARK_GAP).
 tracker: .env
 	$(COMPOSE) up -d --build tracker
 
