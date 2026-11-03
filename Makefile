@@ -1,11 +1,13 @@
 COMPOSE := docker compose -f deploy/compose/docker-compose.yml --env-file .env
 
-.PHONY: hooks up down nuke topics ps fetch fetch-refdata area refdata refdata-image refdata-key refdata-build refdata-verify refdata-load replay migrate migrate-postgis sink sink-logs alerts-sink alerts-sink-logs vessels-sink vessels-sink-logs tracker tracker-logs reconcile score test typecheck
+.PHONY: hooks up down nuke topics ps console fetch fetch-refdata area refdata refdata-image refdata-key refdata-build refdata-verify refdata-load replay migrate migrate-postgis sink sink-logs alerts-sink alerts-sink-logs vessels-sink vessels-sink-logs tracker tracker-logs reconcile score flink-up flink-savepoint flink-restart flink-logs flink-check test test-py test-flink typecheck
 
 .env:
 	@echo "Missing .env. Run: cp .env.example .env" >&2; exit 1
 
-SERVICES := redpanda console clickhouse postgis
+SERVICES := redpanda clickhouse postgis
+# Every profile, so down and nuke also remove Flink, Console and one-shot tool containers.
+ALL_PROFILES := --profile flink --profile console --profile tools
 
 # Read only the keys we need from .env rather than including the whole file.
 env_get = $(shell sed -n 's/^$(1)=//p' .env 2>/dev/null)
@@ -30,11 +32,11 @@ up: hooks .env
 
 ## Stop and remove containers; named volumes (topic data, DBs) are kept.
 down: .env
-	$(COMPOSE) down
+	$(COMPOSE) $(ALL_PROFILES) down
 
 ## Stop and delete everything including volumes. Destroys all data.
 nuke: .env
-	$(COMPOSE) down -v --remove-orphans
+	$(COMPOSE) $(ALL_PROFILES) down -v --remove-orphans
 
 ## (Re)create topics. Idempotent: safe to run any number of times.
 topics: .env
@@ -42,6 +44,10 @@ topics: .env
 
 ps: .env
 	$(COMPOSE) ps -a
+
+## Redpanda Console on http://localhost:8080. Not started by `make up` (256 MB).
+console: .env
+	$(COMPOSE) --profile console up -d --wait console
 
 ## Download, verify (SHA-256) and unzip the pinned DMA AIS day into AIS_DATA_DIR.
 fetch: .env
@@ -145,10 +151,46 @@ score: .env
 	@test -n "$(RUN)" || { echo "usage: make score RUN=<run_id>  (a run replayed with --inject)" >&2; exit 2; }
 	uv run python -m reconcile.score_alerts $(RUN) --wait $(WAIT)
 
+## Flink session cluster plus the enrichment job: ais.raw -> ais.enriched, ais.dlq,
+## ais.dedup_counts (docs/adr/0014). Builds the image (which runs the Java tests), starts
+## the JobManager and TaskManager, then submits the job unless it is already running.
+## Web UI: http://localhost:8081
+FLINK := $(COMPOSE) --profile flink
+flink-up: .env
+	$(FLINK) up -d --build --wait --wait-timeout 180 flink-jobmanager flink-taskmanager
+	$(FLINK) run --rm flink-submit submit
+
+## Stop the job with a savepoint: the sinks commit their last transactions and the state
+## is written to the flink-data volume. The cluster keeps running.
+flink-savepoint: .env
+	$(FLINK) run --rm --no-deps flink-submit stop
+
+## Rebuild the job, stop it with a savepoint if it is running, and start it from the
+## latest savepoint. Use after changing the job or AIS_DAY.
+flink-restart: .env
+	$(FLINK) build flink-submit
+	$(FLINK) run --rm --no-deps flink-submit restart
+
+flink-logs: .env
+	$(FLINK) logs -f flink-jobmanager flink-taskmanager
+
+## Check one replay run through Flink, per partition: raw = enriched + dlq + dedup counts,
+## and no raw offset written twice. Waits up to WAIT seconds while records are only missing.
+## make flink-check RUN=<run_id>
+flink-check: .env
+	@test -n "$(RUN)" || { echo "usage: make flink-check RUN=<run_id>  (see data/runs/)" >&2; exit 2; }
+	uv run python -m reconcile.flink_check $(RUN) --wait $(WAIT)
+
 PY_DIRS := common ingest refdata sql sinks reconcile stream
 
-test:
+test: test-py test-flink
+
+test-py:
 	uv run pytest -q $(PY_DIRS)
+
+## Compile the Flink job and run its unit tests, in Docker (no host JDK or Maven needed).
+test-flink:
+	docker build --target build -q flink/enrichment >/dev/null
 
 typecheck:
 	uv run mypy --strict $(PY_DIRS)

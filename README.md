@@ -20,7 +20,9 @@ The zones DARK_GAP needs come from three reference datasets: Marine Regions EEZ 
 
 A third sink keeps `vessels_current` in PostGIS: one row per vessel with its latest filtered position, upserted from `ais.tracks`. A row only moves forward in event time, so replays, redeliveries and a reset consumer group cannot move a vessel back or rewrite its row ([Current positions](#current-positions), [ADR 0012](docs/adr/0012-vessels-current-upsert-forward-in-event-time.md)).
 
-Not built yet: the DARK_GAP zone check itself (the zones are in PostGIS, but the tracker does not read them yet, so the check still passes everywhere), MMSI_CLASH and Flink enrichment.
+A Flink job now sits on `ais.raw` as well ([Flink enrichment](#flink-enrichment)). It validates every message, sending rejects to `ais.dlq` with one of eight reason codes. It drops repeats of the same report heard by several base stations, and writes the rest to `ais.enriched` with the raw partition and offset each record came from. It is exactly-once end to end: output becomes visible only when a 3 s checkpoint completes ([ADR 0014](docs/adr/0014-flink-exactly-once-3s-checkpoints-5s-latency.md)). Dropped duplicates are counted exactly-once into their own topic ([ADR 0015](docs/adr/0015-dedup-key-and-counted-duplicates.md), [ADR 0016](docs/adr/0016-dedup-counts-topic.md)), so a check can prove, per run and partition, that every raw message is enriched, rejected or a counted duplicate. That holds when the TaskManager is killed partway through a run.
+
+Not built yet: zone tagging in Flink and the DARK_GAP zone check that depends on it (the zones are in PostGIS, but nothing reads them yet, so the check still passes everywhere), moving the tracker from `ais.raw` to `ais.enriched`, and MMSI_CLASH.
 
 ## Detections
 
@@ -105,6 +107,33 @@ ON CONFLICT (mmsi) DO UPDATE SET ... WHERE excluded.event_ts > vessels_current.e
 
 That one condition is why replays cannot corrupt the table. A redelivered batch, a reset consumer group or a second replay of the same day carries fixes that are not later than what is stored, so they write nothing. That includes `updated_at`. An older run read after a newer one cannot move a vessel back. On a tie the first fix received wins, inside a batch and across batches, so the result does not depend on batch boundaries. The catch is that `run_id` names the run whose fix is stored, not the most recent run. To start over, truncate the table and reset the `dvw-vessels-sink` group.
 
+## Flink enrichment
+
+The Flink job (Java 17, Flink 1.20 DataStream API, `flink/enrichment/`) reads `ais.raw` and writes three topics:
+
+```
+ais.raw -> parse + validate --invalid--------------------------------------> ais.dlq
+                 \--valid--> keyBy MMSI -> dedup --unique-------------------> ais.enriched
+                                            \--duplicates--> keyBy (run, partition)
+                                                -> 10 s event-time count -----> ais.dedup_counts
+```
+
+**Validation.** Rules are checked in a fixed order, and the first failure decides the code: `decode_error`, `bad_mmsi`, `no_position`, `position_unavailable` (lat 91 / lon 181), `position_out_of_range`, `null_island`, `bad_timestamp` (more than a day off the replayed day, `AIS_DAY`), `sog_invalid`. Each DLQ record carries its code, a detail string, the original payload, and the raw partition and offset. Base stations, buoys and other non-ship stations are valid. They go to `ais.enriched` with a `station_class` from the same MMSI table the tracker uses. A position far outside the receiver area is valid too, because catching impossible jumps is TELEPORT's job.
+
+**Dedup.** Two records are copies when they share run, MMSI, event time, and position rounded to 5 decimal places (about 1 m). A second ship using the same MMSI in the same second has a different position and survives, which is the evidence MMSI_CLASH will need. A key is remembered for 2 minutes of event time, and an event-time timer clears it ([ADR 0015](docs/adr/0015-dedup-key-and-counted-duplicates.md)). About 40% of DMA rows are copies.
+
+**Counting what is dropped.** Once dedup drops records, "dropped" and "lost" look the same unless the drops are counted exactly. Duplicates leave the dedup step through a side output. They are counted per run and raw partition in 10 s event-time windows and written to `ais.dedup_counts` through the same transactional sink. Windows also flush on a 5 s wall-clock timer, so the last ones of a run do not wait for the next run's data. The check is then:
+
+```
+raw(run, partition) = enriched + dlq + sum(dedup_counts.count)     over the run's ais.raw offset range
+```
+
+`make flink-check RUN=<run_id>` reads all three topics with `read_committed`. It also fails if any raw offset appears twice across `ais.enriched` and `ais.dlq`.
+
+**Exactly-once.** Checkpoints every 3 s snapshot the dedup state together with the Kafka offsets. The three Kafka sinks write in transactions that commit only when a checkpoint completes. After a crash, the job restarts from the last checkpoint, and the broker aborts whatever was written after it. When I killed the TaskManager mid-run, a `read_uncommitted` reader saw 103 records twice and a `read_committed` reader saw each once ([Numbers](#numbers)). The cost is latency: output waits up to 3 s for its checkpoint, so the end-to-end target is now p99 under 5 s at 10x, not 2 s ([ADR 0014](docs/adr/0014-flink-exactly-once-3s-checkpoints-5s-latency.md)).
+
+**Running it.** It is a session cluster in Compose: a JobManager (768 MB), one TaskManager with 4 slots (1280 MB), parallelism 4, heap state, and checkpoints on a Docker volume. A one-shot `flink-submit` container submits the job. To fit that in the 3.9 GiB Docker VM, Redpanda dropped to 512 MB and ClickHouse to 1.25 GB, and Console only runs on demand. Records keep the MMSI key and use the producer's default murmur2 partitioner, so each vessel stays in the same partition number it had in `ais.raw` (ADR 0001).
+
 ## Quickstart
 
 Needs Docker with Compose v2, about 8 GB of free RAM, GNU make, and Python 3.12 with [uv](https://docs.astral.sh/uv/). The AIS data is not in the repository: `make fetch` downloads it and checks its SHA-256.
@@ -117,8 +146,29 @@ make fetch     # download and verify the pinned AIS day (once, about 3 GB)
 
 make replay ARGS="--limit 10000"                # 10x by default; prints the run_id
 make reconcile RUN=<run_id>                     # per-partition produced vs stored
+```
 
-# with labelled anomalies (needs at least ~650k rows, see Detections).
+The Flink job (about 2 GB more; the image build compiles the job and runs its tests):
+
+```sh
+make flink-up                                   # JobManager, TaskManager, submit the job; UI on http://localhost:8081
+make replay ARGS="--limit 10000"
+make flink-check RUN=<run_id>                   # per partition: raw = enriched + dlq + dups, no offset twice
+
+docker kill dvw-flink-taskmanager               # mid-replay; then bring it back:
+docker start dvw-flink-taskmanager              # the job restores the last checkpoint; flink-check still OK
+
+make flink-savepoint                            # stop the job with a savepoint (sinks commit everything)
+make flink-restart                              # rebuild, stop with a savepoint if running, start from the newest one
+make flink-logs
+```
+
+The first start reads `ais.raw` from the beginning, because there are no committed offsets yet. Later starts resume from the checkpoint or savepoint. Change `AIS_DAY` only together with `make flink-restart`: the `bad_timestamp` rule is fixed when the job is submitted.
+
+Labelled anomalies:
+
+```sh
+# needs at least ~650k rows, see Detections.
 # 50x only to shorten the run; the tracker falls behind and catches up, and the score waits for it.
 make replay ARGS="--limit 700000 --speed 50 --inject ingest/replayer/anomalies.yaml"
 make score RUN=<run_id> WAIT=600                # TP/FP/FN per alert type
@@ -138,11 +188,11 @@ make area            # only if the AIS day changes: recompute refdata/area.yaml 
 
 EEZ (Marine Regions form), WDPA (Protected Planet terms page) and WPI (NASA Harvest mirror of the NGA release) have to be downloaded by hand into `data/refdata/incoming/<source>/<version>/`, under the file names in `refdata/sources.yaml`. `make fetch-refdata` prints the page and the exact path for each missing file, and fails on any file whose SHA-256 does not match `refdata/sources.yaml`.
 
-Redpanda Console is at http://localhost:8080. `make sink-logs`, `make alerts-sink-logs` and `make vessels-sink-logs` follow the three sinks (one line per batch; the vessels sink also logs how many rows each batch `written` and how many were `stale`). `make tracker-logs` follows the tracker, which logs its counters every 30 s (`tracks=... read=... not_a_ship=... duplicate=...`). Every record read gets exactly one skip reason or result, so those counters add up to `read`. `make down` stops the stack and keeps the data. `make nuke` stops it and deletes all data volumes, including ClickHouse.
+`make console` starts Redpanda Console on http://localhost:8080. It is not part of `make up`, to save 256 MB. `make sink-logs`, `make alerts-sink-logs` and `make vessels-sink-logs` follow the three sinks (one line per batch; the vessels sink also logs how many rows each batch `written` and how many were `stale`). `make tracker-logs` follows the tracker, which logs its counters every 30 s (`tracks=... read=... not_a_ship=... duplicate=...`). Every record read gets exactly one skip reason or result, so those counters add up to `read`. `make down` stops the stack and keeps the data. `make nuke` stops it and deletes all data volumes, including ClickHouse.
 
-Other targets: `make migrate` and `make migrate-postgis` apply new files in `sql/clickhouse/` and `sql/postgis/` and do nothing when up to date (`make up` runs both). `make test` and `make typecheck` run pytest and `mypy --strict`.
+Other targets: `make migrate` and `make migrate-postgis` apply new files in `sql/clickhouse/` and `sql/postgis/` and do nothing when up to date (`make up` runs both). `make test` runs pytest and the Flink job's JUnit tests (in Docker, so no JDK or Maven needed on the host). `make typecheck` runs `mypy --strict`.
 
-If a sink or the tracker crashes, Docker restarts it and it re-reads from its last committed offset. `docker stop` and `docker kill` count as deliberate stops and leave it down; `make sink`, `make alerts-sink`, `make vessels-sink` or `make tracker` starts it again.
+If a sink or the tracker crashes, Docker restarts it and it re-reads from its last committed offset. `docker stop` and `docker kill` count as deliberate stops and leave it down; `make sink`, `make alerts-sink`, `make vessels-sink` or `make tracker` starts it again. For the TaskManager, use `docker start dvw-flink-taskmanager`.
 
 ## Going faster
 
@@ -150,7 +200,7 @@ If a sink or the tracker crashes, Docker restarts it and it re-reads from its la
 
 1. **More tracker workers, up to 6.** `ais.raw` has 6 partitions keyed by MMSI, and vessel state is partitioned the same way, so Faust can spread the partitions over up to 6 workers without code changes. Each worker costs about 150 to 512 MiB, which is what rules it out on this laptop.
 2. **Drop numpy from the Kalman step.** The filter is 4x4, and per-record numpy calls cost more in overhead than the arithmetic does. Unrolling the predict and update steps into plain floats removes that overhead. I have not measured the gain yet. It needs a test that compares the two versions so the outputs stay identical.
-3. **Filter earlier, in Flink.** Today the tracker decodes every record, including the 9% from non-ship stations and the 35% repeated reports. The Flink validation job will drop those before `ais.enriched`, so the tracker only sees records it will use.
+3. **Filter earlier, in Flink.** Today the tracker decodes every record, including the 9% from non-ship stations and the 35 to 40% repeated reports. The Flink job already drops the repeats and rejects before `ais.enriched`, and marks non-ship stations. Once the tracker reads `ais.enriched`, it will only see records it uses.
 
 Past 6 workers, the next limit is the partition count. Changing it needs an ADR (ADR 0001).
 
@@ -189,6 +239,12 @@ Measured on 2026-11-02 on an Apple M1 laptop (8 GB RAM, macOS 26.5), Docker VM w
 | `vessels_current`, same run reprocessed (2026-11-03) | `rpk group seek dvw-vessels-sink --to-file` the run's start offsets | 5,354 messages, `written=0 stale=1279`. `md5` of the whole table, `updated_at` included, identical before and after |
 | `vessels_current`, a fix 1 h older than the stored one (2026-11-03) | one hand-made message on `ais.tracks` for MMSI 211772470 | `written=0 stale=1`, row unchanged |
 | Vessels sink, re-reading the `ais.tracks` backlog (2026-11-03) | first start, about 1.95 million track messages from earlier runs | about 55,000 messages/s, 25 to 33 ms per 10,000-message upsert. 72 MiB of its 192 MiB limit |
+
+| Flink, first start on the `ais.raw` backlog (2026-11-04) | `make flink-up` with no committed offsets | 3.1 million messages from earlier runs in about 2 minutes, roughly 25,000 to 30,000 messages/s on one TaskManager. 30 checkpoints, none failed. p50 0.3 s, p99 3.8 s while catching up, about 0.2 s once caught up. State 12 MB |
+| Flink check, 10,000 rows at 10x (2026-11-04) | `make replay ARGS="--limit 10000"`, `make flink-check RUN=...` | OK on all 6 partitions: 10,000 = 5,683 enriched + 294 DLQ (all `position_unavailable`) + 4,023 duplicates. No offset twice. A replay of the same rows from before Flink existed, read from the backlog, gives identical numbers |
+| Flink check, TaskManager killed mid-run (2026-11-04) | 10,000 rows at 1x, `docker kill dvw-flink-taskmanager` 20 s in, `docker start` 25 s later | Job restored checkpoint 75. `make flink-check` OK, same 5,683 / 294 / 4,023 as the clean run. Reading `ais.enriched` for that run: 5,786 records and 103 offsets twice with `read_uncommitted`, 5,683 and none twice with `read_committed` |
+| Flink check, 200,000 rows at 10x (2026-11-04) | `make replay ARGS="--limit 200000"` | 104.9 s. `make flink-check` OK: 117,277 enriched + 1,756 DLQ + 80,967 duplicates. `make reconcile` OK on the raw store too |
+| Memory with everything running (2026-11-04) | `docker stats` every 5 s during the 200,000-row replay, Console on too | Total 1.9 to 2.1 GiB of the 3.9 GiB VM. TaskManager 660 MiB (935 MiB peak after the 3.1 million backlog), ClickHouse 614, JobManager 352, Redpanda 276, tracker 92, the rest under 75 each |
 
 End-to-end latency and full-day throughput are still to be measured.
 
