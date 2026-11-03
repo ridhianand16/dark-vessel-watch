@@ -6,7 +6,7 @@ It is a streaming pipeline that runs on a laptop without a network connection: R
 
 ## Where it stands
 
-A day of Danish AIS traffic replays into Redpanda in event-time order, and every message lands in ClickHouse, including ones that are not valid JSON (they are stored with a reason code instead of being dropped). For each replay run, a per-partition check compares what the broker acknowledged with what is stored and shows that nothing was lost or duplicated. That holds when the sink is killed partway through a run or made to re-read the whole topic.
+A day of Danish AIS traffic replays into Redpanda in event-time order, and every message lands in ClickHouse, including ones that are not valid JSON (they are stored with a reason code instead of being dropped). For each replay run, the reconciliation job compares what the broker acknowledged with what is stored, per partition, and shows that nothing was lost or duplicated. That holds when the sink is killed partway through a run or made to re-read the whole topic.
 
 A Faust worker tracks every ship with a Kalman filter and writes one `ais.tracks` message per accepted fix: filtered position and velocity, and how far the fix landed from the prediction (the innovation). It is at-least-once with outputs stored before state, so a crash can repeat a track message but not lose one ([ADR 0004](docs/adr/0004-tracker-at-least-once-outputs-before-state.md)). Base stations, buoys, SAR aircraft and distress beacons also send AIS. The tracker recognises them by MMSI range (ITU-R M.585) and skips them with a `not_a_ship` count. Their rows stay in the raw store ([ADR 0008](docs/adr/0008-10x-replay-target-and-ship-only-tracking.md)).
 
@@ -27,6 +27,8 @@ The same job tags every record with its zones: EEZ, protected areas, port, and g
 The tracker now reads `ais.enriched` instead of `ais.raw`, with `read_committed`, so it only ever sees output of completed Flink checkpoints ([ADR 0019](docs/adr/0019-tracker-on-enriched-and-dark-gap-zone-condition.md)). DARK_GAP uses the zone tags: a gap counts only if the vessel was last seen within 10 nm of an EEZ boundary or a protected area, and not in port. The same 10,000 rows read through either topic gave identical tracks for 1,278 of 1,279 vessels. The one exception came from the two sides rounding positions differently when spotting repeated reports. That rule now lives in one contract file that the Java and Python tests both check ([Tracker on ais.enriched](#tracker-on-aisenriched)).
 
 Every track is now stored in ClickHouse too, and rolled up per vessel to one row per minute and one per hour as it arrives ([History and retention](#history-and-retention), [ADR 0020](docs/adr/0020-rollups-from-tracks-and-ttl.md)). The rollups only use aggregates that a repeated track cannot change, so a crash, a resend or re-reading the whole topic leaves them exactly as they were. Raw and track rows expire 7 days after they were stored, minute rows after 30 days; hourly rows are kept.
+
+One command now proves a run end to end: `make reconcile-run RUN=<run_id>` waits until every stage has finished the run, checks per partition that each record is stored, enriched, rejected with a reason or counted as a duplicate, and that the rollups agree with the tracks. It stores the verdict in ClickHouse, with the run's latency ([How zero loss is proven](#how-zero-loss-is-proven), [ADR 0021](docs/adr/0021-reconciliation-job.md)).
 
 Not built yet: excluding gaps at the edge of receiver coverage, and MMSI_CLASH.
 
@@ -148,7 +150,7 @@ PostGIS active package -> zone source -> broadcast --------------^
 raw(run, partition) = enriched + dlq + sum(dedup_counts.count)     over the run's ais.raw offset range
 ```
 
-`make flink-check RUN=<run_id>` reads all three topics with `read_committed`. It also fails if any raw offset appears twice across `ais.enriched` and `ais.dlq`, or if any enriched record has no zone tags.
+The reconciliation job (`make reconcile-run RUN=<run_id>`) reads all three topics with `read_committed`. It also fails if any raw offset appears twice across `ais.enriched` and `ais.dlq`, or if any enriched record has no zone tags.
 
 **Zone tagging.** Every record in `ais.enriched` gets `eez_id`, `mpa_ids`, `in_port`, `dist_eez_boundary_m`, `dist_mpa_m` (0 inside a protected area) and `zones_version`. How the zones get there ([ADR 0018](docs/adr/0018-flink-zone-tagging-read-at-startup.md)):
 
@@ -172,13 +174,7 @@ The tracker reads `ais.enriched` (`TRACKER_INPUT_TOPIC`), with `read_committed`,
 - **One contract for both sides.** `contracts/ais_enriched.json` lists every station class (wire value, ship or not, example MMSIs) and the duplicate key's rounding. The Java and Python tests both load it, so changing a wire value fails both. It exists because the two drifted once: the tracker treated only `ship` as a ship, so a 98-prefix craft (a tender or RIB, tagged `craft_with_parent`) got no track. The 701,815-record run above had no 98-prefix MMSI in it, which is why the leak counter stayed 0. The whole AIS day has one such vessel, from 07:36.
 - **Same tracks.** The same 10,000 rows read from `ais.raw` and then from `ais.enriched` gave identical tracks for 1,278 of 1,279 vessels (`make compare-tracks`). The other one sent two reports in the same second 0.2 m apart. Flink's dedup key rounds to 5 decimals and dropped the second; the tracker compared positions exactly and took it. The tracker now rounds the same way (ties up, like Java's `Math.round`), so that vessel no longer differs; I have not rerun the comparison since.
 
-Reconciliation, end to end, each per run and `ais.raw` partition over the run's offset range:
-
-```
-produced            = rows in dvw.ais_raw FINAL                   make reconcile
-raw                 = enriched + dlq + sum(dedup_counts.count)     make flink-check
-enriched (tracker)  = sum of one skip reason or result per record  tracker counters, flink_leaks = 0
-```
+The tracker's own accounting (every record read gets one skip reason or result, `flink_leaks = 0`) is in its logged counters. The reconciliation job does not read those yet; see [How zero loss is proven](#how-zero-loss-is-proven).
 
 **How a new zone package is applied.** Zones reach DARK_GAP only through the Flink job's tags, and the job reads the active package once at start. So:
 
@@ -238,6 +234,60 @@ Retention is measured from `ingested_at`, when a row was stored, not from `event
 
 Views only see rows inserted after they exist. `make backfill-rollups` fills the rollups from tracks already stored, with the views' own SELECT, one run and partition at a time. It is safe to repeat, including while the sink runs.
 
+## How zero loss is proven
+
+Every replay run writes `data/runs/<run_id>/produced.json`: for each of the 6 `ais.raw` partitions, the first and last offset the broker acknowledged and how many messages that was. That file is the ground truth. Everything else is counted against it, per partition, over exactly that offset range, so another run's records cannot hide a gap in this one. A total would also hide one partition losing what another gained.
+
+`make reconcile-run RUN=<run_id>` does it in three steps.
+
+1. **Wait for the run to finish.** The job first waits until the replayer marks the run `complete`, and refuses one that was interrupted or failed. Then it waits until each consumer group on the path has committed past the run's last record: the raw sink and Flink on `ais.raw`, the tracker on `ais.enriched`, and the tracks, vessels and alerts sinks after it. It waits for the run's last *record*, not the end of the topic. Flink's transaction markers sit at the end of `ais.enriched`, and the tracker cannot commit past them until new data arrives.
+2. **Check that it adds up**, per partition:
+
+   | Check | Proves |
+   |---|---|
+   | `raw_stored` | produced = rows in `dvw.ais_raw FINAL`, none from another run |
+   | `flink_balance` | raw = enriched + DLQ + counted duplicates, and no raw offset written twice |
+   | `zone_tagged` | no enriched record left without zone tags |
+   | `rollup` | `sum(n_fixes)` in the 1-minute rollup = tracks in `dvw.tracks FINAL` |
+   | `dlq_share` | warns when more than 5% went to the DLQ, with the count per reason |
+
+   Plus one run-wide `latency` row: p50/p95/p99 from replayer send to the fix stored in `dvw.tracks` (warns above 5 s). With `BASELINE=<run_id>` of the same rows, `tracks_match` also compares every vessel's tracks with that run's.
+3. **Keep the verdict.** One row per run, partition and check goes into `dvw.reconciliation`, with the counts and DLQ reasons. Running it again replaces the verdict instead of adding to it. The exit code is 1 if any check fails.
+
+This is a real run: 10,000 rows with three broken lines added on purpose (an MMSI that is not a number, a latitude of `garbage`, a position at 0,0). All three land in the DLQ under their own reason, and everything still balances. Check rows that are the same on every partition are cut to one:
+
+```
+$ make reconcile-run RUN=20261103T234818Z-b4cfbc
+run 20261103T234818Z-b4cfbc
+partition  produced    stored  enriched    dlq    dups untagged   tracks   rollup
+---------------------------------------------------------------------------------
+        0      1665      1665       938     49     678        0      867      867
+        1      1839      1839      1032     40     767        0      988      988
+        2      1736      1736      1037     30     669        0      998      998
+        3      1429      1429       861     32     536        0      822      822
+        4      1800      1800       996     57     747        0      903      903
+        5      1531      1531       818     89     624        0      774      774
+---------------------------------------------------------------------------------
+    total     10000     10000      5682    297    4021        0     5352     5352
+dlq reasons: position_unavailable 294, bad_mmsi 1, no_position 1, null_island 1
+
+check          partition  expected    actual  status note
+---------------------------------------------------------
+raw_stored             4      1800      1800  OK
+flink_balance          4      1800      1800  OK
+zone_tagged            4       996       996  OK
+rollup                 4       903       903  OK
+dlq_share              4      1800        57  OK     3.2% in dlq (position_unavailable 54, bad_mmsi 1, no_position 1, null_island 1)
+dlq_share              5      1531        89  WARN   5.8% in dlq (position_unavailable 89), above 5%
+latency              run      5352      5352  WARN   replay send to track stored: p50 3965 ms, p95 5782 ms, p99 6078 ms, max 6185 ms; p99 above 5000 ms
+reconcile: wrote 31 rows to dvw.reconciliation
+reconcile: OK, 10000 produced, every check balances on all 6 partitions (2 warnings)
+```
+
+The two warnings are real. Partition 5 carries more `lat 91` "not available" reports than the others. The latency is the open p99 issue in [Known issues](#known-issues). To check that the job really catches a loss, I deleted one row of this run from `dvw.ais_raw`. It then failed with `raw_stored 2 ... missing 1` and exit code 1.
+
+What it does not cover yet: the tracker's skip reasons are logged, not stored per run, so the job checks what the tracker wrote but not what it skipped.
+
 ## Quickstart
 
 Needs Docker with Compose v2, about 8 GB of free RAM, GNU make, and Python 3.12 with [uv](https://docs.astral.sh/uv/). The AIS data is not in the repository: `make fetch` downloads it and checks its SHA-256.
@@ -249,7 +299,7 @@ make ps        # every service healthy, raw-sink running
 make fetch     # download and verify the pinned AIS day (once, about 3 GB)
 
 make replay ARGS="--limit 10000"                # 10x by default; prints the run_id
-make reconcile RUN=<run_id>                     # per-partition produced vs stored
+make reconcile-run RUN=<run_id>                 # waits for the pipeline, then proves zero loss per partition
 make backfill-rollups                           # once, if dvw.tracks had rows before the rollups existed
 make ttl-demo                                   # the ingested_at TTL deleting rows, on a scratch table
 ```
@@ -259,11 +309,10 @@ The tracker reads `ais.enriched`, so `make up` also starts the Flink job that wr
 ```sh
 make flink-up                                   # after building a zone package; UI on http://localhost:8081
 make replay ARGS="--limit 10000"
-make flink-check RUN=<run_id>                   # per partition: raw = enriched + dlq + dups, no offset twice, all tagged
 make zone-check RUN=<run_id>                    # a sample of zone tags recomputed in PostGIS
 
 docker kill dvw-flink-taskmanager               # mid-replay; then bring it back:
-docker start dvw-flink-taskmanager              # the job restores the last checkpoint; flink-check still OK
+docker start dvw-flink-taskmanager              # the job restores the last checkpoint; reconcile-run still OK
 
 make flink-savepoint                            # stop the job with a savepoint (sinks commit everything)
 make flink-restart                              # rebuild, stop with a savepoint if running, start from the newest one
@@ -280,6 +329,7 @@ make replay ARGS="--limit 700000 --inject ingest/replayer/anomalies.yaml"
 make score RUN=<run_id> WAIT=600                # TP/FP/FN per alert type, and the zone of each DARK_GAP
 make latency RUN=<run_id>                       # replayer send to track sent, and to TELEPORT stored
 make compare-tracks A=<run_id> B=<run_id>       # two runs of the same rows, vessel by vessel
+make reconcile-run RUN=<run_id> BASELINE=<run_id>  # the same comparison, stored with the run's verdict
 ```
 
 Reference data for the zones:
@@ -325,6 +375,8 @@ _To be written. Each decision has an ADR in [docs/adr/](docs/adr/)._
 
 Measured on 2026-11-02 on an Apple M1 laptop (8 GB RAM, macOS 26.5), Docker VM with 8 CPUs and 3.9 GB, using the 2026-10-28 DMA day.
 
+Rows from before the reconciliation job name `make reconcile` and `make flink-check`. The job replaced both, and runs the same checks as `raw_stored` and `flink_balance`.
+
 | What | Command | Result |
 |---|---|---|
 | Replay 10,000 rows at 100x | `make replay ARGS="--limit 10000 --speed 100"` | 3.1 s, 10,000 acknowledged |
@@ -368,13 +420,17 @@ Measured on 2026-11-02 on an Apple M1 laptop (8 GB RAM, macOS 26.5), Docker VM w
 | Tracks and rollups, 900,000 rows at 100x (2026-11-04) | `make replay SPEED=100 ARGS="--limit 900000"` | 52 s to replay, 502,264 tracks up to 01:14:59 event time. `count()` with `FINAL` = `sum(n_fixes)` at both resolutions = 502,264 |
 | Rollup backfill (2026-11-04) | `make backfill-rollups` | 26 runs, 2.8 million tracks. Largest chunk 37 MiB. Run twice on the same run: numbers unchanged |
 | Memory during the 900,000-row replay (2026-11-04) | `docker stats` every 5 s | Peak 2.65 GiB in total of the 3.9 GiB VM. ClickHouse 988 MiB of 1.25 GiB, TaskManager 925, Redpanda 337, JobManager 278, raw sink 198, tracker 151, tracks and alerts sink 123 of 320, the rest under 90 each |
+| Reconciliation job, 10,000 rows at 10x (2026-11-04) | `make replay ARGS="--limit 10000"`, `make reconcile-run RUN=...` | OK on all 6 partitions in 33 s, most of it waiting for the tracker: 10,000 stored, 5,683 enriched + 294 DLQ + 4,023 duplicates, 5,353 tracks = 5,353 rollup fixes. 31 rows in `dvw.reconciliation`; a rerun still reads 31 with `FINAL` |
+| Reconciliation started during a replay (2026-11-04) | `make replay SPEED=2 ARGS="--limit 10000"`, `make reconcile-run` 22 s in, `BASELINE=` the run above | Waited for the replay to complete, then about 50 s for the tracker. OK, same numbers, and 1,279 of 1,279 vessels' tracks match the baseline. Send to track stored p99 4,972 ms |
+| Reconciliation, TaskManager and raw sink killed mid-run (2026-11-04) | 10,000 rows at 1x, `docker kill dvw-flink-taskmanager dvw-raw-sink` 15 s in, `docker start` both 20 s later | Job restored checkpoint 891. OK on all 6 partitions, same counts as the clean run. The latency row warns (p99 52 s, the outage) |
+| Reconciliation with three broken lines (2026-11-04) | a 10,000-row CSV with a bad MMSI, a `garbage` latitude and a 0,0 position, `make replay AIS_CSV=...` | All three in the DLQ as `bad_mmsi`, `no_position`, `null_island`; every check OK. One row then deleted from `dvw.ais_raw`: `raw_stored` FAIL, missing 1, exit 1 |
 
 The 5 s p99 target holds in steady state but not over the whole 700k run. In the first spike Flink itself wrote records up to 6.3 s after they were sent; in the second Flink wrote on time and the delay came after, at the checkpoint commit or in the tracker. The cause of either is not known yet; checkpoint and GC metrics (observability) are the next step. Full-day throughput is still to be measured.
 
 ## Known issues
 
-- **p99 latency over 5 s on long runs**, see [Numbers](#numbers).
-- **Tracker offset commits lagged once after a run.** After the 700k run the tracker had processed every record, but its committed offsets on two `ais.enriched` partitions stayed about 1,000 behind for several minutes, stuck at a gap left by Flink's transaction markers, then caught up. A 10,000-row run afterwards committed to the end within 30 s on every partition, so it is not systematic. Nothing is lost (a restart re-reads those records and the bookmark skips them), but `make score` can report INCOMPLETE meanwhile. Suspected: Faust's offset-gap handling under `read_committed`.
+- **p99 latency over 5 s on long runs**, see [Numbers](#numbers). On 2026-11-04 even 10,000-row runs at 10x came out at p99 5.7 s to track sent (6.1 to 6.9 s to stored), against 3.5 s measured earlier the same day, so it varies with the state of the stack. The reconciliation job now stores these percentiles for every run.
+- **Tracker offset commits lagged once after a run.** After the 700k run the tracker had processed every record, but its committed offsets on two `ais.enriched` partitions stayed about 1,000 behind for several minutes, stuck at a gap left by Flink's transaction markers, then caught up. A 10,000-row run afterwards committed to the end within 30 s on every partition, so it is not systematic. Nothing is lost (a restart re-reads those records and the bookmark skips them), but `make score` can report INCOMPLETE and `make reconcile-run` keeps waiting meanwhile (up to `TIMEOUT`, 600 s by default). Suspected: Faust's offset-gap handling under `read_committed`.
 - **ClickHouse has little memory headroom.** It idles at 450 to 800 MiB of its 1.13 GiB limit and peaked at 988 MiB in the 900k run. An insert into `dvw.tracks` occasionally fails with `MEMORY_LIMIT_EXCEEDED` while a rollup merge runs; the sink's retry has always succeeded so far, and fail-stop would restart it otherwise. Reading a rollup view without a `run_id`/`mmsi` filter can exceed the limit. Trimming ClickHouse's system log tables and caches, or a larger limit, is the next step.
 - DARK_GAP does not yet exclude the edge of receiver coverage. MMSI_CLASH is not built.
 

@@ -109,12 +109,15 @@ def test_cli_stamps_messages_with_the_runs_dir_run_id(
 
     path = write_csv(tmp_path, ROW, ROW.replace("219026147", "211000001"))
     sent: list[bytes] = []
+    statuses: list[str] = []  # produced.json status seen while producing
 
     class FakeProducer:
         def __init__(self) -> None:
             self.pending: list[tuple[int, Any]] = []
 
         def produce(self, topic: str, value: bytes, key: bytes, on_delivery: Any) -> None:
+            (run_dir,) = runs.iterdir()
+            statuses.append(json.loads((run_dir / "produced.json").read_text())["status"])
             sent.append(value)
             self.pending.append((len(sent) - 1, on_delivery))
 
@@ -146,3 +149,5 @@ def test_cli_stamps_messages_with_the_runs_dir_run_id(
     assert produced["run_id"] == run_dir.name
     assert produced["partitions"] == {"0": {"first_offset": 0, "last_offset": 1, "count": 2}}
     assert [json.loads(v)["run_id"] for v in sent] == [run_dir.name, run_dir.name]
+    assert statuses == ["running", "running"]
+    assert produced["status"] == "complete"

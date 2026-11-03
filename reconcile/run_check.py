@@ -1,6 +1,7 @@
 """Check that every message of one replay run is stored in dvw.ais_raw.
 
-    uv run python -m reconcile.run_check <run_id> [--wait 30]   # or: make reconcile RUN=<run_id>
+Used by the reconciliation job (reconcile/job.py, make reconcile-run RUN=<run_id>) as
+its raw_stored check, and by the other reconcile tools to read produced.json.
 
 Reads data/runs/<run_id>/produced.json (offsets the broker acknowledged, per partition)
 and refuses unless its status is "complete". For each partition it counts rows in
@@ -8,24 +9,16 @@ dvw.ais_raw FINAL with kafka_offset in [first_offset, last_offset] and compares 
 with the produced count, and checks every row in the range carries this run_id.
 FINAL is required: without it, a batch the sink re-inserted after a crash is counted
 twice until a background merge collapses it.
-
-Exit codes: 0 every partition matches, 1 a mismatch, 2 the run cannot be checked.
 """
 
 from __future__ import annotations
 
-import argparse
 import json
-import sys
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from clickhouse_connect.driver.client import Client
-
-from common.clickhouse import client_from_env
-from common.env import REPO_ROOT
 
 TABLE = "dvw.ais_raw"
 
@@ -112,53 +105,3 @@ def query_stored(client: Client, run_id: str, produced: list[Produced]) -> dict[
     plain = client.query(f"SELECT kafka_partition, count() FROM {TABLE} WHERE {ranges} GROUP BY kafka_partition")
     unmerged: dict[int, int] = {int(p): int(n) for p, n in plain.result_rows}
     return {int(p): Stored(int(n), int(f), unmerged.get(int(p), 0)) for p, n, f in final}
-
-
-def render(run_id: str, results: list[Result]) -> str:
-    head = f"{'partition':>9} {'first':>9} {'last':>9} {'produced':>9} {'stored':>9} {'no FINAL':>9} {'foreign':>8}  status"
-    lines = [f"run {run_id}", head, "-" * len(head)]
-    for r in results:
-        p, s = r.produced, r.stored
-        lines.append(
-            f"{p.partition:>9} {p.first_offset:>9} {p.last_offset:>9} {p.count:>9} {s.rows:>9} "
-            f"{s.unmerged:>9} {s.foreign:>8}  {'OK' if r.ok else 'MISMATCH: ' + r.note}"
-        )
-    total_p = sum(r.produced.count for r in results)
-    total_s = sum(r.stored.rows for r in results)
-    total_u = sum(r.stored.unmerged for r in results)
-    lines.append("-" * len(head))
-    lines.append(f"{'total':>9} {'':>9} {'':>9} {total_p:>9} {total_s:>9} {total_u:>9}")
-    return "\n".join(lines)
-
-
-def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(prog="run_check", description=__doc__.splitlines()[0])
-    ap.add_argument("run_id")
-    ap.add_argument("--runs-dir", type=Path, default=REPO_ROOT / "data" / "runs")
-    ap.add_argument("--wait", type=float, default=0.0,
-                    help="seconds to keep re-checking while rows are only missing (sink catching up)")
-    args = ap.parse_args(argv)
-
-    try:
-        produced = load_produced(args.runs_dir / args.run_id / "produced.json", args.run_id)
-    except RunError as e:
-        print(f"reconcile: {e}", file=sys.stderr)
-        return 2
-    client = client_from_env()
-    deadline = time.monotonic() + args.wait
-    while True:
-        results = compare(produced, query_stored(client, args.run_id, produced))
-        catching_up = any(r.missing for r in results) and not any(r.stored.foreign for r in results)
-        if all(r.ok for r in results) or not catching_up or time.monotonic() >= deadline:
-            break
-        time.sleep(1.0)
-    print(render(args.run_id, results))
-    if all(r.ok for r in results):
-        print(f"reconcile: OK, {sum(r.produced.count for r in results)} produced = stored")
-        return 0
-    print("reconcile: MISMATCH", file=sys.stderr)
-    return 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())
