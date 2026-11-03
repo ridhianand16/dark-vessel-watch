@@ -77,7 +77,13 @@ How a package is made and loaded:
 
 1. **Build** (`make refdata-build`). The build re-checks the SHA-256 of every source in `refdata/sources.yaml`. `ogr2ogr` then cuts each layer to `refdata/area.yaml`, in a container with no network. Port circles are computed on the WGS84 ellipsoid, and each vertex is within 0.5 m of 2 nm as PostGIS geography measures it. The output is one GeoPackage per layer and a `manifest.json` with every input and file hash, signed with minisign. The package version is a hash of the inputs, and two builds from the same inputs are byte-identical.
 2. **Verify** (`make refdata-verify`). The signature over the manifest is checked against the committed `refdata/keys/dvw.pub`, then every file's hash. Changing one byte in any file fails this step.
-3. **Load** (`make refdata-load`). The loader verifies again, then fills a staging schema, checks row counts and geometry validity there, and swaps the tables into place. All of that is one transaction, and each load adds a row to `refdata_packages`. Loading the same package twice gives identical zones and two registry rows.
+3. **Load** (`make refdata-load`). The loader verifies again, then fills a staging schema, checks row counts and geometry validity there, writes the metric copies described below, and swaps all the tables into place. All of that is one transaction. Each load adds a row to `refdata_packages` and marks it as the one active package. Loading the same package twice gives identical zones and two registry rows.
+
+The Flink enrichment job will keep the zones in memory and measure with JTS, which is planar. So the loader also writes `zones_25832` and `eez_boundaries_25832`: the same rows in EPSG:25832 (UTM zone 32N, the Danish metric grid), already repaired, checked and GiST-indexed ([ADR 0013](docs/adr/0013-metric-zone-copy-and-active-package.md)). Before reprojecting, it adds vertices to long segments: geodesic for boundary lines, so a metric distance matches a geography distance, and straight in degrees for polygons, so containment matches `zones`. Without that, a 50 km boundary segment becomes a different line in UTM and a Kattegat distance was 6 m off. With it, the remaining error is the projection's scale. That is 0.7 m on 9 km in the Kattegat, but 0.16% around Bornholm and about 0.3% at the eastern edge of the area, where a 10 nm threshold ends up about 55 m short.
+
+```sql
+SELECT package_version FROM refdata_packages WHERE active;   -- the live package
+```
 
 To find the nearest boundary in metres, order by geography distance. `ORDER BY geom <-> point` on geometry ranks in degrees, and at 57 N it puts a 37.6 km line ahead of a 30.2 km one:
 
@@ -174,9 +180,10 @@ Measured on 2026-11-02 on an Apple M1 laptop (8 GB RAM, macOS 26.5), Docker VM w
 | Replay 700,000 rows + 1,665 synthetic at 50x | `make replay ARGS="--limit 700000 --speed 50 --inject ..."` | 74 to 77 s, 701,665 acknowledged. About 4 s of that is the up-front span check |
 | Injected anomalies, tracker killed mid-run | `docker kill dvw-tracker` after the 3rd injected alert, `make tracker` | 6 of 6 alerts, no extras, same 28 alerts as the clean runs. 3,823 records skipped as `redelivered` on restart. `make reconcile` OK |
 | Alerts topic vs table | 3 runs, then 6 alerts resent byte-identical to simulate a tracker resend | 90 messages on `ais.alerts`, 90 rows without `FINAL`, 84 with `FINAL` = 84 distinct `alert_id` |
-
 | Zone package build, from the pinned sources (2026-11-03) | `make refdata-build` | 14 s. Peak memory of the largest cut (WDPA) 691 MiB including page cache, limit 1 GB. A second build from scratch gave byte-identical files |
 | Zone package load into PostGIS under Rosetta (2026-11-03) | `make refdata-load`, three runs | 6.8 to 10.9 s each: verify 0.1 s, staging load and checks 6.3 to 9.7 s, swap 36 to 61 ms. 2,353 zones and 103 boundary lines |
+| Zone package load with the EPSG:25832 copies (2026-11-03) | `make refdata`, twice | staging load and checks 13.1 to 13.8 s, swap 40 to 59 ms. `zones` and `zones_25832` 2,353 rows each, the boundary tables 103 each. `zones_25832` has 3,026,879 vertices (3,019,186 in `zones`) and takes 49 MB with indexes |
+| Metric copy vs geography, nearest EEZ boundary (2026-11-03) | `ST_Distance` in 25832 vs `::geography` in 4326 | Kattegat (57.0 N, 11.6 E) 9,045.9 m vs 9,046.6 m. Bornholm area (55.3 N, 15.5 E) 19,355.2 m vs 19,324.5 m, which is UTM 32N's scale error that far east |
 | Whole zone pipeline offline (2026-11-03) | `UV_OFFLINE=1 make refdata`, package deleted first | 19.8 s for build, verify and load |
 | `vessels_current`, one 10,000-row replay into an empty table (2026-11-03) | `TRUNCATE vessels_current`, group seeked to the end, `make replay ARGS="--limit 10000"` | 5,354 track messages, 1,279 rows = 1,279 distinct MMSIs in the run's tracks. Upserts of 1,000 to 3,300 tracks take 38 to 139 ms |
 | `vessels_current`, same run reprocessed (2026-11-03) | `rpk group seek dvw-vessels-sink --to-file` the run's start offsets | 5,354 messages, `written=0 stale=1279`. `md5` of the whole table, `updated_at` included, identical before and after |
