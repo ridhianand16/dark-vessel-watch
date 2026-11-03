@@ -18,7 +18,9 @@ The zones DARK_GAP needs come from three reference datasets: Marine Regions EEZ 
 
 `make refdata` turns those files into a signed zone package and loads it into PostGIS, offline ([Zones](#zones)). A package that fails its signature, a file hash or a staging check is refused as a whole, and the live zones stay as they were ([ADR 0010](docs/adr/0010-zone-package-staging-swap-and-port-radius.md), [ADR 0011](docs/adr/0011-signed-zone-package-built-from-pinned-sources.md)).
 
-Not built yet: the DARK_GAP zone check itself (the zones are in PostGIS, but the tracker does not read them yet, so the check still passes everywhere), `vessels_current`, MMSI_CLASH and Flink enrichment.
+A third sink keeps `vessels_current` in PostGIS: one row per vessel with its latest filtered position, upserted from `ais.tracks`. A row only moves forward in event time, so replays, redeliveries and a reset consumer group cannot move a vessel back or rewrite its row ([Current positions](#current-positions), [ADR 0012](docs/adr/0012-vessels-current-upsert-forward-in-event-time.md)).
+
+Not built yet: the DARK_GAP zone check itself (the zones are in PostGIS, but the tracker does not read them yet, so the check still passes everywhere), MMSI_CLASH and Flink enrichment.
 
 ## Detections
 
@@ -85,13 +87,25 @@ FROM eez_boundaries, ST_SetSRID(ST_Point(11.3, 56.9), 4326) AS p   -- mid-Katteg
 ORDER BY 2 LIMIT 1;                                                -- line 1120, 30,241 m
 ```
 
+## Current positions
+
+`vessels_current` holds one row per MMSI: the Kalman-filtered position (`geometry(Point, 4326)`, GiST-indexed), speed and course of the latest accepted fix, its `event_ts`, the `run_id` of the track message it came from, and `updated_at`, the wall time of the write. It is what the map and the DARK_GAP zone check will query.
+
+The vessels sink reads `ais.tracks`, reduces each batch to the latest fix per MMSI, and upserts that in one statement and one transaction. It commits the Kafka offsets only after the transaction has committed. The upsert replaces a row only when the new `event_ts` is strictly later:
+
+```sql
+ON CONFLICT (mmsi) DO UPDATE SET ... WHERE excluded.event_ts > vessels_current.event_ts
+```
+
+That one condition is why replays cannot corrupt the table. A redelivered batch, a reset consumer group or a second replay of the same day carries fixes that are not later than what is stored, so they write nothing. That includes `updated_at`. An older run read after a newer one cannot move a vessel back. On a tie the first fix received wins, inside a batch and across batches, so the result does not depend on batch boundaries. The catch is that `run_id` names the run whose fix is stored, not the most recent run. To start over, truncate the table and reset the `dvw-vessels-sink` group.
+
 ## Quickstart
 
 Needs Docker with Compose v2, about 8 GB of free RAM, GNU make, and Python 3.12 with [uv](https://docs.astral.sh/uv/). The AIS data is not in the repository: `make fetch` downloads it and checks its SHA-256.
 
 ```sh
 cp .env.example .env
-make up        # git hooks, stack, topics, ClickHouse migrations, raw sink, tracker
+make up        # git hooks, stack, topics, migrations, the three sinks, tracker
 make ps        # every service healthy, raw-sink running
 make fetch     # download and verify the pinned AIS day (once, about 3 GB)
 
@@ -118,11 +132,11 @@ make area            # only if the AIS day changes: recompute refdata/area.yaml 
 
 EEZ (Marine Regions form), WDPA (Protected Planet terms page) and WPI (NASA Harvest mirror of the NGA release) have to be downloaded by hand into `data/refdata/incoming/<source>/<version>/`, under the file names in `refdata/sources.yaml`. `make fetch-refdata` prints the page and the exact path for each missing file, and fails on any file whose SHA-256 does not match `refdata/sources.yaml`.
 
-Redpanda Console is at http://localhost:8080. `make sink-logs` and `make alerts-sink-logs` follow the two sinks (one line per batch). `make tracker-logs` follows the tracker, which logs its counters every 30 s (`tracks=... read=... not_a_ship=... duplicate=...`). Every record read gets exactly one skip reason or result, so those counters add up to `read`. `make down` stops the stack and keeps the data. `make nuke` stops it and deletes all data volumes, including ClickHouse.
+Redpanda Console is at http://localhost:8080. `make sink-logs`, `make alerts-sink-logs` and `make vessels-sink-logs` follow the three sinks (one line per batch; the vessels sink also logs how many rows each batch `written` and how many were `stale`). `make tracker-logs` follows the tracker, which logs its counters every 30 s (`tracks=... read=... not_a_ship=... duplicate=...`). Every record read gets exactly one skip reason or result, so those counters add up to `read`. `make down` stops the stack and keeps the data. `make nuke` stops it and deletes all data volumes, including ClickHouse.
 
 Other targets: `make migrate` and `make migrate-postgis` apply new files in `sql/clickhouse/` and `sql/postgis/` and do nothing when up to date (`make up` runs both). `make test` and `make typecheck` run pytest and `mypy --strict`.
 
-If a sink or the tracker crashes, Docker restarts it and it re-reads from its last committed offset. `docker stop` and `docker kill` count as deliberate stops and leave it down; `make sink`, `make alerts-sink` or `make tracker` starts it again.
+If a sink or the tracker crashes, Docker restarts it and it re-reads from its last committed offset. `docker stop` and `docker kill` count as deliberate stops and leave it down; `make sink`, `make alerts-sink`, `make vessels-sink` or `make tracker` starts it again.
 
 ## Going faster
 
@@ -164,6 +178,10 @@ Measured on 2026-11-02 on an Apple M1 laptop (8 GB RAM, macOS 26.5), Docker VM w
 | Zone package build, from the pinned sources (2026-11-03) | `make refdata-build` | 14 s. Peak memory of the largest cut (WDPA) 691 MiB including page cache, limit 1 GB. A second build from scratch gave byte-identical files |
 | Zone package load into PostGIS under Rosetta (2026-11-03) | `make refdata-load`, three runs | 6.8 to 10.9 s each: verify 0.1 s, staging load and checks 6.3 to 9.7 s, swap 36 to 61 ms. 2,353 zones and 103 boundary lines |
 | Whole zone pipeline offline (2026-11-03) | `UV_OFFLINE=1 make refdata`, package deleted first | 19.8 s for build, verify and load |
+| `vessels_current`, one 10,000-row replay into an empty table (2026-11-03) | `TRUNCATE vessels_current`, group seeked to the end, `make replay ARGS="--limit 10000"` | 5,354 track messages, 1,279 rows = 1,279 distinct MMSIs in the run's tracks. Upserts of 1,000 to 3,300 tracks take 38 to 139 ms |
+| `vessels_current`, same run reprocessed (2026-11-03) | `rpk group seek dvw-vessels-sink --to-file` the run's start offsets | 5,354 messages, `written=0 stale=1279`. `md5` of the whole table, `updated_at` included, identical before and after |
+| `vessels_current`, a fix 1 h older than the stored one (2026-11-03) | one hand-made message on `ais.tracks` for MMSI 211772470 | `written=0 stale=1`, row unchanged |
+| Vessels sink, re-reading the `ais.tracks` backlog (2026-11-03) | first start, about 1.95 million track messages from earlier runs | about 55,000 messages/s, 25 to 33 ms per 10,000-message upsert. 72 MiB of its 192 MiB limit |
 
 End-to-end latency and full-day throughput are still to be measured.
 

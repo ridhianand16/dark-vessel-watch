@@ -1,4 +1,5 @@
-# ClickHouse sink image, shared by raw-sink and alerts-sink (the argument picks the sink). Build context: repo root (see .dockerignore, an allow-list).
+# Sink image, shared by raw-sink, alerts-sink (the argument picks the ClickHouse sink) and
+# vessels-sink (Compose overrides the entrypoint to python -m sinks.postgis_vessels). Build context: repo root (see .dockerignore, an allow-list).
 # Dependencies come from uv.lock at build time; nothing is downloaded at runtime.
 FROM python:3.12.16-slim-bookworm
 

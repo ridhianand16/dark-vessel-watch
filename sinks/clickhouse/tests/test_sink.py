@@ -11,7 +11,8 @@ import pytest
 from clickhouse_connect.driver.client import Client
 from confluent_kafka import Consumer, TopicPartition
 
-from sinks.clickhouse.sink import ClickHouseSink, InsertFailed, Settings, SinkSpec
+from common.kafka_batch import BatchSettings, WriteFailed
+from sinks.clickhouse.sink import ClickHouseSink, SinkSpec
 from sinks.clickhouse.specs import SPECS
 
 
@@ -80,7 +81,7 @@ def make(
 ) -> tuple[ClickHouseSink, FakeConsumer, FakeClient]:
     consumer, client = FakeConsumer(batches), FakeClient(failures)
     client.consumer = consumer
-    s = Settings(max_rows=10, max_wait_s=0.01, insert_attempts=attempts, backoff_base_s=0.0)
+    s = BatchSettings(max_rows=10, max_wait_s=0.01, write_attempts=attempts, backoff_base_s=0.0)
     spec = replace(SPECS[name], settings=s)
     sink = ClickHouseSink(spec, cast(Consumer, consumer), cast(Client, client))
     consumer.on_drained = lambda: setattr(sink, "stopping", True)
@@ -106,7 +107,7 @@ def test_retries_then_commits_once() -> None:
 def test_never_commits_when_inserts_keep_failing() -> None:
     sink, consumer, _ = make([[FakeMessage(1, 0)]], failures=99)
     sink._collect()
-    with pytest.raises(InsertFailed):
+    with pytest.raises(WriteFailed):
         sink.flush()
     assert consumer.commits == []
     assert len(sink.batch.rows) == 1  # left in place; the process exits and re-reads
