@@ -18,11 +18,11 @@ as-is. Validation belongs to the Flink job.
 
 from __future__ import annotations
 
-import json
-import math
 import re
 from collections.abc import Callable
 from typing import Any
+
+from sinks.clickhouse.convert import BadValue, decode_object, to_float, to_str, ts_ms, u8, u16, u32
 
 SCHEMA_VERSION = 1
 
@@ -53,65 +53,25 @@ COLUMNS: tuple[str, ...] = (
 )
 _INDEX = {c: i for i, c in enumerate(COLUMNS)}
 
-# Epoch-ms timestamps outside 2000..2100 are treated as bad values. DateTime64 would
-# accept a wider range, but the table is partitioned by day, and one insert may touch
-# at most 100 partitions (max_partitions_per_insert_block). Junk dates spread across
-# decades could make a whole batch fail to insert, every time it is retried.
-TS_MIN_MS = 946_684_800_000  # 2000-01-01
-TS_MAX_MS = 4_102_444_800_000  # 2100-01-01
-
 _RUN_ID_RE = re.compile(r'"run_id"\s*:\s*"([A-Za-z0-9_.:-]{1,64})"')
-
-
-class BadValue(ValueError):
-    pass
-
-
-def _int_in(lo: int, hi: int) -> Callable[[Any], int | None]:
-    def conv(v: Any) -> int | None:
-        if v is None:
-            return None
-        if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
-            raise BadValue
-        return v
-
-    return conv
-
-
-def _float(v: Any) -> float | None:
-    if v is None:
-        return None
-    if isinstance(v, bool) or not isinstance(v, int | float) or not math.isfinite(v):
-        raise BadValue
-    return float(v)
-
-
-def _str(v: Any) -> str | None:
-    if v is None or isinstance(v, str):
-        return v
-    raise BadValue
-
-
-_ts = _int_in(TS_MIN_MS, TS_MAX_MS - 1)
-_u8, _u16, _u32 = _int_in(0, 2**8 - 1), _int_in(0, 2**16 - 1), _int_in(0, 2**32 - 1)
 
 # Payload field -> converter. Insertion order is the order fields are checked in.
 TYPED_FIELDS: dict[str, Callable[[Any], object]] = {
-    "event_ts": _ts,
-    "replay_send_ts": _ts,
-    "mmsi": _u32,
-    "lat": _float,
-    "lon": _float,
-    "sog": _float,
-    "cog": _float,
-    "heading": _u16,
-    "nav_status": _str,
-    "ship_type": _str,
-    "name": _str,
-    "imo": _u32,
-    "callsign": _str,
-    "length": _u16,
-    "width": _u8,
+    "event_ts": ts_ms,
+    "replay_send_ts": ts_ms,
+    "mmsi": u32,
+    "lat": to_float,
+    "lon": to_float,
+    "sog": to_float,
+    "cog": to_float,
+    "heading": u16,
+    "nav_status": to_str,
+    "ship_type": to_str,
+    "name": to_str,
+    "imo": u32,
+    "callsign": to_str,
+    "length": u16,
+    "width": u8,
 }
 # Envelope fields: not nullable in the table, '' when missing or wrong.
 TEXT_FIELDS = ("run_id", "raw", "trace_id")
@@ -132,22 +92,12 @@ def to_row(value: bytes | None, partition: int, offset: int, kafka_ts_ms: int) -
 
 def _fill(row: list[object], value: bytes | None) -> str:
     """Fill decoded fields into row; return the decode_error code ('' if none)."""
-    if not value:
-        return "empty"
-    try:
-        text = value.decode("utf-8")
-    except UnicodeDecodeError:
-        _salvage_run_id(row, value.decode("utf-8", errors="replace"))
-        return "not_utf8"
-    try:
-        obj = json.loads(text)
-    except (ValueError, RecursionError):  # RecursionError: deeply nested input
-        _salvage_run_id(row, text)
-        return "not_json"
-    if not isinstance(obj, dict):
-        return "not_object"
+    obj, error, text = decode_object(value)
+    if obj is None:
+        if error in ("not_utf8", "not_json"):
+            _salvage_run_id(row, text)
+        return error
 
-    error = ""
     for f in TEXT_FIELDS:
         v = obj.get(f)
         if isinstance(v, str):

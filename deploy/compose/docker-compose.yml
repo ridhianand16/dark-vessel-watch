@@ -140,15 +140,16 @@ services:
       retries: 30
       start_period: 20s
 
-  # ais.raw -> dvw.ais_raw (sinks/clickhouse_raw, docs/adr/0003). Commits offsets only
+  # ais.raw -> dvw.ais_raw (sinks/clickhouse, docs/adr/0003). Commits offsets only
   # after the insert succeeds; redeliveries collapse on (kafka_partition, kafka_offset).
   # Needs the table: run `make migrate` first (`make up` does).
   raw-sink:
     build:
       context: ../..
-      dockerfile: sinks/clickhouse_raw/Dockerfile
-    image: dvw-raw-sink:0.1.0
+      dockerfile: sinks/clickhouse/Dockerfile
+    image: dvw-clickhouse-sink:0.2.0
     container_name: dvw-raw-sink
+    command: ["raw"]
     depends_on:
       init-topics:
         condition: service_completed_successfully

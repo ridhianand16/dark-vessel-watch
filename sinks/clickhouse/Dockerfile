@@ -1,4 +1,4 @@
-# raw-sink image. Build context: repo root (see .dockerignore, an allow-list).
+# ClickHouse sink image, shared by raw-sink and alerts-sink (the argument picks the sink). Build context: repo root (see .dockerignore, an allow-list).
 # Dependencies come from uv.lock at build time; nothing is downloaded at runtime.
 FROM python:3.12.16-slim-bookworm
 
@@ -19,4 +19,5 @@ COPY common/ common/
 COPY sinks/ sinks/
 
 USER nobody
-CMD ["python", "-m", "sinks.clickhouse_raw"]
+ENTRYPOINT ["python", "-m", "sinks.clickhouse"]
+CMD ["raw"]

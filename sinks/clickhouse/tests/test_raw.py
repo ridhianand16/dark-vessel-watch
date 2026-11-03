@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from sinks.clickhouse_raw.mapping import COLUMNS, to_row
+from sinks.clickhouse.raw import COLUMNS, to_row
 
 KAFKA_TS = 1_761_609_601_500
 
