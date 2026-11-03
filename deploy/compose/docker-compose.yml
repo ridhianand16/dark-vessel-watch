@@ -308,7 +308,10 @@ services:
 
   # Submits the enrichment job (or reports it is already running), then exits. Also runs
   # stop-with-savepoint and restart for the Makefile; see flink/enrichment/docker/flinkctl.sh.
-  # The job reads KAFKA_BROKERS and AIS_DAY from this container's environment at submit time.
+  # The job reads KAFKA_BROKERS, AIS_DAY and the POSTGRES_* settings from this container's
+  # environment at submit time. Before submitting it waits until PostGIS has an active
+  # zone package (the startup gate, docs/adr/0018); the job's zone source then reads that
+  # package with the same settings, which travel inside the job graph.
   flink-submit:
     build:
       context: ../../flink/enrichment
@@ -322,10 +325,17 @@ services:
         condition: service_completed_successfully
       flink-jobmanager:
         condition: service_healthy
+      postgis:
+        condition: service_healthy
     environment:
       FLINK_JOBMANAGER: flink-jobmanager:8081
       KAFKA_BROKERS: redpanda:9092   # internal listener
       AIS_DAY: ${AIS_DAY:?set in .env}
+      POSTGRES_HOST: postgis
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:?set in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set in .env}
     volumes:
       - flink-data:/flink-data
     # The flink CLI is a JVM that builds the job graph and uploads the jar.

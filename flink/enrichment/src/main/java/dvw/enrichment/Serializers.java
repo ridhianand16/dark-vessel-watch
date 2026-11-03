@@ -2,6 +2,7 @@ package dvw.enrichment;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -30,8 +31,12 @@ public final class Serializers {
     }
 
     /**
-     * ais.enriched: the ais.raw object unchanged, plus src_partition, src_offset and
-     * station_class. Keyed by MMSI, as ais.raw.
+     * ais.enriched: the ais.raw object unchanged, plus src_partition, src_offset,
+     * station_class and the zone tags (docs/adr/0018): zones_version, eez_id (null outside
+     * every EEZ), mpa_ids (array, empty outside protected areas), in_port, and
+     * dist_eez_boundary_m and dist_mpa_m (geodesic metres to 0.1 m; dist_mpa_m is 0 inside
+     * a protected area; both null for a point that cannot be projected). Keyed by MMSI, as
+     * ais.raw.
      */
     public static final class Enriched implements KafkaRecordSerializationSchema<RawRecord> {
         private final String topic;
@@ -51,6 +56,17 @@ public final class Serializers {
                 n.put("src_partition", r.srcPartition);
                 n.put("src_offset", r.srcOffset);
                 n.put("station_class", r.stationClass);
+                n.put("zones_version", r.zonesVersion);
+                n.put("eez_id", r.eezId);
+                ArrayNode mpas = n.putArray("mpa_ids");
+                if (r.mpaIds != null) {
+                    for (String id : r.mpaIds) {
+                        mpas.add(id);
+                    }
+                }
+                n.put("in_port", r.inPort);
+                n.put("dist_eez_boundary_m", decimetres(r.distEezBoundaryM));
+                n.put("dist_mpa_m", decimetres(r.distMpaM));
                 return MAPPER.writeValueAsBytes(n);
             } catch (IOException e) {
                 // Unreachable: the validator parsed this value as a JSON object.
@@ -113,6 +129,10 @@ public final class Serializers {
             n.put("count", c.count);
             return write(n);
         }
+    }
+
+    private static Double decimetres(Double metres) {
+        return metres == null ? null : Math.round(metres * 10) / 10.0;
     }
 
     private static byte[] write(JsonNode n) {

@@ -3,6 +3,8 @@ package dvw.enrichment;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import dvw.enrichment.zones.TestZones;
+import dvw.enrichment.zones.ZoneElement;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -21,7 +23,9 @@ import org.junit.jupiter.api.Test;
 
 /**
  * The whole topology between source and sinks on a local mini cluster: for every partition,
- * raw = enriched + dlq + sum(dedup_counts), and no raw offset is forwarded twice.
+ * raw = enriched + dlq + sum(dedup_counts), no raw offset is forwarded twice, and every
+ * enriched record is zone-tagged. The zones arrive whenever the mini cluster schedules
+ * them, before, among or after the AIS records, so the tagging buffer is exercised too.
  */
 class TopologyTest {
     @Test
@@ -55,11 +59,16 @@ class TopologyTest {
         conf.set(PipelineOptions.GENERIC_TYPES, false); // as in the job: fails if a type needs Kryo
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment(conf);
         env.setParallelism(2);
-        EnrichmentJob.Outputs out = EnrichmentJob.topology(env
-                .fromData(raw, TypeInformation.of(RawRecord.class))
-                .assignTimestampsAndWatermarks(WatermarkStrategy
-                        .<RawRecord>forBoundedOutOfOrderness(Duration.ofSeconds(5))
-                        .withTimestampAssigner((r, ts) -> r.isValid() ? r.eventTs : Long.MIN_VALUE)));
+        TestZones zones = new TestZones()
+                .box(ZoneElement.EEZ, "eez:5674", 10, 54, 13, 58)
+                .box(ZoneElement.MPA, "wdpa:1", 11.4, 55.0, 11.6, 55.2)
+                .line("1", new double[][] {{13.0, 54.0}, {13.0, 58.0}});
+        EnrichmentJob.Outputs out = EnrichmentJob.topology(
+                env.fromData(raw, TypeInformation.of(RawRecord.class))
+                        .assignTimestampsAndWatermarks(WatermarkStrategy
+                                .<RawRecord>forBoundedOutOfOrderness(Duration.ofSeconds(5))
+                                .withTimestampAssigner((r, ts) -> r.isValid() ? r.eventTs : Long.MIN_VALUE)),
+                env.fromData(zones.stream(), TypeInformation.of(ZoneElement.class)).setParallelism(1));
         CloseableIterator<RawRecord> enriched = out.enriched.collectAsync();
         CloseableIterator<RawRecord> dlq = out.dlq.collectAsync();
         CloseableIterator<DedupCount> counts = out.dedupCounts.collectAsync();
@@ -72,6 +81,8 @@ class TopologyTest {
         while (enriched.hasNext()) {
             RawRecord r = enriched.next();
             assertEquals(true, seenOffsets.add(r.srcOffset), "offset forwarded twice: " + r.srcOffset);
+            assertEquals(TestZones.VERSION, r.zonesVersion, "untagged record at offset " + r.srcOffset);
+            assertEquals("eez:5674", r.eezId);
             accounted.merge(r.srcPartition, 1, Integer::sum);
             enrichedTotal++;
         }

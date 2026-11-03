@@ -1,6 +1,11 @@
 package dvw.enrichment;
 
 import java.time.Duration;
+import dvw.enrichment.zones.PostgisConfig;
+import dvw.enrichment.zones.PostgisZoneRows;
+import dvw.enrichment.zones.ZoneElement;
+import dvw.enrichment.zones.ZoneSource;
+import dvw.enrichment.zones.ZonesGate;
 import java.time.LocalDate;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.typeinfo.Types;
@@ -22,8 +27,10 @@ import org.apache.kafka.clients.consumer.OffsetResetStrategy;
  * The Flink enrichment job:
  *
  * <pre>
- *   ais.raw -> parse + validate -> invalid ----------------------------------> ais.dlq
- *                                 valid -> keyBy MMSI -> dedup -> unique -----> ais.enriched
+ *   ais.raw -> parse + validate -> invalid ---------------------------------------------> ais.dlq
+ *                                 valid -> keyBy MMSI -> dedup -> unique -> keyBy MMSI
+ *                                                          |               -> zone tagging --> ais.enriched
+ *   PostGIS active package -> zone source -> broadcast -------------------------^
  *                                                          \-> duplicates -> keyBy (run, partition)
  *                                                              -> 10 s event-time count --> ais.dedup_counts
  * </pre>
@@ -33,9 +40,14 @@ import org.apache.kafka.clients.consumer.OffsetResetStrategy;
  * that snapshot completes. For every run and ais.raw partition,
  * raw = enriched + dlq + sum(dedup_counts) (docs/adr/0015).
  *
+ * <p>Zone tagging (docs/adr/0018): main waits until PostGIS has an active zone package before
+ * it builds the job. In the job, a parallelism-1 source reads that package and broadcasts it
+ * to every zone-tagging task, which buffers AIS records until the whole package is in.
+ *
  * <p>Configuration comes from the environment of the process that submits the job (main runs
- * on the client and the values are baked into the job graph): KAFKA_BROKERS and AIS_DAY
- * (yyyy-MM-dd, the replayed day, for the bad_timestamp rule).
+ * on the client and the values are baked into the job graph): KAFKA_BROKERS, AIS_DAY
+ * (yyyy-MM-dd, the replayed day, for the bad_timestamp rule) and POSTGRES_HOST, _PORT, _DB,
+ * _USER and _PASSWORD for the zone package.
  */
 public final class EnrichmentJob {
     public static final String JOB_NAME = "dvw-enrichment";
@@ -61,12 +73,15 @@ public final class EnrichmentJob {
     /** Valid event times span 3 days (the AIS day +-1 day), so with 3 days of lateness no
      * valid duplicate is ever too late for its window; the LATE side output is a safety net. */
     static final Duration COUNT_LATENESS = Duration.ofDays(3);
+    static final Duration ZONES_GATE_POLL = Duration.ofSeconds(5);
 
     private EnrichmentJob() {}
 
     public static void main(String[] args) throws Exception {
         String brokers = requireEnv("KAFKA_BROKERS");
         LocalDate aisDay = LocalDate.parse(requireEnv("AIS_DAY"));
+        PostgisConfig postgis = PostgisConfig.fromEnv(System::getenv);
+        ZonesGate.awaitActivePackage(postgis, ZONES_GATE_POLL, System.err);
 
         Configuration conf = new Configuration();
         // No Kryo fallback: every record type must be a Flink POJO or a basic type.
@@ -103,7 +118,15 @@ public final class EnrichmentJob {
 
         // uid() names each stateful operator for savepoints. Without it Flink derives an id from
         // the graph shape, and any change to the job would orphan the saved state.
-        Outputs out = topology(env.fromSource(source, watermarks, "ais.raw").uid("raw-source"));
+        // One reader is enough: the package is read once and broadcast. noWatermarks: the
+        // source emits one final watermark itself after the marker (ZoneSource).
+        DataStream<ZoneElement> zones = env
+                .fromSource(new ZoneSource(PostgisZoneRows.opener(postgis)),
+                        WatermarkStrategy.noWatermarks(), "zones")
+                .uid("zone-source")
+                .setParallelism(1);
+
+        Outputs out = topology(env.fromSource(source, watermarks, "ais.raw").uid("raw-source"), zones);
 
         out.enriched.sinkTo(sink(brokers, new Serializers.Enriched(ENRICHED_TOPIC), "dvw-enrichment-enriched"))
                 .uid("enriched-sink").name(ENRICHED_TOPIC);
@@ -129,13 +152,20 @@ public final class EnrichmentJob {
     }
 
     /** Everything between the source and the sinks; tests run it on a local mini cluster. */
-    static Outputs topology(DataStream<RawRecord> raw) {
+    static Outputs topology(DataStream<RawRecord> raw, DataStream<ZoneElement> zones) {
         SingleOutputStreamOperator<RawRecord> valid = raw
                 .process(new RouteInvalid()).uid("validate").name("validate");
 
         SingleOutputStreamOperator<RawRecord> unique = valid
                 .keyBy(r -> r.mmsi, Types.LONG)
                 .process(new Dedup()).uid("dedup").name("dedup");
+
+        // Tagging comes after dedup, so duplicates are never tagged, and the buffer's lost
+        // timestamps (ZoneTagging) cannot reach the event-time counting below.
+        SingleOutputStreamOperator<RawRecord> tagged = unique
+                .keyBy(r -> r.mmsi, Types.LONG)
+                .connect(zones.broadcast(ZoneTagging.ZONES))
+                .process(new ZoneTagging()).uid("zone-tagging").name("zone-tagging");
 
         SingleOutputStreamOperator<DedupCount> counts = unique.getSideOutput(Dedup.DUPLICATES)
                 .keyBy(Duplicate::countKey, Types.STRING)
@@ -148,7 +178,7 @@ public final class EnrichmentJob {
         DataStream<DedupCount> lateCounts = counts.getSideOutput(DuplicateCounting.LATE)
                 .process(new DuplicateCounting.CountLate()).uid("dedup-count-late").name("dedup-count-late");
 
-        return new Outputs(unique, valid.getSideOutput(RouteInvalid.DLQ), counts.union(lateCounts));
+        return new Outputs(tagged, valid.getSideOutput(RouteInvalid.DLQ), counts.union(lateCounts));
     }
 
     /**

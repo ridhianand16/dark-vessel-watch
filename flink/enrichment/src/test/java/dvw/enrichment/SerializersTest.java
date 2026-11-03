@@ -3,6 +3,7 @@ package dvw.enrichment;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -23,6 +24,12 @@ class SerializersTest {
         RawRecord r = new Validator(ValidatorTest.DAY).validate(raw.toString().getBytes(StandardCharsets.UTF_8));
         r.srcPartition = 4;
         r.srcOffset = 562950;
+        r.zonesVersion = "zones-ee4167a002e7";
+        r.eezId = "eez:5674";
+        r.mpaIds = new String[] {"wdpa:1", "wdpa:2"};
+        r.inPort = false;
+        r.distEezBoundaryM = 9046.6449;
+        r.distMpaM = 0.0;
 
         ProducerRecord<byte[], byte[]> pr = new Serializers.Enriched("ais.enriched").serialize(r, null, 123L);
         assertEquals("ais.enriched", pr.topic());
@@ -39,7 +46,25 @@ class SerializersTest {
         assertEquals(4, out.get("src_partition").asInt());
         assertEquals(562950L, out.get("src_offset").asLong());
         assertEquals("ship", out.get("station_class").asText());
-        assertEquals(raw.size() + 3, out.size());
+        assertEquals("zones-ee4167a002e7", out.get("zones_version").asText());
+        assertEquals("eez:5674", out.get("eez_id").asText());
+        assertEquals("[\"wdpa:1\",\"wdpa:2\"]", out.get("mpa_ids").toString());
+        assertEquals(false, out.get("in_port").asBoolean());
+        assertEquals(9046.6, out.get("dist_eez_boundary_m").asDouble());
+        assertEquals(0.0, out.get("dist_mpa_m").asDouble());
+        assertEquals(raw.size() + 3 + 6, out.size());
+    }
+
+    @Test
+    void enrichedWritesNullsOutsideEveryZone() throws Exception {
+        RawRecord r = new Validator(ValidatorTest.DAY).validate(ValidatorTest.valid().toString().getBytes(StandardCharsets.UTF_8));
+        r.zonesVersion = "zones-ee4167a002e7";
+        r.mpaIds = new String[0];
+        JsonNode out = json(new Serializers.Enriched("ais.enriched").serialize(r, null, 1L).value());
+        assertTrue(out.get("eez_id").isNull());
+        assertEquals("[]", out.get("mpa_ids").toString());
+        assertTrue(out.get("dist_eez_boundary_m").isNull());
+        assertTrue(out.get("dist_mpa_m").isNull());
     }
 
     @Test
