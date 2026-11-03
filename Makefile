@@ -1,6 +1,6 @@
 COMPOSE := docker compose -f deploy/compose/docker-compose.yml --env-file .env
 
-.PHONY: hooks up down nuke topics ps fetch replay migrate sink sink-logs reconcile test typecheck
+.PHONY: hooks up down nuke topics ps fetch replay migrate sink sink-logs tracker tracker-logs reconcile test typecheck
 
 .env:
 	@echo "Missing .env. Run: cp .env.example .env" >&2; exit 1
@@ -25,7 +25,7 @@ up: hooks .env
 	$(COMPOSE) up -d --wait --wait-timeout 180 $(SERVICES)
 	$(COMPOSE) run --rm init-topics
 	$(MAKE) migrate
-	$(COMPOSE) up -d --build raw-sink
+	$(COMPOSE) up -d --build raw-sink tracker
 
 ## Stop and remove containers; named volumes (topic data, DBs) are kept.
 down: .env
@@ -59,6 +59,13 @@ sink: .env
 sink-logs: .env
 	$(COMPOSE) logs -f raw-sink
 
+## (Re)build and start the Faust tracker: ais.raw -> ais.tracks.
+tracker: .env
+	$(COMPOSE) up -d --build tracker
+
+tracker-logs: .env
+	$(COMPOSE) logs -f tracker
+
 ## Apply new ClickHouse migrations in sql/clickhouse/ (no-op when up to date).
 migrate: .env
 	uv run python -m sql.migrate
@@ -70,7 +77,7 @@ reconcile: .env
 	@test -n "$(RUN)" || { echo "usage: make reconcile RUN=<run_id>  (see data/runs/)" >&2; exit 2; }
 	uv run python -m reconcile.run_check $(RUN) --wait $(WAIT)
 
-PY_DIRS := common ingest refdata sql sinks reconcile
+PY_DIRS := common ingest refdata sql sinks reconcile stream
 
 test:
 	uv run pytest -q $(PY_DIRS)
