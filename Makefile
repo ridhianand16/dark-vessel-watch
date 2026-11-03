@@ -1,6 +1,6 @@
 COMPOSE := docker compose -f deploy/compose/docker-compose.yml --env-file .env
 
-.PHONY: hooks up down nuke topics ps fetch fetch-refdata area replay migrate migrate-postgis sink sink-logs alerts-sink alerts-sink-logs tracker tracker-logs reconcile score test typecheck
+.PHONY: hooks up down nuke topics ps fetch fetch-refdata area refdata refdata-image refdata-key refdata-build refdata-verify refdata-load replay migrate migrate-postgis sink sink-logs alerts-sink alerts-sink-logs tracker tracker-logs reconcile score test typecheck
 
 .env:
 	@echo "Missing .env. Run: cp .env.example .env" >&2; exit 1
@@ -59,6 +59,35 @@ fetch-refdata: .env
 ## day. Only needed when the day or refdata/package.yaml changes; commit the result.
 area: .env
 	uv run python -m refdata.area
+
+## Build the GDAL + minisign image the package build runs in. Online, once.
+refdata-image: .env
+	$(COMPOSE) build refdata-tools
+
+## Create the package signing key: secret key in MINISIGN_KEY (default
+## ~/.minisign/dvw.key, never in the repo), public key in refdata/keys/dvw.pub (commit it).
+## Refuses to overwrite either. No password, so builds run unattended (ADR 0011).
+MINISIGN_KEY ?= $(or $(call env_get,MINISIGN_KEY),$(HOME)/.minisign/dvw.key)
+refdata-key: .env
+	@test ! -e refdata/keys/dvw.pub || { echo "refdata/keys/dvw.pub exists; delete it first to replace the key" >&2; exit 1; }
+	@test ! -e $(MINISIGN_KEY) || { echo "$(MINISIGN_KEY) exists; delete it first to replace the key" >&2; exit 1; }
+	mkdir -p $(dir $(MINISIGN_KEY)) refdata/keys
+	$(COMPOSE) run --rm --no-deps -v $(dir $(abspath $(MINISIGN_KEY))):/keys -v $(CURDIR)/refdata/keys:/pub \
+		refdata-tools minisign -G -W -p /pub/dvw.pub -s /keys/$(notdir $(MINISIGN_KEY))
+
+## Zone package: cut every layer to refdata/area.yaml, sign the manifest, verify it,
+## then load it into PostGIS through a staging schema. Offline. A package is
+## data/refdata/packages/<version>/; PKG=<dir> verifies or loads another one (rollback).
+refdata: refdata-build refdata-verify refdata-load
+
+refdata-build: .env
+	uv run python -m refdata build
+
+refdata-verify: .env
+	uv run python -m refdata verify $(if $(PKG),--package $(PKG))
+
+refdata-load: .env
+	uv run python -m refdata load $(if $(PKG),--package $(PKG))
 
 ## Replay the pinned AIS day into ais.raw at SPEED (default 10x, the speed the
 ## pipeline is sized for). Brokers default to REDPANDA_BROKERS in .env.
