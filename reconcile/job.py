@@ -466,7 +466,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     total = sum(p.count for p in produced)
     print(f"reconcile: OK, {total} produced, every check balances on all {len(produced)} partitions"
-          + (f" ({len(warns)} warnings)" if warns else ""))
+          + (f" ({len(warns)} warning{'s' if len(warns) > 1 else ''})" if warns else ""))
     return 0
 
 
