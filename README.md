@@ -54,7 +54,7 @@ Precision and recall are 1.00 for both types on this set. That says the rules fi
 
 ## Quickstart
 
-Needs Docker with Compose v2, about 8 GB of free RAM, GNU make, and Python 3.12 with [uv](https://docs.astral.sh/uv/). One-time setup and data licensing notes are in [docs/SETUP.md](docs/SETUP.md).
+Needs Docker with Compose v2, about 8 GB of free RAM, GNU make, and Python 3.12 with [uv](https://docs.astral.sh/uv/). The AIS data is not in the repository: `make fetch` downloads it and checks its SHA-256.
 
 ```sh
 cp .env.example .env

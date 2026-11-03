@@ -4,7 +4,7 @@ Status: accepted (2026-11-02)
 
 ## Context
 
-Every topic is keyed by MMSI (CLAUDE.md) and has 6 partitions. Per-vessel state in
+Every topic is keyed by MMSI and has 6 partitions. Per-vessel state in
 Faust and Flink relies on all messages for one MMSI landing in the same partition,
 and later on the same MMSI landing in the *same partition number* across topics, so
 a worker that owns partition 3 of `ais.enriched` also owns partition 3 of `ais.tracks`.

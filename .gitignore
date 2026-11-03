@@ -1,4 +1,4 @@
-# Data (never committed, see docs/SETUP.md licensing note)
+# Data (never committed; `make fetch` downloads it)
 data/
 *.zip
 *.gz
@@ -27,3 +27,8 @@ __pycache__/
 
 # Local Claude Code settings
 .claude/settings.local.json
+
+# Local working notes, kept out of the repository
+CLAUDE.md
+PROBLEM_STATEMENT.md
+docs/SETUP.md
