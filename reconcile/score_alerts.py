@@ -231,7 +231,7 @@ def behind(brokers: str, progress: Progress) -> list[str]:
     for tp in committed(brokers, ALERTS_SINK_GROUP, [TopicPartition("ais.alerts", p) for p in sorted(ends)]):
         left = ends[tp.partition] - max(tp.offset, 0)
         if left > 0:
-            out.append(f"alerts-sink: {left} records on ais.alerts/{tp.partition}")
+            out.append(f"alerts sink: {left} records on ais.alerts/{tp.partition}")
     return out
 
 

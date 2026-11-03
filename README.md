@@ -26,6 +26,8 @@ The same job tags every record with its zones: EEZ, protected areas, port, and g
 
 The tracker now reads `ais.enriched` instead of `ais.raw`, with `read_committed`, so it only ever sees output of completed Flink checkpoints ([ADR 0019](docs/adr/0019-tracker-on-enriched-and-dark-gap-zone-condition.md)). DARK_GAP uses the zone tags: a gap counts only if the vessel was last seen within 10 nm of an EEZ boundary or a protected area, and not in port. The same 10,000 rows read through either topic gave identical tracks for 1,278 of 1,279 vessels. The one exception came from the two sides rounding positions differently when spotting repeated reports. That rule now lives in one contract file that the Java and Python tests both check ([Tracker on ais.enriched](#tracker-on-aisenriched)).
 
+Every track is now stored in ClickHouse too, and rolled up per vessel to one row per minute and one per hour as it arrives ([History and retention](#history-and-retention), [ADR 0020](docs/adr/0020-rollups-from-tracks-and-ttl.md)). The rollups only use aggregates that a repeated track cannot change, so a crash, a resend or re-reading the whole topic leaves them exactly as they were. Raw and track rows expire 7 days after they were stored, minute rows after 30 days; hourly rows are kept.
+
 Not built yet: excluding gaps at the edge of receiver coverage, and MMSI_CLASH.
 
 ## Detections
@@ -189,18 +191,67 @@ Records tagged before the restart keep the old package's tags, and every record 
 
 **Switching a running tracker between topics.** Stop it, `rpk group seek dvw-tracker --to end --topics ais.enriched --allow-new-topics`, start it. Without the seek it starts at the earliest offset and re-tracks every earlier run.
 
+## History and retention
+
+A vessel's day can be read at three resolutions. All three come from `ais.tracks`, so they hold ships only, with Kalman-filtered positions. Every record as received stays in `dvw.ais_raw`.
+
+| Table | One row per | Kept |
+|---|---|---|
+| `dvw.tracks` | accepted fix | 7 days after it was stored |
+| `dvw.ais_1min_v` | vessel, run and minute | 30 days after the minute was last written |
+| `dvw.ais_1hour_v` | vessel, run and hour | kept |
+
+The same sink process that stores alerts stores `ais.tracks` in `dvw.tracks`, deduplicated on each fix's identity: MMSI, event time, and the raw partition and offset it came from. Two materialised views on `dvw.tracks` keep the 1-minute and 1-hour rollups up to date on every insert. Each rollup row holds the last fix's position, speed and course, min and max speed, the largest innovation, and `n_fixes`.
+
+The catch with materialised views is that they run on every inserted block, before ClickHouse merges away duplicate rows. A batch the sink inserts twice after a crash reaches the views twice. So the rollups use only aggregates that a second copy cannot change: the last fix by `argMax` over (event time, offset), min and max, and `n_fixes` as `uniqExact` of the fix's identity, never `count()` or `avg()` ([ADR 0020](docs/adr/0020-rollups-from-tracks-and-ttl.md)). That makes the check exact: for any run, `sum(n_fixes)` at either resolution equals `count()` with `FINAL` in `dvw.tracks`.
+
+One vessel at all three resolutions (put in your own `run_id` from `data/runs/`):
+
+```sql
+-- every fix
+SELECT event_ts, lat, lon, sog_kn, cog_deg
+FROM dvw.tracks FINAL
+WHERE run_id = '20261103T232419Z-9959ca' AND mmsi = 273274080
+ORDER BY event_ts, src_offset;
+
+-- one row per minute; dvw.ais_1hour_v has the same columns, one row per hour
+SELECT bucket, last_event_ts, lat, lon, sog_kn, cog_deg, min_sog_kn, max_sog_kn, n_fixes
+FROM dvw.ais_1min_v
+WHERE run_id = '20261103T232419Z-9959ca' AND mmsi = 273274080
+ORDER BY bucket;
+```
+
+For that vessel, across the 01:00 boundary of the replayed day:
+
+```
+res                        last fix                  lat       lon       sog   n_fixes
+tracks                     2026-10-28 00:59:58.000   57.7704   9.83173   6.3   1
+1min  2026-10-28 00:59:00  2026-10-28 00:59:58.000   57.7704   9.83173   6.3   30
+1hour 2026-10-28 00:00:00  2026-10-28 00:59:58.000   57.7704   9.83173   6.3   1743
+```
+
+The last fix of the 00:59 minute is the last fix of the 00:00 hour. Over the run's 75 minutes and 2 hours for this vessel, every bucket's last fix and `n_fixes` match what `dvw.tracks` gives, and each hour's `n_fixes` is the sum of its minutes.
+
+Filter the rollup views by `run_id` and `mmsi`. Each view finishes its aggregates at read time, and reading every vessel of every run at once exceeds ClickHouse's 1.25 GB limit on this laptop.
+
+Retention is measured from `ingested_at`, when a row was stored, not from `event_ts`. The replayed day is in the past, so an event-time TTL would delete rows as they arrive. TTL deletes during merges, so expired rows can linger for a few hours. `make ttl-demo` shows it working on a scratch table with the same expression in minutes and touches no real table.
+
+Views only see rows inserted after they exist. `make backfill-rollups` fills the rollups from tracks already stored, with the views' own SELECT, one run and partition at a time. It is safe to repeat, including while the sink runs.
+
 ## Quickstart
 
 Needs Docker with Compose v2, about 8 GB of free RAM, GNU make, and Python 3.12 with [uv](https://docs.astral.sh/uv/). The AIS data is not in the repository: `make fetch` downloads it and checks its SHA-256.
 
 ```sh
 cp .env.example .env
-make up        # git hooks, stack, topics, migrations, the three sinks, tracker, Flink job
+make up        # git hooks, stack, topics, migrations, the sinks, tracker, Flink job
 make ps        # every service healthy, raw-sink running
 make fetch     # download and verify the pinned AIS day (once, about 3 GB)
 
 make replay ARGS="--limit 10000"                # 10x by default; prints the run_id
 make reconcile RUN=<run_id>                     # per-partition produced vs stored
+make backfill-rollups                           # once, if dvw.tracks had rows before the rollups existed
+make ttl-demo                                   # the ingested_at TTL deleting rows, on a scratch table
 ```
 
 The tracker reads `ais.enriched`, so `make up` also starts the Flink job that writes it (about 2 GB of the memory budget; the image build compiles the job and runs its tests). The job needs a zone package in PostGIS. `make up` loads the last one built if none is active, including after `make nuke`. On a fresh clone there is none yet: `make up` says so and leaves the job unsubmitted, so build one (reference data, below), then run `make flink-up`. To run without Flink, set `TRACKER_INPUT_TOPIC=ais.raw` in `.env` and `make tracker`: tracks work, DARK_GAP does not.
@@ -246,11 +297,11 @@ make area            # only if the AIS day changes: recompute refdata/area.yaml 
 
 EEZ (Marine Regions form), WDPA (Protected Planet terms page) and WPI (NASA Harvest mirror of the NGA release) have to be downloaded by hand into `data/refdata/incoming/<source>/<version>/`, under the file names in `refdata/sources.yaml`. `make fetch-refdata` prints the page and the exact path for each missing file, and fails on any file whose SHA-256 does not match `refdata/sources.yaml`.
 
-`make console` starts Redpanda Console on http://localhost:8080. It is not part of `make up`, to save 256 MB. `make sink-logs`, `make alerts-sink-logs` and `make vessels-sink-logs` follow the three sinks (one line per batch; the vessels sink also logs how many rows each batch `written` and how many were `stale`). `make tracker-logs` follows the tracker, which logs its counters every 30 s (`input=ais.enriched tracks=... flink_leaks=0 read=... not_a_ship=...`). Every record read gets exactly one skip reason or result, so those counters add up to `read`. `flink_leaks` counts records the tracker's own checks caught that Flink should have removed; it should stay 0. `make down` stops the stack and keeps the data. `make nuke` stops it and deletes all data volumes, including ClickHouse.
+`make console` starts Redpanda Console on http://localhost:8080. It is not part of `make up`, to save 256 MB. `make sink-logs`, `make tracks-alerts-sink-logs` and `make vessels-sink-logs` follow the sinks (one line per batch; the vessels sink also logs how many rows each batch `written` and how many were `stale`). `make tracker-logs` follows the tracker, which logs its counters every 30 s (`input=ais.enriched tracks=... flink_leaks=0 read=... not_a_ship=...`). Every record read gets exactly one skip reason or result, so those counters add up to `read`. `flink_leaks` counts records the tracker's own checks caught that Flink should have removed; it should stay 0. `make down` stops the stack and keeps the data. `make nuke` stops it and deletes all data volumes, including ClickHouse.
 
 Other targets: `make migrate` and `make migrate-postgis` apply new files in `sql/clickhouse/` and `sql/postgis/` and do nothing when up to date (`make up` runs both). `make test` runs pytest and the Flink job's JUnit tests (in Docker, so no JDK or Maven needed on the host). `make typecheck` runs `mypy --strict`.
 
-If a sink or the tracker crashes, Docker restarts it and it re-reads from its last committed offset. `docker stop` and `docker kill` count as deliberate stops and leave it down; `make sink`, `make alerts-sink`, `make vessels-sink` or `make tracker` starts it again. For the TaskManager, use `docker start dvw-flink-taskmanager`.
+If a sink or the tracker crashes, Docker restarts it and it re-reads from its last committed offset. `docker stop` and `docker kill` count as deliberate stops and leave it down; `make sink`, `make tracks-alerts-sink`, `make vessels-sink` or `make tracker` starts it again. For the TaskManager, use `docker start dvw-flink-taskmanager`.
 
 ## Going faster
 
@@ -312,6 +363,11 @@ Measured on 2026-11-02 on an Apple M1 laptop (8 GB RAM, macOS 26.5), Docker VM w
 | Tracker on `ais.enriched`, same 10,000 rows as from `ais.raw` (2026-11-04) | replay with the old tracker, switch, replay again, `make compare-tracks A=... B=...` | 1,278 of 1,279 vessels identical, 1 differing by Flink's 5-decimal dedup. Tracker `read=5683` = Flink's enriched count, `flink_leaks=0` |
 | End-to-end latency at 10x, 10,000 rows (2026-11-04) | `make replay ARGS="--limit 10000"`, `make latency RUN=...` | send to track sent: p50 2.2 s, p99 3.5 s, max 3.6 s (5,353 tracks) |
 | End-to-end latency at 10x, 701,815 rows (2026-11-04) | `make replay ARGS="--limit 700000 --inject ..."`, `make latency RUN=...` | send to track sent: p50 2.8 s, p99 8.2 s, max 10.4 s (392,977 tracks). Per 30 s window p99 is 3.4 to 4.9 s, except two windows at 9.0 and 8.6 s. Send to TELEPORT stored in ClickHouse: max 3.0 s (8 alerts) |
+| Tracks and rollups, 10,000 rows at 10x (2026-11-04) | `make replay ARGS="--limit 10000"` | 5,353 tracks. `count()` with `FINAL` in `dvw.tracks` = `sum(n_fixes)` in `ais_1min_v` = in `ais_1hour_v` = 5,353 |
+| Rollups after re-inserting every track (2026-11-04) | `rpk group seek dvw-tracks-sink --to start`, restart the sink | 2,833,322 tracks re-inserted in about 96 s (about 29,500 rows/s with both views). For all 27 runs, the counts and a hash of every 1-minute and 1-hour row are identical before and after. One insert hit ClickHouse's memory limit and succeeded on the first retry |
+| Tracks and rollups, 900,000 rows at 100x (2026-11-04) | `make replay SPEED=100 ARGS="--limit 900000"` | 52 s to replay, 502,264 tracks up to 01:14:59 event time. `count()` with `FINAL` = `sum(n_fixes)` at both resolutions = 502,264 |
+| Rollup backfill (2026-11-04) | `make backfill-rollups` | 26 runs, 2.8 million tracks. Largest chunk 37 MiB. Run twice on the same run: numbers unchanged |
+| Memory during the 900,000-row replay (2026-11-04) | `docker stats` every 5 s | Peak 2.65 GiB in total of the 3.9 GiB VM. ClickHouse 988 MiB of 1.25 GiB, TaskManager 925, Redpanda 337, JobManager 278, raw sink 198, tracker 151, tracks and alerts sink 123 of 320, the rest under 90 each |
 
 The 5 s p99 target holds in steady state but not over the whole 700k run. In the first spike Flink itself wrote records up to 6.3 s after they were sent; in the second Flink wrote on time and the delay came after, at the checkpoint commit or in the tracker. The cause of either is not known yet; checkpoint and GC metrics (observability) are the next step. Full-day throughput is still to be measured.
 
@@ -319,6 +375,7 @@ The 5 s p99 target holds in steady state but not over the whole 700k run. In the
 
 - **p99 latency over 5 s on long runs**, see [Numbers](#numbers).
 - **Tracker offset commits lagged once after a run.** After the 700k run the tracker had processed every record, but its committed offsets on two `ais.enriched` partitions stayed about 1,000 behind for several minutes, stuck at a gap left by Flink's transaction markers, then caught up. A 10,000-row run afterwards committed to the end within 30 s on every partition, so it is not systematic. Nothing is lost (a restart re-reads those records and the bookmark skips them), but `make score` can report INCOMPLETE meanwhile. Suspected: Faust's offset-gap handling under `read_committed`.
+- **ClickHouse has little memory headroom.** It idles at 450 to 800 MiB of its 1.13 GiB limit and peaked at 988 MiB in the 900k run. An insert into `dvw.tracks` occasionally fails with `MEMORY_LIMIT_EXCEEDED` while a rollup merge runs; the sink's retry has always succeeded so far, and fail-stop would restart it otherwise. Reading a rollup view without a `run_id`/`mmsi` filter can exceed the limit. Trimming ClickHouse's system log tables and caches, or a larger limit, is the next step.
 - DARK_GAP does not yet exclude the edge of receiver coverage. MMSI_CLASH is not built.
 
 ## Attribution
