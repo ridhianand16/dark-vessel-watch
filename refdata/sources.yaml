@@ -1,16 +1,27 @@
-# Data sources fetched by refdata/fetch.py.
+# Data sources fetched by refdata/fetch.py (make fetch, make fetch-refdata).
 #
 # Fields:
 #   name             human-readable name
-#   url              download URL; {day} is replaced with YYYY-MM-DD where used
-#   version          source version. For daily data, the pinned day the hash belongs to.
-#   expected_sha256  SHA-256 of the downloaded file. Empty: fetch.py prints the
-#                    computed hash so it can be committed here.
+#   url              direct download URL; {day} / {version} are filled in. Empty when
+#                    there is no stable URL (the file is placed by hand).
+#   file             name of the downloaded file. Default: last segment of the url path.
+#   page             human download page, printed when the file must be fetched by hand
+#   manual           true: never downloaded. The file must be placed in
+#                    data/refdata/incoming/<key>/<version>/<file>; fetch verifies it.
+#   version          source release. For daily data, the pinned day the hash belongs to.
+#   version_env      .env key that selects the version; must equal `version` while a
+#                    hash is pinned
+#   expected_sha256  SHA-256 of the downloaded bytes. Empty: fetch prints the computed
+#                    hash and fails until it is committed here.
+#   archive          key of the source whose download contains this one (same file,
+#                    same hash); used for layers that ship in one zip
+#   members          file names that must exist in the unzipped download
 #   licence          licence / terms of use
-#   attribution      required attribution text
+#   attribution      required attribution text (also in README "Attribution")
 #
-# Only dma_ais is implemented (M1). The rest are placeholders for M3 so the
-# schema is visible; their downloads sit behind forms / terms pages.
+# The reference layers are licensed against redistribution (WDPA) or for
+# non-commercial share-alike use (Marine Regions). The repo pins their hashes;
+# the files themselves never go into the repo or a release.
 
 sources:
   dma_ais:
@@ -21,41 +32,74 @@ sources:
     # Path-style S3 URL used for HTTPS (the website endpoint resets TLS).
     url: https://s3.eu-central-1.amazonaws.com/aisdata.ais.dk/aisdk-{day}.zip
     version: "2026-10-28"
-    expected_sha256: ""
+    expected_sha256: "e20fdb5fa0e28dbadda0e97b76850bfe604fd68f8f0a39c63f3ab48fa199fa31"
     licence: >-
       Free re-use under the Danish act on re-use of public sector information
       (act no. 596 of 24 June 2005). Provided as-is, no warranty. See DMA
       "Conditions for the use of data" (dma.dk, AIS data).
     attribution: Contains AIS data from the Danish Maritime Authority.
 
-  # eez:
-  #   name: Marine Regions World EEZ polygons
-  #   url: ""                # behind download form; place zip in data/refdata/incoming/
-  #   version: ""            # e.g. "v12"
-  #   expected_sha256: ""
-  #   licence: CC BY-NC-SA 4.0
-  #   attribution: "Flanders Marine Institute (VLIZ), Maritime Boundaries Geodatabase"
+  eez:
+    name: Marine Regions World EEZ v12, polygons (versioned static release)
+    # Downloads sit behind a form (name, organisation, purpose), so there is no
+    # stable URL. Pick "World EEZ v12", GeoPackage. The zip carries both the
+    # polygons and the boundary lines (eez_boundaries below).
+    url: ""
+    page: https://www.marineregions.org/downloads.php
+    file: World_EEZ_v12_20231025_gpkg.zip
+    manual: true
+    version: v12
+    expected_sha256: ""
+    members: [eez_v12.gpkg]
+    licence: CC BY-NC-SA 4.0
+    attribution: >-
+      Flanders Marine Institute (2023). Maritime Boundaries Geodatabase: Maritime
+      Boundaries and Exclusive Economic Zones (200NM), version 12.
+      https://doi.org/10.14284/632
 
-  # eez_boundaries:
-  #   name: Marine Regions World EEZ boundary lines
-  #   url: ""
-  #   version: ""
-  #   expected_sha256: ""
-  #   licence: CC BY-NC-SA 4.0
-  #   attribution: "Flanders Marine Institute (VLIZ), Maritime Boundaries Geodatabase"
+  eez_boundaries:
+    name: Marine Regions World EEZ v12, boundary lines
+    # Same download as eez. DARK_GAP distances are measured to these lines, never
+    # to the edges of clipped polygons.
+    archive: eez
+    version: v12
+    members: [eez_boundaries_v12.gpkg]
+    licence: CC BY-NC-SA 4.0
+    attribution: >-
+      Flanders Marine Institute (2023). Maritime Boundaries Geodatabase: Maritime
+      Boundaries and Exclusive Economic Zones (200NM), version 12.
+      https://doi.org/10.14284/632
 
-  # wdpa_marine:
-  #   name: World Database on Protected Areas (marine subset)
-  #   url: ""                # behind terms page; place download in data/refdata/incoming/
-  #   version: ""            # e.g. "Nov2026"
-  #   expected_sha256: ""
-  #   licence: WDPA terms of use (non-commercial, no redistribution)
-  #   attribution: "UNEP-WCMC and IUCN, Protected Planet"
+  wdpa_marine:
+    name: World Database on Protected Areas, marine subset (Protected Planet)
+    # Monthly release on a moving URL: last month's file is removed (404) when the
+    # next one appears. The link below is the pattern seen for Nov2026; download it
+    # from the page after accepting the terms. The zip holds shapefiles split
+    # into parts. Set WDPA_VERSION in .env to the same value as `version`.
+    url: https://d1gam3xoknrgr2.cloudfront.net/current/WDPA_WDOECM_{version}_Public_marine_shp.zip
+    page: https://www.protectedplanet.net/en/thematic-areas/marine-protected-areas
+    manual: true
+    version: Nov2026
+    version_env: WDPA_VERSION
+    expected_sha256: ""
+    licence: >-
+      Protected Planet terms of use: non-commercial use, no redistribution of the
+      data or derived works without UNEP-WCMC permission.
+    attribution: >-
+      UNEP-WCMC and IUCN (2026), Protected Planet: The World Database on Protected
+      Areas (WDPA) and World Database on Other Effective Area-based Conservation
+      Measures (WD-OECM), November 2026, Cambridge, UK. www.protectedplanet.net
 
-  # wpi:
-  #   name: World Port Index (Pub 150)
-  #   url: ""
-  #   version: ""
-  #   expected_sha256: ""
-  #   licence: US Government public domain
-  #   attribution: "National Geospatial-Intelligence Agency, World Port Index"
+  wpi:
+    name: World Port Index (NGA Pub 150), CSV
+    # NGA does not version the CSV; `version` is the day the pinned bytes were
+    # downloaded. msi.nga.mil answers scripted clients with HTTP 503 (bot check),
+    # in which case fetch prints the manual steps: download from the page, save
+    # under the printed path.
+    url: https://msi.nga.mil/api/publications/download?key=16694622/SFH00000/UpdatedPub150.csv&type=download
+    page: https://msi.nga.mil/Publications/WPI
+    file: UpdatedPub150.csv
+    version: "2026-11-03"
+    expected_sha256: ""
+    licence: US Government work, public domain.
+    attribution: National Geospatial-Intelligence Agency, World Port Index (Pub. 150).

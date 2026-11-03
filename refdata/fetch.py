@@ -1,17 +1,26 @@
-"""Download a data source listed in refdata/sources.yaml, verify its SHA-256, unzip it.
+"""Download data sources listed in refdata/sources.yaml, verify their SHA-256, unzip them.
 
 Usage:
-    uv run python refdata/fetch.py --source dma_ais --day 2026-10-28 --dest data/ais
+    uv run python -m refdata.fetch --source dma_ais --day 2026-10-28 --dest data/ais
+    uv run python -m refdata.fetch --incoming data/refdata/incoming \\
+        --source eez --source eez_boundaries --source wdpa_marine --source wpi
 
 Behaviour:
     * Streams to <file>.part and resumes it with an HTTP Range request if present.
       The final filename only appears once the download is complete.
     * A complete file whose hash matches expected_sha256 is not downloaded again.
-    * Empty expected_sha256: prints the computed hash so it can be committed.
+    * Empty expected_sha256: prints the computed hash so it can be committed, and
+      exits 1. Nothing unpinned counts as fetched.
     * Hash mismatch: exits 1 without unzipping.
-    * Unzips only after the hash check.
+    * Unzips only after the hash check, then checks the source's expected members.
+    * With --incoming, each source lives in <incoming>/<download>/<version>/.
+      A `manual: true` source is never downloaded: the file must already be there.
+      If it is missing, or a non-manual download fails, fetch prints where to get
+      the file and where to put it.
+    * Every requested source is attempted, so one run reports everything missing.
 
-Exit codes: 0 ok, 1 hash mismatch or download failure, 2 bad config or arguments.
+Exit codes: 0 ok, 1 hash mismatch, download failure or manual step needed,
+2 bad config or arguments.
 """
 
 from __future__ import annotations
@@ -29,12 +38,18 @@ from typing import Any
 import httpx
 import yaml
 
+from common.env import dotenv_value
+
 CHUNK_SIZE = 1 << 20  # 1 MiB
 DEFAULT_SOURCES = Path(__file__).with_name("sources.yaml")
 
 
 class FetchError(Exception):
     """Download or verification failed (exit 1)."""
+
+
+class ManualStepNeeded(FetchError):
+    """The file has to be downloaded by hand and placed in the incoming directory (exit 1)."""
 
 
 class ConfigError(Exception):
@@ -46,34 +61,105 @@ class Source:
     key: str
     name: str
     url: str
+    """Direct download URL. May contain {day} or {version}. Empty for manual-only sources."""
     version: str
     expected_sha256: str
     licence: str
     attribution: str
+    file: str = ""
+    """Name of the downloaded file. Defaults to the last segment of the URL path."""
+    page: str = ""
+    """Human download page, printed when the file has to be fetched by hand."""
+    manual: bool = False
+    version_env: str = ""
+    """Environment / .env key that selects the version (e.g. WDPA_VERSION)."""
+    members: tuple[str, ...] = ()
+    """File names that must exist anywhere under the unzipped archive."""
+    archive: str = ""
+    """Key of the source whose download contains this one (url, file, hash come from it)."""
 
 
-def load_source(path: Path, key: str) -> Source:
+_STR_FIELDS = ("name", "url", "version", "expected_sha256", "licence", "attribution", "file", "page", "version_env")
+_REQUIRED = ("name", "version", "licence", "attribution")
+
+
+def _entries(path: Path) -> dict[str, Any]:
     raw: Any = yaml.safe_load(path.read_text(encoding="utf-8"))
     sources = raw.get("sources") if isinstance(raw, dict) else None
-    if not isinstance(sources, dict) or key not in sources:
-        raise ConfigError(f"source {key!r} not found in {path}")
-    entry = sources[key]
+    if not isinstance(sources, dict):
+        raise ConfigError(f"{path} has no 'sources' mapping")
+    return sources
+
+
+def _parse(key: str, entry: Any, path: Path) -> Source:
     if not isinstance(entry, dict):
         raise ConfigError(f"source {key!r} in {path} is not a mapping")
-    fields = ("name", "url", "version", "expected_sha256", "licence", "attribution")
     values: dict[str, str] = {}
-    for field in fields:
-        value = entry.get(field)
+    for field in _STR_FIELDS:
+        value = entry.get(field, "" if field not in _REQUIRED else None)
         if not isinstance(value, str):
             raise ConfigError(f"source {key!r}: field {field!r} must be a string")
         values[field] = value.strip()
-    if not values["url"]:
-        raise ConfigError(f"source {key!r} has no url (not implemented yet)")
+    manual = entry.get("manual", False)
+    if not isinstance(manual, bool):
+        raise ConfigError(f"source {key!r}: 'manual' must be true or false")
+    members = entry.get("members", [])
+    if not isinstance(members, list) or not all(isinstance(m, str) and m for m in members):
+        raise ConfigError(f"source {key!r}: 'members' must be a list of file names")
+    archive = entry.get("archive", "")
+    if not isinstance(archive, str):
+        raise ConfigError(f"source {key!r}: 'archive' must be a source key")
     sha = values["expected_sha256"].lower()
     if sha and (len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha)):
         raise ConfigError(f"source {key!r}: expected_sha256 is not a hex SHA-256")
     values["expected_sha256"] = sha
-    return Source(key=key, **values)
+    if not archive and not values["url"] and not manual:
+        raise ConfigError(f"source {key!r} has no url and is not manual")
+    if not archive and not values["url"] and not values["file"]:
+        raise ConfigError(f"source {key!r} needs 'file' when it has no url")
+    if manual and not values["page"] and not values["url"]:
+        raise ConfigError(f"manual source {key!r} needs a 'page' or 'url' to point people to")
+    return Source(key=key, manual=manual, members=tuple(members), archive=archive, **values)
+
+
+def load_source(path: Path, key: str) -> Source:
+    sources = _entries(path)
+    if key not in sources:
+        raise ConfigError(f"source {key!r} not found in {path}")
+    return _parse(key, sources[key], path)
+
+
+def download_source(path: Path, source: Source) -> Source:
+    """The source whose file is actually downloaded: itself, or the archive it ships in."""
+    if not source.archive:
+        return source
+    parent = load_source(path, source.archive)
+    if parent.archive:
+        raise ConfigError(f"source {source.key!r}: archive {parent.key!r} is itself inside an archive")
+    if parent.version != source.version:
+        raise ConfigError(
+            f"source {source.key!r} is version {source.version} but its archive "
+            f"{parent.key!r} is {parent.version}; bump them together"
+        )
+    return parent
+
+
+def resolve_version(source: Source) -> str:
+    """The pinned version, or the one set in source.version_env.
+
+    A different version is only allowed while no hash is pinned: the hash belongs to
+    the pinned version's bytes.
+    """
+    wanted = (dotenv_value(source.version_env) or "").strip() if source.version_env else ""
+    if not wanted or wanted == source.version:
+        return source.version
+    if source.expected_sha256:
+        raise ConfigError(
+            f"{source.version_env}={wanted} but sources.yaml pins {source.key!r} at "
+            f"{source.version}. Set {source.version_env}={source.version}, or update "
+            "version and clear expected_sha256 to pin the new release."
+        )
+    return wanted
 
 
 def sha256_file(path: Path) -> str:
@@ -121,6 +207,10 @@ def download(url: str, target: Path) -> None:
                 mode = "wb"
             else:
                 raise FetchError(f"GET {url} returned HTTP {response.status_code}")
+            # None of the sources is a web page. An HTML body is an error, bot-check or
+            # terms page served with 200, and must never be hashed and pinned.
+            if response.headers.get("content-type", "").startswith("text/html"):
+                raise FetchError(f"GET {url} returned an HTML page, not the file")
 
             total = _total_size(response, offset)
             written = offset
@@ -167,7 +257,79 @@ def unzip(archive: Path, dest: Path) -> list[Path]:
     return extracted
 
 
+def _fill(template: str, *, day: str = "", version: str = "") -> str:
+    return template.replace("{day}", day).replace("{version}", version)
+
+
+def _manual_steps(source: Source, url: str, target: Path, reason: str) -> ManualStepNeeded:
+    lines = [f"{source.key}: {reason}. Download it by hand:"]
+    if source.page:
+        lines.append(f"    from: {source.page}")
+    if url:
+        lines.append(f"    file: {url}")
+    lines.append(f"  and save it as\n    {target}")
+    if target.parent.is_dir():
+        present = sorted(p.name for p in target.parent.iterdir() if p.is_file() and not p.name.endswith(".part"))
+        if present:
+            lines.append(f"  (that directory has {', '.join(present)}; the file name must match)")
+    lines.append("  then rerun the fetch.")
+    return ManualStepNeeded("\n".join(lines))
+
+
+def verify(source: Source, target: Path) -> None:
+    actual = sha256_file(target)
+    if not source.expected_sha256:
+        print(f"computed sha256 for {source.key} ({target.name}):")
+        print(f'  expected_sha256: "{actual}"')
+        raise FetchError(
+            f"{source.key} is not pinned. Check the file came from the right place, then paste "
+            f"the hash above into {DEFAULT_SOURCES} and rerun."
+        )
+    if actual != source.expected_sha256:
+        raise FetchError(
+            f"SHA-256 mismatch for {target}\n"
+            f"  expected: {source.expected_sha256}\n"
+            f"  actual:   {actual}\n"
+            "The file is corrupt or the source changed. Delete it and rerun, "
+            "or update expected_sha256 if the change is intended."
+        )
+    print(f"sha256 ok: {source.key} {actual}", file=sys.stderr)
+
+
+def fetch_file(source: Source, url: str, target: Path, *, manual_fallback: bool) -> None:
+    """Make sure target exists and matches source's hash, then unzip it next to itself."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        print(f"{target} exists, verifying hash", file=sys.stderr)
+    elif source.manual:
+        raise _manual_steps(source, url, target, "file not found")
+    else:
+        print(f"fetching {url}", file=sys.stderr)
+        try:
+            download(url, target)
+        except (FetchError, httpx.HTTPError) as exc:
+            if not manual_fallback:
+                raise
+            raise _manual_steps(source, url, target, f"download failed ({exc})") from exc
+
+    verify(source, target)
+    if zipfile.is_zipfile(target):
+        unzip(target, target.parent)
+
+
+def check_members(source: Source, root: Path) -> None:
+    missing = [m for m in source.members if next(root.rglob(m), None) is None]
+    if missing:
+        raise FetchError(
+            f"{source.key}: {', '.join(missing)} not found under {root} after unzip. "
+            "The archive layout differs from sources.yaml 'members'."
+        )
+
+
 def fetch(source: Source, day: str | None, dest: Path) -> None:
+    """Fetch a source straight into dest (the AIS day)."""
+    if source.archive:
+        raise ConfigError(f"source {source.key!r} ships inside {source.archive!r}; use --incoming")
     if "{day}" in source.url:
         if day is None:
             raise ConfigError(f"source {source.key!r} needs --day")
@@ -176,37 +338,31 @@ def fetch(source: Source, day: str | None, dest: Path) -> None:
                 f"expected_sha256 for {source.key!r} is for day {source.version}, not {day}. "
                 "Fetch the pinned day, or update version and clear expected_sha256."
             )
-        url = source.url.format(day=day)
+    url = _fill(source.url, day=day or "")
+    name = _fill(source.file, day=day or "") or PurePosixPath(httpx.URL(url).path).name
+    fetch_file(source, url, dest / name, manual_fallback=False)
+    check_members(source, dest)
+
+
+def fetch_incoming(sources_path: Path, source: Source, incoming: Path, seen: dict[str, bool]) -> None:
+    """Fetch a source into <incoming>/<download key>/<version>/.
+
+    seen maps download keys already handled in this run to whether they succeeded, so
+    layers sharing one archive check it once and report its failure once.
+    """
+    dl = download_source(sources_path, source)
+    version = resolve_version(dl)
+    url = _fill(dl.url, version=version)
+    name = _fill(dl.file, version=version) or PurePosixPath(httpx.URL(url).path).name
+    target_dir = incoming / dl.key / version
+    if dl.key in seen:
+        if not seen[dl.key]:
+            raise FetchError(f"{source.key}: ships in the {dl.key} download, which failed above")
     else:
-        url = source.url
-
-    dest.mkdir(parents=True, exist_ok=True)
-    target = dest / PurePosixPath(httpx.URL(url).path).name
-
-    if target.exists():
-        print(f"{target} exists, verifying hash", file=sys.stderr)
-    else:
-        print(f"fetching {url}", file=sys.stderr)
-        download(url, target)
-
-    actual = sha256_file(target)
-    if not source.expected_sha256:
-        print(f"computed sha256 for {source.key} ({target.name}):")
-        print(f"  expected_sha256: \"{actual}\"")
-        print(f"paste it into {DEFAULT_SOURCES} to pin this file", file=sys.stderr)
-    elif actual != source.expected_sha256:
-        raise FetchError(
-            f"SHA-256 mismatch for {target}\n"
-            f"  expected: {source.expected_sha256}\n"
-            f"  actual:   {actual}\n"
-            "The file is corrupt or the source changed. Delete it and rerun, "
-            "or update expected_sha256 if the change is intended."
-        )
-    else:
-        print(f"sha256 ok: {actual}", file=sys.stderr)
-
-    if zipfile.is_zipfile(target):
-        unzip(target, dest)
+        seen[dl.key] = False
+        fetch_file(dl, url, target_dir / name, manual_fallback=True)
+        seen[dl.key] = True
+    check_members(source, target_dir)
 
 
 def parse_day(value: str) -> str:
@@ -218,22 +374,34 @@ def parse_day(value: str) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--source", required=True, help="key in sources.yaml, e.g. dma_ais")
+    parser.add_argument(
+        "--source", action="append", required=True, help="key in sources.yaml, e.g. dma_ais (repeatable)"
+    )
     parser.add_argument("--day", type=parse_day, help="YYYY-MM-DD, for sources with {day} in the url")
-    parser.add_argument("--dest", type=Path, required=True, help="output directory")
+    where = parser.add_mutually_exclusive_group(required=True)
+    where.add_argument("--dest", type=Path, help="output directory")
+    where.add_argument("--incoming", type=Path, help="root of per-source <name>/<version>/ directories")
     parser.add_argument("--sources", type=Path, default=DEFAULT_SOURCES, help="path to sources.yaml")
     args = parser.parse_args(argv)
 
-    try:
-        source = load_source(args.sources, args.source)
-        fetch(source, args.day, args.dest)
-    except ConfigError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    except (FetchError, httpx.HTTPError, zipfile.BadZipFile) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-    return 0
+    status = 0
+    seen: dict[str, bool] = {}
+    for key in args.source:
+        try:
+            source = load_source(args.sources, key)
+            if args.incoming is not None:
+                fetch_incoming(args.sources, source, args.incoming, seen)
+            else:
+                fetch(source, args.day, args.dest)
+        except ConfigError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            status = max(status, 2)
+        except (FetchError, httpx.HTTPError, zipfile.BadZipFile) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            status = max(status, 1)
+        else:
+            print(f"ok: {key}", file=sys.stderr)
+    return status
 
 
 if __name__ == "__main__":
