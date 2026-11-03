@@ -1,6 +1,7 @@
 """Check that the Flink enrichment job accounted for every message of one replay run.
 
-    uv run python -m reconcile.flink_check <run_id> [--wait 60]   # or: make flink-check RUN=<run_id>
+Used by the reconciliation job (reconcile/job.py, make reconcile-run RUN=<run_id>) as its
+flink_balance and zone_tagged checks; read_topic is shared by the other reconcile tools.
 
 For each ais.raw partition p in data/runs/<run_id>/produced.json, over its offset range
 [first_offset, last_offset]:
@@ -18,15 +19,11 @@ record means that buffer leaked.
 
 All three topics are read with isolation.level=read_committed, so only output of completed
 Flink checkpoints counts, starting at the run's start time (offsets_for_times) minus a minute.
-
-Exit codes: 0 every partition balances, 1 a mismatch, 2 the run cannot be checked.
 """
 
 from __future__ import annotations
 
-import argparse
 import json
-import sys
 import time
 import uuid
 from collections import Counter
@@ -38,8 +35,7 @@ from typing import Any
 
 from confluent_kafka import OFFSET_END, Consumer, KafkaError, KafkaException, TopicPartition
 
-from common.env import REPO_ROOT, setting
-from reconcile.run_check import Produced, RunError, load_produced
+from reconcile.run_check import Produced, RunError
 
 ENRICHED = "ais.enriched"
 DLQ = "ais.dlq"
@@ -58,6 +54,7 @@ class Tally:
     repeated: int = 0  # offsets seen a second time, in either output topic
     foreign: int = 0  # records in the range whose run_id is another run
     untagged: int = 0  # enriched records without zone tags
+    reasons: Counter[str] = field(default_factory=Counter)  # DLQ reason codes
     seen: bytearray = field(default_factory=bytearray, repr=False)  # one bit per offset
 
     def __post_init__(self) -> None:
@@ -131,6 +128,7 @@ def tally(
     for rec in dlq:
         if (t := place(rec)) is not None:
             t.dlq += 1
+            t.reasons[str(rec.get("reason"))] += 1
             reasons[str(rec.get("reason"))] += 1
     for rec in counts:
         if rec.get("run_id") == run_id and (t := by_partition.get(rec.get("src_partition", -1))) is not None:
@@ -184,68 +182,3 @@ def read_topic(brokers: str, topic: str, since_ms: int, timeout_s: float = 120.0
 def run_started_ms(path: Path) -> int:
     doc: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
     return int(datetime.fromisoformat(doc["started_at"]).timestamp() * 1000)
-
-
-def render(run_id: str, tallies: list[Tally], reasons: Counter[str]) -> str:
-    head = (f"{'partition':>9} {'first':>9} {'last':>9} {'raw':>8} {'enriched':>8} {'dlq':>6} "
-            f"{'dups':>6} {'twice':>6} {'foreign':>7} {'untagged':>8}  status")
-    lines = [f"run {run_id}  (raw = enriched + dlq + dups)", head, "-" * len(head)]
-    for t in tallies:
-        p = t.produced
-        lines.append(
-            f"{p.partition:>9} {p.first_offset:>9} {p.last_offset:>9} {p.count:>8} {t.enriched:>8} {t.dlq:>6} "
-            f"{t.duplicates:>6} {t.repeated:>6} {t.foreign:>7} {t.untagged:>8}  {'OK' if t.ok else 'MISMATCH: ' + t.note}"
-        )
-    lines.append("-" * len(head))
-    lines.append(
-        f"{'total':>9} {'':>9} {'':>9} {sum(t.produced.count for t in tallies):>8} "
-        f"{sum(t.enriched for t in tallies):>8} {sum(t.dlq for t in tallies):>6} "
-        f"{sum(t.duplicates for t in tallies):>6} {sum(t.repeated for t in tallies):>6} "
-        f"{sum(t.foreign for t in tallies):>7} {sum(t.untagged for t in tallies):>8}"
-    )
-    if reasons:
-        lines.append("dlq reasons: " + ", ".join(f"{r} {n}" for r, n in reasons.most_common()))
-    return "\n".join(lines)
-
-
-def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(prog="flink_check", description=__doc__.splitlines()[0])
-    ap.add_argument("run_id")
-    ap.add_argument("--runs-dir", type=Path, default=REPO_ROOT / "data" / "runs")
-    ap.add_argument("--wait", type=float, default=0.0,
-                    help="seconds to keep re-checking while records are only missing (job catching up)")
-    args = ap.parse_args(argv)
-
-    path = args.runs_dir / args.run_id / "produced.json"
-    brokers = setting("REDPANDA_BROKERS", "localhost:19092")
-    try:
-        produced = load_produced(path, args.run_id)
-        since = run_started_ms(path) - SEEK_MARGIN_MS
-        deadline = time.monotonic() + args.wait
-        while True:
-            tallies, reasons = tally(
-                args.run_id, produced,
-                read_topic(brokers, ENRICHED, since), read_topic(brokers, DLQ, since), read_topic(brokers, COUNTS, since),
-            )
-            catching_up = all(
-                t.accounted <= t.produced.count and not t.repeated and not t.foreign and not t.untagged for t in tallies
-            )
-            if all(t.ok for t in tallies) or not catching_up or time.monotonic() >= deadline:
-                break
-            time.sleep(2.0)
-    except RunError as e:
-        print(f"flink_check: {e}", file=sys.stderr)
-        return 2
-    print(render(args.run_id, tallies, reasons))
-    if all(t.ok for t in tallies):
-        print(
-            f"flink_check: OK, {sum(t.produced.count for t in tallies)} raw = enriched + dlq + dups,"
-            " no offset twice, every enriched record zone-tagged"
-        )
-        return 0
-    print("flink_check: MISMATCH", file=sys.stderr)
-    return 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())

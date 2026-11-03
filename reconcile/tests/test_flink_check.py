@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from reconcile.flink_check import Tally, render, tally
+from reconcile.flink_check import Tally, tally
 from reconcile.run_check import Produced
 
 RUN = "20261103T172423Z-8b1198"
@@ -71,11 +71,12 @@ def test_bitmap_covers_the_last_offset() -> None:
     assert not t.mark(7)
 
 
-def test_render_shows_status_and_reasons() -> None:
-    tallies, reasons = tally(RUN, PRODUCED[1:], [rec(3, 50)], [rec(3, 51, reason="bad_mmsi")], [count(3, 1)])
-    out = render(RUN, tallies, reasons)
-    assert "OK" in out
-    assert "dlq reasons: bad_mmsi 1" in out
+def test_dlq_reasons_are_counted_per_partition() -> None:
+    dlq = [rec(0, 106, reason="null_island"), rec(0, 107, reason="bad_mmsi"), rec(3, 51, reason="bad_mmsi")]
+    tallies, reasons = tally(RUN, PRODUCED, [], dlq, [])
+    assert tallies[0].reasons == {"null_island": 1, "bad_mmsi": 1}
+    assert tallies[1].reasons == {"bad_mmsi": 1}
+    assert reasons == {"null_island": 1, "bad_mmsi": 2}
 
 
 def test_enriched_record_without_zone_tags_fails() -> None:

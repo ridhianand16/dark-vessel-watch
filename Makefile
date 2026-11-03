@@ -1,6 +1,6 @@
 COMPOSE := docker compose -f deploy/compose/docker-compose.yml --env-file .env
 
-.PHONY: hooks up down nuke topics ps console fetch fetch-refdata area refdata refdata-image refdata-key refdata-build refdata-verify refdata-load replay migrate migrate-postgis sink sink-logs tracks-alerts-sink tracks-alerts-sink-logs vessels-sink vessels-sink-logs tracker tracker-logs reconcile score flink-up flink-savepoint flink-restart flink-logs flink-check compare-tracks latency backfill-rollups ttl-demo test test-py test-flink typecheck
+.PHONY: hooks up down nuke topics ps console fetch fetch-refdata area refdata refdata-image refdata-key refdata-build refdata-verify refdata-load replay migrate migrate-postgis sink sink-logs tracks-alerts-sink tracks-alerts-sink-logs vessels-sink vessels-sink-logs tracker tracker-logs reconcile-run score flink-up flink-savepoint flink-restart flink-logs compare-tracks latency backfill-rollups ttl-demo test test-py test-flink typecheck
 
 .env:
 	@echo "Missing .env. Run: cp .env.example .env" >&2; exit 1
@@ -152,12 +152,17 @@ ttl-demo: .env
 migrate-postgis: .env
 	uv run python -m sql.migrate --target postgis
 
-## Check one replay run against ClickHouse, per partition. Waits up to WAIT seconds
-## while rows are only missing (sink catching up). make reconcile RUN=<run_id>
+## Reconcile one replay run end to end, per ais.raw partition: waits for the replay to
+## complete and every consumer group to pass the run, then checks produced = ais_raw FINAL,
+## raw = enriched + dlq + dups, every enriched record zone-tagged, rollups = tracks, the
+## DLQ share and latency. Writes dvw.reconciliation; exits 1 on any failed check.
+## make reconcile-run RUN=<run_id> [TIMEOUT=600] [BASELINE=<run_id of the same rows>]
+TIMEOUT ?= 600
+reconcile-run: .env
+	@test -n "$(RUN)" || { echo "usage: make reconcile-run RUN=<run_id>  (see data/runs/)" >&2; exit 2; }
+	uv run python -m reconcile.job $(RUN) --timeout $(TIMEOUT) $(if $(BASELINE),--baseline $(BASELINE))
+
 WAIT ?= 30
-reconcile: .env
-	@test -n "$(RUN)" || { echo "usage: make reconcile RUN=<run_id>  (see data/runs/)" >&2; exit 2; }
-	uv run python -m reconcile.run_check $(RUN) --wait $(WAIT)
 
 ## Score a --inject run's alerts against its labels: TP/FP/FN per alert type. Waits up
 ## to WAIT seconds for the tracker and alerts sink to finish the run. make score RUN=<run_id>
@@ -201,13 +206,6 @@ flink-restart: .env
 
 flink-logs: .env
 	$(COMPOSE) logs -f flink-jobmanager flink-taskmanager
-
-## Check one replay run through Flink, per partition: raw = enriched + dlq + dedup counts,
-## and no raw offset written twice. Waits up to WAIT seconds while records are only missing.
-## make flink-check RUN=<run_id>
-flink-check: .env
-	@test -n "$(RUN)" || { echo "usage: make flink-check RUN=<run_id>  (see data/runs/)" >&2; exit 2; }
-	uv run python -m reconcile.flink_check $(RUN) --wait $(WAIT)
 
 ## Recompute the zone tags of a sample of one run's ais.enriched records in PostGIS
 ## (geography distances on the 4326 tables) and report differences. make zone-check RUN=<run_id>

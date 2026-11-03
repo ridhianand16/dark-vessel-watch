@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from reconcile.run_check import Produced, RunError, Stored, compare, load_produced, render
+from reconcile.run_check import Produced, RunError, Stored, compare, load_produced
 
 RUN = "20261102T132701Z-6cdc0c"
 
@@ -45,7 +45,6 @@ def test_compare_all_match() -> None:
     stored = {0: Stored(10, 0, 10), 1: Stored(3, 0, 6)}  # duplicates not merged yet: still OK
     results = compare(produced, stored)
     assert all(r.ok for r in results)
-    assert "OK" in render(RUN, results)
 
 
 def test_compare_flags_missing_partition_and_rows() -> None:
