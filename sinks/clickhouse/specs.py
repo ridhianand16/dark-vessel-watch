@@ -30,9 +30,10 @@ SPECS: dict[str, SinkSpec] = {
             table="dvw.alerts",
             columns=alerts.COLUMNS,
             to_row=alerts.to_row,
-            # Alerts are few and count against the 2 s end-to-end budget: a lone alert
-            # waits at most max_wait_s for company before it is inserted.
-            settings=BatchSettings(max_rows=10_000, max_wait_s=0.25),
+            # Alerts are few and count against the 5 s p99 end-to-end budget, of which
+            # the Flink job's 3 s checkpoints take most (ADR 0014): a lone alert waits
+            # at most max_wait_s for company before it is inserted.
+            settings=BatchSettings(max_rows=10_000, max_wait_s=0.2),
         ),
     )
 }
