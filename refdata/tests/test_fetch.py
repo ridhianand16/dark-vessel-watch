@@ -24,27 +24,19 @@ def write_sources(path: Path, eez_sha: str, wdpa_sha: str = "") -> Path:
         f"""
 sources:
   eez:
-    name: EEZ polygons
-    url: ""
+    name: EEZ polygons and boundary lines
+    url: https://www.marineregions.org/downloads.php
     file: World_EEZ_v12.zip
-    page: https://www.marineregions.org/downloads.php
     manual: true
     version: v12
     expected_sha256: "{eez_sha}"
     licence: CC BY-NC-SA 4.0
     attribution: VLIZ
-    members: [eez_v12.gpkg]
-  eez_boundaries:
-    name: EEZ boundary lines
-    archive: eez
-    version: v12
-    licence: CC BY-NC-SA 4.0
-    attribution: VLIZ
-    members: [eez_boundaries_v12.gpkg]
+    members: [eez_v12.gpkg, eez_boundaries_v12.gpkg]
   wdpa_marine:
     name: WDPA marine
-    url: https://example.invalid/WDPA_{{version}}_marine.zip
-    page: https://www.protectedplanet.net/
+    url: https://www.protectedplanet.net/
+    file: WDPA_{{version}}_marine.zip
     manual: true
     version: Nov2026
     version_env: DVW_TEST_WDPA_VERSION
@@ -78,7 +70,7 @@ def test_manual_file_in_place_verifies_unzips_and_finds_members(tmp_path: Path) 
     archive = incoming / "eez" / "v12" / "World_EEZ_v12.zip"
     sha = make_zip(archive, {"World_EEZ_v12/eez_v12.gpkg": b"p", "World_EEZ_v12/eez_boundaries_v12.gpkg": b"l"})
     sources = write_sources(tmp_path / "sources.yaml", sha)
-    assert run(sources, incoming, "eez", "eez_boundaries") == 0
+    assert run(sources, incoming, "eez") == 0
     assert (archive.parent / "World_EEZ_v12" / "eez_boundaries_v12.gpkg").read_bytes() == b"l"
 
 
@@ -98,7 +90,7 @@ def test_member_missing_from_archive_fails(tmp_path: Path, capsys: pytest.Captur
     incoming = tmp_path / "incoming"
     sha = make_zip(incoming / "eez" / "v12" / "World_EEZ_v12.zip", {"eez_v12.gpkg": b"p"})
     sources = write_sources(tmp_path / "sources.yaml", sha)
-    assert run(sources, incoming, "eez_boundaries") == 1
+    assert run(sources, incoming, "eez") == 1
     assert "eez_boundaries_v12.gpkg not found" in capsys.readouterr().err
 
 
@@ -118,7 +110,7 @@ def test_every_source_is_attempted(tmp_path: Path, capsys: pytest.CaptureFixture
     err = capsys.readouterr().err
     assert "eez: file not found" in err
     assert "wdpa_marine: file not found" in err
-    assert "https://example.invalid/WDPA_Nov2026_marine.zip" in err
+    assert str(tmp_path / "incoming" / "wdpa_marine" / "Nov2026" / "WDPA_Nov2026_marine.zip") in err
 
 
 def test_version_env_must_match_pinned_version(
@@ -140,15 +132,19 @@ def test_version_env_picks_the_directory_while_unpinned(
 
 
 def test_real_sources_yaml_parses() -> None:
-    from refdata.fetch import DEFAULT_SOURCES, _entries, _parse, download_source
+    from refdata.fetch import DEFAULT_SOURCES, _entries, _parse
 
-    for key, entry in _entries(DEFAULT_SOURCES).items():
-        download_source(DEFAULT_SOURCES, _parse(key, entry, DEFAULT_SOURCES))
+    sources = [_parse(key, entry, DEFAULT_SOURCES) for key, entry in _entries(DEFAULT_SOURCES).items()]
+    assert all(s.expected_sha256 for s in sources), "every source must be pinned"
 
 
-def test_shared_archive_failure_is_reported_once(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    sources = write_sources(tmp_path / "sources.yaml", SHA_OF_EMPTY)
-    assert run(sources, tmp_path / "incoming", "eez", "eez_boundaries") == 1
-    err = capsys.readouterr().err
-    assert err.count("file not found") == 1
-    assert "eez_boundaries: ships in the eez download, which failed above" in err
+
+def test_manual_source_needs_a_file_name(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    sources = tmp_path / "sources.yaml"
+    sources.write_text(
+        "sources:\n  wpi:\n    name: WPI\n    url: https://example.invalid/\n    version: v1\n"
+        "    manual: true\n    expected_sha256: ''\n    licence: pd\n    attribution: NGA\n",
+        encoding="utf-8",
+    )
+    assert run(sources, tmp_path / "incoming", "wpi") == 2
+    assert "needs 'file'" in capsys.readouterr().err

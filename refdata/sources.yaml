@@ -1,34 +1,31 @@
-# Data sources fetched by refdata/fetch.py (make fetch, make fetch-refdata).
+# Data sources fetched by refdata/fetch.py (python -m refdata.fetch).
 #
 # Fields:
 #   name             human-readable name
-#   url              direct download URL; {day} / {version} are filled in. Empty when
-#                    there is no stable URL (the file is placed by hand).
-#   file             name of the downloaded file. Default: last segment of the url path.
-#   page             human download page, printed when the file must be fetched by hand
-#   manual           true: never downloaded. The file must be placed in
-#                    data/refdata/incoming/<key>/<version>/<file>; fetch verifies it.
-#   version          source release. For daily data, the pinned day the hash belongs to.
-#   version_env      .env key that selects the version; must equal `version` while a
-#                    hash is pinned
-#   expected_sha256  SHA-256 of the downloaded bytes. Empty: fetch prints the computed
+#   url              download URL ({day} is replaced with YYYY-MM-DD). For manual
+#                    sources, the page where a person downloads the file.
+#   version          source version; the hash belongs to this version
+#   version_env      .env key that must equal `version` while a hash is pinned
+#   manual           true: never downloaded by the script. fetch.py looks for `file`
+#                    in data/refdata/incoming/<key>/<version>/, verifies the hash,
+#                    and if it is missing prints where to get it and exits non-zero.
+#   file             expected file name (manual sources)
+#   members          files or directories that must exist after unzip, so a wrong
+#                    archive fails at fetch rather than at build
+#   expected_sha256  SHA-256 of the file's bytes. Empty: fetch.py prints the computed
 #                    hash and fails until it is committed here.
-#   archive          key of the source whose download contains this one (same file,
-#                    same hash); used for layers that ship in one zip
-#   members          file names that must exist in the unzipped download
 #   licence          licence / terms of use
-#   attribution      required attribution text (also in README "Attribution")
+#   attribution      required attribution text
 #
-# The reference layers are licensed against redistribution (WDPA) or for
-# non-commercial share-alike use (Marine Regions). The repo pins their hashes;
-# the files themselves never go into the repo or a release.
+# `make fetch` handles dma_ais; `make fetch-refdata` handles the reference sources.
+# Nothing counts as fetched until its hash is pinned.
 
 sources:
   dma_ais:
     name: Danish AIS daily CSV (DMA, operated by Danish Emergency Management Agency)
     # Index: http://aisdata.ais.dk (S3 website endpoint, HTTP only).
     # Days from 2025-02-27 onward sit at the bucket root as aisdk-YYYY-MM-DD.zip;
-    # older days are archived under YYYY/ and would need a different template.
+    # older days are archived under YYYY/ and need a different template.
     # Path-style S3 URL used for HTTPS (the website endpoint resets TLS).
     url: https://s3.eu-central-1.amazonaws.com/aisdata.ais.dk/aisdk-{day}.zip
     version: "2026-10-28"
@@ -40,66 +37,54 @@ sources:
     attribution: Contains AIS data from the Danish Maritime Authority.
 
   eez:
-    name: Marine Regions World EEZ v12, polygons (versioned static release)
-    # Downloads sit behind a form (name, organisation, purpose), so there is no
-    # stable URL. Pick "World EEZ v12", GeoPackage. The zip carries both the
-    # polygons and the boundary lines (eez_boundaries below).
-    url: ""
-    page: https://www.marineregions.org/downloads.php
-    file: World_EEZ_v12_20231025_gpkg.zip
+    name: Marine Regions World EEZ v12 (polygons and boundary lines, GeoPackage)
+    # Behind a request form at marineregions.org/downloads.php. The zip holds both
+    # the EEZ polygons and the boundary lines; the package builder reads both.
+    url: https://www.marineregions.org/downloads.php
+    version: "v12"
     manual: true
-    version: v12
-    expected_sha256: ""
-    members: [eez_v12.gpkg]
-    licence: CC BY-NC-SA 4.0
+    file: World_EEZ_v12_20231025_gpkg.zip
+    members: [eez_v12.gpkg, eez_boundaries_v12.gpkg]
+    expected_sha256: "9215ee0ae641aa20b5f7aa700288656d2380d151fd733ba566fba3318de4a415"
+    licence: CC BY-NC-SA 4.0 (non-commercial use, share alike, attribution)
     attribution: >-
-      Flanders Marine Institute (2023). Maritime Boundaries Geodatabase: Maritime
-      Boundaries and Exclusive Economic Zones (200NM), version 12.
-      https://doi.org/10.14284/632
-
-  eez_boundaries:
-    name: Marine Regions World EEZ v12, boundary lines
-    # Same download as eez. DARK_GAP distances are measured to these lines, never
-    # to the edges of clipped polygons.
-    archive: eez
-    version: v12
-    members: [eez_boundaries_v12.gpkg]
-    licence: CC BY-NC-SA 4.0
-    attribution: >-
-      Flanders Marine Institute (2023). Maritime Boundaries Geodatabase: Maritime
-      Boundaries and Exclusive Economic Zones (200NM), version 12.
-      https://doi.org/10.14284/632
+      Flanders Marine Institute (2023). Maritime Boundaries Geodatabase:
+      Maritime Boundaries and Exclusive Economic Zones (200NM), version 12.
+      Available online at https://www.marineregions.org/.
 
   wdpa_marine:
-    name: World Database on Protected Areas, marine subset (Protected Planet)
-    # Monthly release on a moving URL: last month's file is removed (404) when the
-    # next one appears. The link below is the pattern seen for Nov2026; download it
-    # from the page after accepting the terms. The zip holds shapefiles split
-    # into parts. Set WDPA_VERSION in .env to the same value as `version`.
-    url: https://d1gam3xoknrgr2.cloudfront.net/current/WDPA_WDOECM_{version}_Public_marine_shp.zip
-    page: https://www.protectedplanet.net/en/thematic-areas/marine-protected-areas
-    manual: true
-    version: Nov2026
+    name: World Database on Protected Areas, marine subset (File Geodatabase)
+    # Monthly release; the previous month disappears (404) once a new one is out,
+    # so the downloaded file in incoming/ is the only copy of this version.
+    # Accept the terms at protectedplanet.net before downloading. This is the
+    # File Geodatabase release (one .gdb, read by GDAL's OpenFileGDB driver), not
+    # the shapefile release, which is split into parts.
+    url: https://www.protectedplanet.net/en/thematic-areas/marine-protected-areas
+    version: "Nov2026"
     version_env: WDPA_VERSION
-    expected_sha256: ""
+    manual: true
+    file: WDPA_WDOECM_Nov2026_Public_marine.zip
+    members: [WDPA_WDOECM_Nov2026_Public_marine.gdb]
+    expected_sha256: "8b49635f26dea88ccaf9d8cf762470f0fc7cab5de5f5ad1c1a08e1cbaf29c8ec"
     licence: >-
-      Protected Planet terms of use: non-commercial use, no redistribution of the
-      data or derived works without UNEP-WCMC permission.
+      WDPA terms of use: non-commercial use only, no redistribution or
+      sub-licensing of the data or derived works.
     attribution: >-
-      UNEP-WCMC and IUCN (2026), Protected Planet: The World Database on Protected
-      Areas (WDPA) and World Database on Other Effective Area-based Conservation
-      Measures (WD-OECM), November 2026, Cambridge, UK. www.protectedplanet.net
+      UNEP-WCMC and IUCN (2026), Protected Planet: The World Database on
+      Protected Areas (WDPA), November 2026, Cambridge, UK: UNEP-WCMC and IUCN.
+      Available at: www.protectedplanet.net.
 
   wpi:
-    name: World Port Index (NGA Pub 150), CSV
-    # NGA does not version the CSV; `version` is the day the pinned bytes were
-    # downloaded. msi.nga.mil answers scripted clients with HTTP 503 (bot check),
-    # in which case fetch prints the manual steps: download from the page, save
-    # under the printed path.
-    url: https://msi.nga.mil/api/publications/download?key=16694622/SFH00000/UpdatedPub150.csv&type=download
-    page: https://msi.nga.mil/Publications/WPI
-    file: UpdatedPub150.csv
-    version: "2026-11-03"
-    expected_sha256: ""
-    licence: US Government work, public domain.
-    attribution: National Geospatial-Intelligence Agency, World Port Index (Pub. 150).
+    name: World Port Index (Pub 150), mirror of the NGA release
+    # NGA's site (msi.nga.mil) refuses scripted and some manual downloads, so this
+    # is a mirror of the official public-domain release. The pinned hash fixes the
+    # exact copy used. GeoJSON, EPSG:4326, 3,669 port points.
+    url: https://data.harvestportal.org/dataset/world-ports-index
+    version: "2019-mirror-harvest"
+    manual: true
+    file: ports_of_the_world_wpi.geojson
+    expected_sha256: "7ae5a402ddf9f048abc747f69e564c6803bd7ffba7085502f30c22800a91bbff"
+    licence: US Government work, public domain (original); CC BY on the mirror
+    attribution: >-
+      National Geospatial-Intelligence Agency, World Port Index (Pub 150);
+      obtained via NASA Harvest Portal.

@@ -3,7 +3,7 @@
 Usage:
     uv run python -m refdata.fetch --source dma_ais --day 2026-10-28 --dest data/ais
     uv run python -m refdata.fetch --incoming data/refdata/incoming \\
-        --source eez --source eez_boundaries --source wdpa_marine --source wpi
+        --source eez --source wdpa_marine --source wpi
 
 Behaviour:
     * Streams to <file>.part and resumes it with an HTTP Range request if present.
@@ -13,10 +13,11 @@ Behaviour:
       exits 1. Nothing unpinned counts as fetched.
     * Hash mismatch: exits 1 without unzipping.
     * Unzips only after the hash check, then checks the source's expected members.
-    * With --incoming, each source lives in <incoming>/<download>/<version>/.
-      A `manual: true` source is never downloaded: the file must already be there.
-      If it is missing, or a non-manual download fails, fetch prints where to get
-      the file and where to put it.
+    * With --incoming, each source lives in <incoming>/<key>/<version>/<file>.
+      A `manual: true` source is never downloaded: its url is the page a person
+      downloads it from, and the file must already be there. If it is missing, or a
+      non-manual download fails, fetch prints where to get the file and where to
+      put it.
     * Every requested source is attempted, so one run reports everything missing.
 
 Exit codes: 0 ok, 1 hash mismatch, download failure or manual step needed,
@@ -61,26 +62,22 @@ class Source:
     key: str
     name: str
     url: str
-    """Direct download URL. May contain {day} or {version}. Empty for manual-only sources."""
+    """Download URL (may contain {day}), or for a manual source the page to download it from."""
     version: str
     expected_sha256: str
     licence: str
     attribution: str
     file: str = ""
-    """Name of the downloaded file. Defaults to the last segment of the URL path."""
-    page: str = ""
-    """Human download page, printed when the file has to be fetched by hand."""
+    """Name of the file. Required for manual sources; otherwise the last URL path segment."""
     manual: bool = False
     version_env: str = ""
     """Environment / .env key that selects the version (e.g. WDPA_VERSION)."""
     members: tuple[str, ...] = ()
-    """File names that must exist anywhere under the unzipped archive."""
-    archive: str = ""
-    """Key of the source whose download contains this one (url, file, hash come from it)."""
+    """File or directory names that must exist anywhere under the unzipped archive."""
 
 
-_STR_FIELDS = ("name", "url", "version", "expected_sha256", "licence", "attribution", "file", "page", "version_env")
-_REQUIRED = ("name", "version", "licence", "attribution")
+_STR_FIELDS = ("name", "url", "version", "expected_sha256", "licence", "attribution", "file", "version_env")
+_REQUIRED = ("name", "url", "version", "licence", "attribution")
 
 
 def _entries(path: Path) -> dict[str, Any]:
@@ -106,20 +103,15 @@ def _parse(key: str, entry: Any, path: Path) -> Source:
     members = entry.get("members", [])
     if not isinstance(members, list) or not all(isinstance(m, str) and m for m in members):
         raise ConfigError(f"source {key!r}: 'members' must be a list of file names")
-    archive = entry.get("archive", "")
-    if not isinstance(archive, str):
-        raise ConfigError(f"source {key!r}: 'archive' must be a source key")
     sha = values["expected_sha256"].lower()
     if sha and (len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha)):
         raise ConfigError(f"source {key!r}: expected_sha256 is not a hex SHA-256")
     values["expected_sha256"] = sha
-    if not archive and not values["url"] and not manual:
-        raise ConfigError(f"source {key!r} has no url and is not manual")
-    if not archive and not values["url"] and not values["file"]:
-        raise ConfigError(f"source {key!r} needs 'file' when it has no url")
-    if manual and not values["page"] and not values["url"]:
-        raise ConfigError(f"manual source {key!r} needs a 'page' or 'url' to point people to")
-    return Source(key=key, manual=manual, members=tuple(members), archive=archive, **values)
+    if not values["url"]:
+        raise ConfigError(f"source {key!r} has no url")
+    if manual and not values["file"]:
+        raise ConfigError(f"manual source {key!r} needs 'file': the name exactly as downloaded")
+    return Source(key=key, manual=manual, members=tuple(members), **values)
 
 
 def load_source(path: Path, key: str) -> Source:
@@ -127,21 +119,6 @@ def load_source(path: Path, key: str) -> Source:
     if key not in sources:
         raise ConfigError(f"source {key!r} not found in {path}")
     return _parse(key, sources[key], path)
-
-
-def download_source(path: Path, source: Source) -> Source:
-    """The source whose file is actually downloaded: itself, or the archive it ships in."""
-    if not source.archive:
-        return source
-    parent = load_source(path, source.archive)
-    if parent.archive:
-        raise ConfigError(f"source {source.key!r}: archive {parent.key!r} is itself inside an archive")
-    if parent.version != source.version:
-        raise ConfigError(
-            f"source {source.key!r} is version {source.version} but its archive "
-            f"{parent.key!r} is {parent.version}; bump them together"
-        )
-    return parent
 
 
 def resolve_version(source: Source) -> str:
@@ -262,11 +239,7 @@ def _fill(template: str, *, day: str = "", version: str = "") -> str:
 
 
 def _manual_steps(source: Source, url: str, target: Path, reason: str) -> ManualStepNeeded:
-    lines = [f"{source.key}: {reason}. Download it by hand:"]
-    if source.page:
-        lines.append(f"    from: {source.page}")
-    if url:
-        lines.append(f"    file: {url}")
+    lines = [f"{source.key}: {reason}. Download it by hand from", f"    {url}"]
     lines.append(f"  and save it as\n    {target}")
     if target.parent.is_dir():
         present = sorted(p.name for p in target.parent.iterdir() if p.is_file() and not p.name.endswith(".part"))
@@ -328,8 +301,6 @@ def check_members(source: Source, root: Path) -> None:
 
 def fetch(source: Source, day: str | None, dest: Path) -> None:
     """Fetch a source straight into dest (the AIS day)."""
-    if source.archive:
-        raise ConfigError(f"source {source.key!r} ships inside {source.archive!r}; use --incoming")
     if "{day}" in source.url:
         if day is None:
             raise ConfigError(f"source {source.key!r} needs --day")
@@ -344,24 +315,13 @@ def fetch(source: Source, day: str | None, dest: Path) -> None:
     check_members(source, dest)
 
 
-def fetch_incoming(sources_path: Path, source: Source, incoming: Path, seen: dict[str, bool]) -> None:
-    """Fetch a source into <incoming>/<download key>/<version>/.
-
-    seen maps download keys already handled in this run to whether they succeeded, so
-    layers sharing one archive check it once and report its failure once.
-    """
-    dl = download_source(sources_path, source)
-    version = resolve_version(dl)
-    url = _fill(dl.url, version=version)
-    name = _fill(dl.file, version=version) or PurePosixPath(httpx.URL(url).path).name
-    target_dir = incoming / dl.key / version
-    if dl.key in seen:
-        if not seen[dl.key]:
-            raise FetchError(f"{source.key}: ships in the {dl.key} download, which failed above")
-    else:
-        seen[dl.key] = False
-        fetch_file(dl, url, target_dir / name, manual_fallback=True)
-        seen[dl.key] = True
+def fetch_incoming(source: Source, incoming: Path) -> None:
+    """Fetch a source into <incoming>/<key>/<version>/."""
+    version = resolve_version(source)
+    url = _fill(source.url, version=version)
+    name = _fill(source.file, version=version) or PurePosixPath(httpx.URL(url).path).name
+    target_dir = incoming / source.key / version
+    fetch_file(source, url, target_dir / name, manual_fallback=True)
     check_members(source, target_dir)
 
 
@@ -385,12 +345,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     status = 0
-    seen: dict[str, bool] = {}
     for key in args.source:
         try:
             source = load_source(args.sources, key)
             if args.incoming is not None:
-                fetch_incoming(args.sources, source, args.incoming, seen)
+                fetch_incoming(source, args.incoming)
             else:
                 fetch(source, args.day, args.dest)
         except ConfigError as exc:

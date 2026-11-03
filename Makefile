@@ -51,7 +51,7 @@ fetch: .env
 ## Verify (SHA-256) the reference layers for the zone package in
 ## REFDATA_DIR/incoming/<source>/<version>/. EEZ and WDPA are placed by hand; WPI is
 ## downloaded if possible. A missing file prints where to get it and where to put it.
-REFDATA_SOURCES := eez eez_boundaries wdpa_marine wpi
+REFDATA_SOURCES := eez wdpa_marine wpi
 fetch-refdata: .env
 	uv run python -m refdata.fetch --incoming $(REFDATA_DIR)/incoming $(addprefix --source ,$(REFDATA_SOURCES))
 
