@@ -89,7 +89,11 @@ class BatchSink(ABC, Generic[R]):
         """Store rows durably, or raise. Returns counters for the batch log line."""
 
     def request_stop(self, signum: int, _frame: FrameType | None) -> None:
-        self.log.info("signal %s: finishing the in-flight batch, then exiting", signal.Signals(signum).name)
+        self.stop(f"signal {signal.Signals(signum).name}")
+
+    def stop(self, reason: str) -> None:
+        """Make run() return after the in-flight batch is written and committed."""
+        self.log.info("%s: finishing the in-flight batch, then exiting", reason)
         self.stopping = True
 
     def run(self) -> int:
