@@ -14,10 +14,17 @@ Per alert type:
         type, or any alert on a decoy (labels with expect: null)
 Alerts on real vessels have no ground truth; they are counted separately, not scored.
 
-Scores only once the pipeline has finished the run: the tracker has committed past the
-run's last ais.raw offsets (produced.json) and the alerts sink has committed up to the
-end of ais.alerts. Stopping as soon as the expected alerts appear would miss false
-positives raised later in the run. --wait bounds how long to wait for that.
+Scores only once the pipeline has finished the run, and the alerts sink has committed
+up to the end of ais.alerts. Stopping as soon as the expected alerts appear would miss
+false positives raised later in the run. --wait bounds how long to wait for that.
+Finished depends on the tracker's input (TRACKER_INPUT_TOPIC):
+
+    ais.raw       the tracker has committed past the run's last offsets (produced.json)
+    ais.enriched  the Flink enrichment job has committed past them (its source commits
+                  offsets after each completed checkpoint, when its output is already
+                  committed), and the tracker past the run's last ais.enriched record
+
+Each DARK_GAP hit is listed with the zone tags it was raised on (details.zone).
 
 Also checks that FINAL holds each alert_id once. Exit codes: 0 no FP, no FN and no
 duplicate; 1 otherwise, or the pipeline did not finish within --wait; 2 the run
@@ -30,22 +37,26 @@ import argparse
 import json
 import sys
 import time
+import uuid
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from clickhouse_connect.driver.client import Client
-from confluent_kafka import Consumer, TopicPartition
+from confluent_kafka import OFFSET_END, Consumer, KafkaError, KafkaException, TopicPartition
 
 from common.clickhouse import client_from_env
 from common.env import REPO_ROOT, setting
+from reconcile.flink_check import SEEK_MARGIN_MS, run_started_ms
 from reconcile.run_check import RunError, load_produced
+from stream.faust_app.config import ENRICHED_TOPIC, NM_M, RAW_TOPIC
 from stream.faust_app.detect import AlertType, alert_id
 
 TABLE = "dvw.alerts"
 TYPES = tuple(t.value for t in AlertType)
 TRACKER_GROUP = "dvw-tracker"
+FLINK_GROUP = "dvw-flink-enrichment"  # EnrichmentJob.GROUP_ID
 ALERTS_SINK_GROUP = "dvw-alerts-sink"
 
 
@@ -54,6 +65,7 @@ class Stored:
     alert_id: str
     type: str
     mmsi: int | None
+    details: str = "{}"
 
 
 @dataclass
@@ -64,6 +76,7 @@ class Score:
     real: Counter[str] = field(default_factory=Counter)
     missed: list[str] = field(default_factory=list)
     unexpected: list[str] = field(default_factory=list)
+    zones: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -106,6 +119,8 @@ def score(doc: dict[str, Any], stored: list[Stored]) -> Score:
         elif a.alert_id in expected:
             s.tp[a.type] += 1
             found.add(a.alert_id)
+            if a.type == AlertType.DARK_GAP:
+                s.zones.append(f"{expected[a.alert_id]['name']}: {describe_zone(a.details)}")
         else:
             s.fp[a.type] += 1
             s.unexpected.append(f"{a.type} on {names.get(a.mmsi, a.mmsi)} ({a.alert_id})")
@@ -116,34 +131,104 @@ def score(doc: dict[str, Any], stored: list[Stored]) -> Score:
     return s
 
 
-def behind(brokers: str, raw_last: dict[int, int]) -> list[str]:
-    """What the pipeline still has to process for the run; empty when it is done.
+def describe_zone(details: str) -> str:
+    zone = json.loads(details).get("zone")
+    if not zone:
+        return "no zone tags"
 
-    raw_last is the run's last ais.raw offset per partition. Committed offsets are the
-    next offset to read, so the tracker is done with a partition once its commit is past
-    the last one. Reading a group's commits does not join the group.
-    """
-    out: list[str] = []
+    def nm(m: float | None) -> str:
+        return "-" if m is None else f"{m / NM_M:.1f} nm"
 
-    def committed(group: str, tps: list[TopicPartition]) -> list[TopicPartition]:
-        c = Consumer({"bootstrap.servers": brokers, "group.id": group, "enable.auto.commit": False})
-        try:
-            return list(c.committed(tps, timeout=10))
-        finally:
-            c.close()
+    mpas = ",".join(zone["mpa_ids"]) or "none"
+    return (f"protected area {nm(zone['dist_mpa_m'])} (inside: {mpas}), EEZ boundary "
+            f"{nm(zone['dist_eez_boundary_m'])}, in_port {zone['in_port']}, zones {zone['zones_version']}")
 
-    raw = committed(TRACKER_GROUP, [TopicPartition("ais.raw", p) for p in sorted(raw_last)])
-    for tp in raw:
-        left = raw_last[tp.partition] + 1 - max(tp.offset, 0)
+
+def committed(brokers: str, group: str, tps: list[TopicPartition]) -> list[TopicPartition]:
+    """A group's committed offsets (the next offset to read). Does not join the group."""
+    c = Consumer({"bootstrap.servers": brokers, "group.id": group, "enable.auto.commit": False})
+    try:
+        return list(c.committed(tps, timeout=10))
+    finally:
+        c.close()
+
+
+def lagging(brokers: str, group: str, topic: str, last: dict[int, int]) -> list[str]:
+    """Partitions where `group` has not committed past offset last[p]."""
+    out = []
+    for tp in committed(brokers, group, [TopicPartition(topic, p) for p in sorted(last)]):
+        left = last[tp.partition] + 1 - max(tp.offset, 0)
         if left > 0:
-            out.append(f"tracker: {left} records on ais.raw/{tp.partition}")
+            out.append(f"{group}: {left} records on {topic}/{tp.partition}")
+    return out
+
+
+def run_last_offsets(brokers: str, topic: str, run_id: str, since_ms: int) -> dict[int, int]:
+    """Offset of the run's last record per partition of `topic`, read committed from
+    since_ms to the current end. Partitions without the run's records are left out."""
+    c = Consumer({
+        "bootstrap.servers": brokers,
+        "group.id": f"dvw-score-{uuid.uuid4().hex[:8]}",  # never committed
+        "enable.auto.commit": False,
+        "isolation.level": "read_committed",
+        "enable.partition.eof": True,
+    })
+    last: dict[int, int] = {}
+    try:
+        parts = c.list_topics(topic, timeout=10).topics[topic].partitions
+        start = c.offsets_for_times([TopicPartition(topic, p, since_ms) for p in parts], timeout=10)
+        c.assign([TopicPartition(topic, tp.partition, tp.offset if tp.offset >= 0 else OFFSET_END) for tp in start])
+        remaining = set(parts)
+        while remaining:
+            msg = c.poll(1.0)
+            if msg is None:
+                continue
+            err = msg.error()
+            if err is not None:
+                if err.code() == KafkaError._PARTITION_EOF:
+                    remaining.discard(msg.partition())
+                    continue
+                raise KafkaException(err)
+            value, partition, offset = msg.value(), msg.partition(), msg.offset()
+            if value is not None and partition is not None and offset is not None:
+                if json.loads(value).get("run_id") == run_id:
+                    last[partition] = offset
+    finally:
+        c.close()
+    return last
+
+
+class Progress:
+    """Whether the tracker (and, on ais.enriched, the Flink job before it) is done with
+    the run. The run's last ais.enriched offsets are looked up once, after the Flink
+    job has finished the run: no record of it can be added after that."""
+
+    def __init__(self, brokers: str, input_topic: str, run_id: str, raw_last: dict[int, int], since_ms: int):
+        self.brokers, self.input_topic, self.run_id = brokers, input_topic, run_id
+        self.raw_last, self.since_ms = raw_last, since_ms
+        self.enriched_last: dict[int, int] | None = None
+
+    def tracker_behind(self) -> list[str]:
+        if self.input_topic == RAW_TOPIC:
+            return lagging(self.brokers, TRACKER_GROUP, RAW_TOPIC, self.raw_last)
+        if self.enriched_last is None:
+            flink = lagging(self.brokers, FLINK_GROUP, RAW_TOPIC, self.raw_last)
+            if flink:
+                return flink
+            self.enriched_last = run_last_offsets(self.brokers, ENRICHED_TOPIC, self.run_id, self.since_ms)
+        return lagging(self.brokers, TRACKER_GROUP, ENRICHED_TOPIC, self.enriched_last)
+
+
+def behind(brokers: str, progress: Progress) -> list[str]:
+    """What the pipeline still has to process for the run; empty when it is done."""
+    out = progress.tracker_behind()
     c = Consumer({"bootstrap.servers": brokers, "group.id": ALERTS_SINK_GROUP})
     try:
         meta = c.list_topics("ais.alerts", timeout=10).topics["ais.alerts"].partitions
         ends = {p: c.get_watermark_offsets(TopicPartition("ais.alerts", p), timeout=10)[1] for p in meta}
     finally:
         c.close()
-    for tp in committed(ALERTS_SINK_GROUP, [TopicPartition("ais.alerts", p) for p in sorted(ends)]):
+    for tp in committed(brokers, ALERTS_SINK_GROUP, [TopicPartition("ais.alerts", p) for p in sorted(ends)]):
         left = ends[tp.partition] - max(tp.offset, 0)
         if left > 0:
             out.append(f"alerts-sink: {left} records on ais.alerts/{tp.partition}")
@@ -154,12 +239,13 @@ def query(client: Client, run_id: str) -> tuple[list[Stored], int, int]:
     """(rows FINAL, count FINAL, distinct alert_id FINAL) for the run."""
     params = {"run": run_id}
     rows = client.query(
-        f"SELECT alert_id, type, mmsi FROM {TABLE} FINAL WHERE run_id = {{run:String}}", parameters=params
+        f"SELECT alert_id, type, mmsi, details FROM {TABLE} FINAL WHERE run_id = {{run:String}}", parameters=params
     ).result_rows
     n, distinct = client.query(
         f"SELECT count(), uniqExact(alert_id) FROM {TABLE} FINAL WHERE run_id = {{run:String}}", parameters=params
     ).result_rows[0]
-    return [Stored(str(a), str(t), None if m is None else int(m)) for a, t, m in rows], int(n), int(distinct)
+    stored = [Stored(str(a), str(t), None if m is None else int(m), str(d)) for a, t, m, d in rows]
+    return stored, int(n), int(distinct)
 
 
 def render(run_id: str, doc: dict[str, Any], s: Score, n: int, distinct: int) -> str:
@@ -175,6 +261,7 @@ def render(run_id: str, doc: dict[str, Any], s: Score, n: int, distinct: int) ->
         rec = f"{tp / (tp + fn):.2f}" if tp + fn else "-"
         lines.append(f"{t:<10} {tp:>4} {fp:>4} {fn:>4} {prec:>10} {rec:>8} {s.real[t]:>13}")
     lines.append(f"{TABLE} FINAL for this run: {n} rows, {distinct} distinct alert_id")
+    lines += [f"  DARK_GAP zone, {z}" for z in sorted(s.zones)]
     lines += [f"  missed: {m}" for m in s.missed]
     lines += [f"  unexpected: {u}" for u in s.unexpected]
     return "\n".join(lines)
@@ -191,12 +278,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         doc = load_labels(run_dir / "labels.json", args.run_id)
         raw_last = {p.partition: p.last_offset for p in load_produced(run_dir / "produced.json", args.run_id)}
+        since_ms = run_started_ms(run_dir / "produced.json") - SEEK_MARGIN_MS
     except RunError as e:
         print(f"score: {e}", file=sys.stderr)
         return 2
     brokers = setting("REDPANDA_BROKERS", "localhost:19092")
+    progress = Progress(brokers, setting("TRACKER_INPUT_TOPIC", ENRICHED_TOPIC), args.run_id, raw_last, since_ms)
     deadline = time.monotonic() + args.wait
-    while (pending := behind(brokers, raw_last)) and time.monotonic() < deadline:
+    while (pending := behind(brokers, progress)) and time.monotonic() < deadline:
         time.sleep(2.0)
     stored, n, distinct = query(client_from_env(), args.run_id)
     s = score(doc, stored)
