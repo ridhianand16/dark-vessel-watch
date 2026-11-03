@@ -1,4 +1,4 @@
-"""Faust worker: ais.raw -> per-MMSI Kalman tracks -> ais.tracks.
+"""Faust worker: ais.raw -> per-MMSI Kalman tracks -> ais.tracks, and alerts -> ais.alerts.
 
     uv run faust -A stream.faust_app.app worker -l info   # normally runs in Compose as tracker
 
@@ -17,6 +17,15 @@ behind the state are skipped as `redelivered`; records ahead of it are processed
 again and produce byte-identical messages, which sinks dedup on
 (src_partition, src_offset).
 
+Detections (ADR 0005) follow the same order. TELEPORT, and DARK_GAP for a vessel that
+reports again, come out of the batch with the tracks. DARK_GAP for vessels still
+silent comes from a scan at the end of a batch, whenever a partition's watermark
+(max event_ts per partition and run) enters a new DARK_SCAN_STEP_S step: send the
+alerts, wait for the acks, then write gap_alerted. The scan runs here and not in a
+Faust timer: a timer cannot write the table (Faust raises outside stream iteration),
+and would race with this read-send-write on the same keys. The watermark only moves
+when records arrive, so a timer between batches would see nothing new anyway.
+
 Any unexpected error stops the process at once (exit 70) without committing. Faust
 would otherwise log it, ack the batch, and carry on, which drops those records.
 """
@@ -28,7 +37,7 @@ import logging
 import os
 import weakref
 from collections import Counter
-from collections.abc import Iterator, Sequence
+from collections.abc import Awaitable, Iterator, Sequence
 from contextlib import contextmanager
 
 import faust
@@ -36,7 +45,8 @@ import faust.streams
 from faust.types import EventT
 
 from stream.faust_app import config
-from stream.faust_app.tracker import ACCEPTED, RawRecord, process_batch
+from stream.faust_app.detect import Watermarks
+from stream.faust_app.tracker import ACCEPTED, RawRecord, process_batch, scan_dark_gaps
 
 APP_ID = "dvw-tracker"
 EXIT_CRASH = 70  # EX_SOFTWARE
@@ -76,6 +86,15 @@ tracks_topic = app.topic(
     partitions=PARTITIONS,
     internal=False,
 )
+alerts_topic = app.topic(
+    "ais.alerts",
+    key_type=bytes,
+    value_type=bytes,
+    key_serializer="raw",
+    value_serializer="raw",
+    partitions=PARTITIONS,
+    internal=False,
+)
 
 # Faust's RocksDB defaults are a 2 GB block cache (+500 MB compressed) per partition
 # DB. The state here is ~0.5 kB per vessel, a few MB in total, so keep them small.
@@ -95,6 +114,7 @@ vessels = app.Table(
 )
 
 counts: Counter[str] = Counter()
+watermarks = Watermarks(cfg.detect)
 
 
 @contextmanager
@@ -121,13 +141,34 @@ async def handle(events: Sequence[EventT[bytes]]) -> None:
             blob: bytes | None = vessels.get(records[i].key)
             return blob
 
-    result = process_batch(records, load, cfg.kalman)
+    result = process_batch(records, load, cfg.kalman, cfg.detect)
     acks = [await tracks_topic.send(key=k, value=v) for k, v in result.tracks]
+    acks += [await alerts_topic.send(key=k, value=v) for k, v in result.alerts]
     await asyncio.gather(*acks)  # raises if any send failed: state must not move past it
     for i, key, blob in result.writes:
         with as_current_event(events[i]):
             vessels[key] = blob
     counts.update(result.counts)
+
+    due = watermarks.advance(result.seen.items())
+    if due:
+        await scan(events, due)
+
+
+async def scan(events: Sequence[EventT[bytes]], partitions: set[int]) -> None:
+    # Table iteration covers actively assigned partitions only (Faust's RocksDB store
+    # skips standby replicas), and scan_dark_gaps() keeps just `partitions`: those
+    # whose watermark moved, all of them in this batch.
+    result = scan_dark_gaps(vessels.items(), watermarks, partitions, cfg.kalman, cfg.detect)
+    acks: list[Awaitable[object]] = [await alerts_topic.send(key=k, value=v) for k, v in result.alerts]
+    await asyncio.gather(*acks)
+    # Writing needs a current event in the vessel's partition (see as_current_event).
+    event_in = {e.message.partition: e for e in events}
+    for partition, key, blob in result.writes:
+        with as_current_event(event_in[partition]):
+            vessels[key] = blob
+    counts["scanned"] += result.scanned
+    counts["alert_dark_gap"] += len(result.alerts)
 
 
 async def handle_or_exit(events: Sequence[EventT[bytes]]) -> None:
