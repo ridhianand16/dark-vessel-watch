@@ -24,7 +24,7 @@ A Flink job now sits on `ais.raw` as well ([Flink enrichment](#flink-enrichment)
 
 The same job tags every record with its zones: EEZ, protected areas, port, and geodesic distances to the nearest EEZ boundary and protected area. It reads the active zone package from PostGIS when it starts, and records that arrive before the zones are held back rather than tagged "no zone" ([ADR 0018](docs/adr/0018-flink-zone-tagging-read-at-startup.md)). On a 400-record sample the tags agree with PostGIS exactly, and the distances agree to within 0.5 m.
 
-The tracker now reads `ais.enriched` instead of `ais.raw`, with `read_committed`, so it only ever sees output of completed Flink checkpoints ([ADR 0019](docs/adr/0019-tracker-on-enriched-and-dark-gap-zone-condition.md)). DARK_GAP uses the zone tags: a gap counts only if the vessel was last seen within 10 nm of an EEZ boundary or a protected area, and not in port. The same 10,000 rows read through either topic give identical tracks for 1,278 of 1,279 vessels. The one exception is a report Flink's dedup drops on purpose ([Tracker on ais.enriched](#tracker-on-aisenriched)).
+The tracker now reads `ais.enriched` instead of `ais.raw`, with `read_committed`, so it only ever sees output of completed Flink checkpoints ([ADR 0019](docs/adr/0019-tracker-on-enriched-and-dark-gap-zone-condition.md)). DARK_GAP uses the zone tags: a gap counts only if the vessel was last seen within 10 nm of an EEZ boundary or a protected area, and not in port. The same 10,000 rows read through either topic gave identical tracks for 1,278 of 1,279 vessels. The one exception came from the two sides rounding positions differently when spotting repeated reports. That rule now lives in one contract file that the Java and Python tests both check ([Tracker on ais.enriched](#tracker-on-aisenriched)).
 
 Not built yet: excluding gaps at the edge of receiver coverage, and MMSI_CLASH.
 
@@ -150,7 +150,7 @@ raw(run, partition) = enriched + dlq + sum(dedup_counts.count)     over the run'
 
 **Zone tagging.** Every record in `ais.enriched` gets `eez_id`, `mpa_ids`, `in_port`, `dist_eez_boundary_m`, `dist_mpa_m` (0 inside a protected area) and `zones_version`. How the zones get there ([ADR 0018](docs/adr/0018-flink-zone-tagging-read-at-startup.md)):
 
-- *Startup gate.* `make flink-up` waits until PostGIS has an active package, and says so. I checked this by clearing the active marker: the submit sat at the gate, and `make refdata-load` released it within 5 s.
+- *Startup gate.* The job is submitted only once PostGIS has an active package. `make up` (through `make flink-up`) first loads the last built package if none is active, which is the case after `make nuke`; with no package built at all it says so and does not submit. I checked this by clearing the active marker: the submit sat at the gate, and `make refdata-load` released it within 5 s.
 - *Read at startup.* A one-reader source reads the package's 34,706 pieces (ADR 0017) in one locked snapshot, in 2.7 s, and broadcasts them followed by a "zones complete" marker. It reads again on every restart, so a new package goes live by stopping with a savepoint, loading, and `make flink-restart`. Each record's `zones_version` says which package tagged it.
 - *One index per TaskManager.* The first task to see the marker builds three JTS STRtrees (65 MB), and the other three tasks share that index. The index is deliberately not Flink state, because broadcast state is copied by every task at every checkpoint.
 - *The buffer.* The AIS backlog reaches the tagging step long before the zones do. Until the marker arrives, records wait in per-vessel keyed state, and then they leave in order. Started on a 300,000-record backlog, the job held 58,344 records this way, and not one enriched record came out untagged.
@@ -159,15 +159,16 @@ Distances follow ADR 0013. The job finds the nearest point in UTM, then measures
 
 **Exactly-once.** Checkpoints every 3 s snapshot the dedup state together with the Kafka offsets. The three Kafka sinks write in transactions that commit only when a checkpoint completes. After a crash, the job restarts from the last checkpoint, and the broker aborts whatever was written after it. When I killed the TaskManager mid-run, a `read_uncommitted` reader saw 103 records twice and a `read_committed` reader saw each once ([Numbers](#numbers)). The cost is latency: output waits up to 3 s for its checkpoint, so the end-to-end target is now p99 under 5 s at 10x, not 2 s ([ADR 0014](docs/adr/0014-flink-exactly-once-3s-checkpoints-5s-latency.md)).
 
-**Running it.** It is a session cluster in Compose: a JobManager (768 MB), one TaskManager with 4 slots (1280 MB), parallelism 4, heap state, and checkpoints on a Docker volume. A one-shot `flink-submit` container submits the job. To fit that in the 3.9 GiB Docker VM, Redpanda dropped to 512 MB and ClickHouse to 1.25 GB, and Console only runs on demand. Records keep the MMSI key and use the producer's default murmur2 partitioner, so each vessel stays in the same partition number it had in `ais.raw` (ADR 0001).
+**Running it.** It is a session cluster in Compose: a JobManager (768 MB), one TaskManager with 4 slots (1280 MB), parallelism 4, heap state, and checkpoints on a Docker volume. A one-shot `flink-submit` container submits the job; `make up` starts all of it. To fit that in the 3.9 GiB Docker VM, Redpanda dropped to 512 MB and ClickHouse to 1.25 GB, and Console only runs on demand. Records keep the MMSI key and use the producer's default murmur2 partitioner, so each vessel stays in the same partition number it had in `ais.raw` (ADR 0001).
 
 ## Tracker on ais.enriched
 
-The tracker reads `ais.enriched` (`TRACKER_INPUT_TOPIC`), with `read_committed`, through a small Faust transport. Faust only reads committed when its own output is transactional too, and the tracker stays at-least-once ([ADR 0019](docs/adr/0019-tracker-on-enriched-and-dark-gap-zone-condition.md)).
+The tracker reads `ais.enriched` (`TRACKER_INPUT_TOPIC`), with `read_committed`, through a small Faust transport. Faust only reads committed when its own output is transactional too, and the tracker stays at-least-once ([ADR 0019](docs/adr/0019-tracker-on-enriched-and-dark-gap-zone-condition.md)). The transport sets a private aiokafka attribute, so at startup the tracker checks that its consumer really reads committed, and exits with code 78 if not. A test against Redpanda aborts one transaction and commits another; the tracker's consumer reads only the committed record.
 
 - **The bookmark is still a raw offset.** Each vessel's state remembers the last `ais.raw` offset applied, so a redelivered record is skipped (ADR 0004). On `ais.enriched` that offset comes from the record's `src_offset`, never its own offset: Flink drops about 40% of records, so enriched offsets run far behind raw ones and would look old. Tracks keep `src_partition`/`src_offset`, so every sink's dedup key is unchanged.
 - **Safety net.** The tracker keeps its own validity, ship and duplicate checks. Anything they catch on `ais.enriched` is counted as a Flink leak (`leak_invalid`, `leak_station_class`, `leak_duplicate`, logged as `flink_leaks`). Over the 701,815-record run it stayed 0.
-- **Same tracks.** The same 10,000 rows read from `ais.raw` and then from `ais.enriched` give identical tracks for 1,278 of 1,279 vessels (`make compare-tracks`). The other one sent two reports in the same second 0.2 m apart; Flink's dedup key rounds to 5 decimals and drops the second, the tracker's exact check had taken it.
+- **One contract for both sides.** `contracts/ais_enriched.json` lists every station class (wire value, ship or not, example MMSIs) and the duplicate key's rounding. The Java and Python tests both load it, so changing a wire value fails both. It exists because the two drifted once: the tracker treated only `ship` as a ship, so a 98-prefix craft (a tender or RIB, tagged `craft_with_parent`) got no track. The 701,815-record run above had no 98-prefix MMSI in it, which is why the leak counter stayed 0. The whole AIS day has one such vessel, from 07:36.
+- **Same tracks.** The same 10,000 rows read from `ais.raw` and then from `ais.enriched` gave identical tracks for 1,278 of 1,279 vessels (`make compare-tracks`). The other one sent two reports in the same second 0.2 m apart. Flink's dedup key rounds to 5 decimals and dropped the second; the tracker compared positions exactly and took it. The tracker now rounds the same way (ties up, like Java's `Math.round`), so that vessel no longer differs; I have not rerun the comparison since.
 
 Reconciliation, end to end, each per run and `ais.raw` partition over the run's offset range:
 
@@ -194,7 +195,7 @@ Needs Docker with Compose v2, about 8 GB of free RAM, GNU make, and Python 3.12 
 
 ```sh
 cp .env.example .env
-make up        # git hooks, stack, topics, migrations, the three sinks, tracker (reads ais.enriched)
+make up        # git hooks, stack, topics, migrations, the three sinks, tracker, Flink job
 make ps        # every service healthy, raw-sink running
 make fetch     # download and verify the pinned AIS day (once, about 3 GB)
 
@@ -202,10 +203,10 @@ make replay ARGS="--limit 10000"                # 10x by default; prints the run
 make reconcile RUN=<run_id>                     # per-partition produced vs stored
 ```
 
-The tracker reads `ais.enriched`, so tracks and alerts need the Flink job (about 2 GB more; the image build compiles the job and runs its tests). Without it, set `TRACKER_INPUT_TOPIC=ais.raw` in `.env` and `make tracker`: tracks work, DARK_GAP does not.
+The tracker reads `ais.enriched`, so `make up` also starts the Flink job that writes it (about 2 GB of the memory budget; the image build compiles the job and runs its tests). The job needs a zone package in PostGIS. `make up` loads the last one built if none is active, including after `make nuke`. On a fresh clone there is none yet: `make up` says so and leaves the job unsubmitted, so build one (reference data, below), then run `make flink-up`. To run without Flink, set `TRACKER_INPUT_TOPIC=ais.raw` in `.env` and `make tracker`: tracks work, DARK_GAP does not.
 
 ```sh
-make flink-up                                   # JobManager, TaskManager, submit the job; UI on http://localhost:8081
+make flink-up                                   # after building a zone package; UI on http://localhost:8081
 make replay ARGS="--limit 10000"
 make flink-check RUN=<run_id>                   # per partition: raw = enriched + dlq + dups, no offset twice, all tagged
 make zone-check RUN=<run_id>                    # a sample of zone tags recomputed in PostGIS
@@ -237,6 +238,7 @@ make fetch-refdata   # verify the EEZ, WDPA and WPI files; prints where to downl
 make refdata-image   # once, online: the GDAL + minisign image the build runs in
 make refdata-key     # once: signing key in ~/.minisign/dvw.key (refuses if refdata/keys/dvw.pub exists)
 make refdata         # offline: build, verify and load the zone package into PostGIS
+make flink-up        # submit the Flink job, now that a package is active
 make area            # only if the AIS day changes: recompute refdata/area.yaml from the CSV
 ```
 
