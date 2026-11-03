@@ -6,6 +6,7 @@
 #   clickhouse 2g | postgis 512m               | raw-sink 384m
 #   tracker 512m  | alerts-sink 192m
 #   total ≈ 5.3g ceiling
+#   refdata-tools 1g, only while `make refdata` builds a package (one-shot)
 # Every image tag is pinned; never use :latest (reproducibility).
 
 name: dvw
@@ -208,6 +209,19 @@ services:
     # Long enough to finish the in-flight batch, flush the producer and commit.
     stop_grace_period: 30s
     restart: unless-stopped
+
+  # GDAL + minisign for the zone package (refdata/build.py, docs/adr/0011). Not a
+  # service: refdata/tools.py starts it with `compose run` for each ogr2ogr or minisign
+  # call, mounting only the directories that call needs. No network at all, so the
+  # build provably uses nothing but the pinned files in data/refdata/incoming.
+  refdata-tools:
+    build:
+      context: ../../refdata/tools
+    image: dvw-refdata-tools:0.1.0
+    profiles: [tools]
+    network_mode: none
+    # ogr2ogr streams features; the largest WDPA polygons clipped with GEOS dominate.
+    mem_limit: 1g
 
 volumes:
   redpanda-data:
