@@ -14,7 +14,10 @@ Per layer:
     * the layer's extent inside the package bbox from refdata/area.yaml. Layers are
       clipped to it when the package is built, so anything outside means the package
       was built for a different area. A metric layer's extent is taken after
-      transforming back to EPSG:4326, so one bbox in degrees serves both.
+      transforming back to EPSG:4326, so one bbox in degrees serves both. Zone pieces
+      (ADR 0017) skip it: a cut adds vertices on straight UTM segments, which bow
+      centimetres outside a bbox edge in degrees, and the loader instead checks that the
+      pieces add up to rows that passed it.
 """
 
 from __future__ import annotations
@@ -65,7 +68,13 @@ def _one(conn: psycopg.Connection[Any], query: sql.Composed) -> tuple[Any, ...]:
 
 
 def check_layer(
-    conn: psycopg.Connection[Any], schema: str, layer: str, bbox: BBox, geom: str = "geom", srid: int = SRID
+    conn: psycopg.Connection[Any],
+    schema: str,
+    layer: str,
+    bbox: BBox,
+    geom: str = "geom",
+    srid: int = SRID,
+    check_extent: bool = True,
 ) -> tuple[LayerReport | None, list[str]]:
     table = sql.Identifier(schema, layer)
     g = sql.Identifier(geom)
@@ -118,7 +127,7 @@ def check_layer(
     if xmin is None:
         return None, problems or [f"{layer}: no geometries"]
     extent = BBox(float(xmin), float(ymin), float(xmax), float(ymax))
-    if not _inside(extent, bbox, EXTENT_TOLERANCE_DEG if srid == SRID else REPROJECTED_TOLERANCE_DEG):
+    if check_extent and not _inside(extent, bbox, EXTENT_TOLERANCE_DEG if srid == SRID else REPROJECTED_TOLERANCE_DEG):
         problems.append(f"{layer}: extent {extent.as_dict()} is not inside the package bbox {bbox.as_dict()}")
 
     return LayerReport(layer=layer, rows=rows, repaired=repaired, extent=extent), problems
@@ -131,6 +140,7 @@ def check_staging(
     bbox: BBox,
     geom: str = "geom",
     srid: int = SRID,
+    check_extent: bool = True,
 ) -> list[LayerReport]:
     """Check and repair every layer in schema. Raises StagingCheckFailed listing all problems.
 
@@ -142,7 +152,7 @@ def check_staging(
     reports: list[LayerReport] = []
     problems: list[str] = []
     for layer in layers:
-        report, layer_problems = check_layer(conn, schema, layer, bbox, geom, srid)
+        report, layer_problems = check_layer(conn, schema, layer, bbox, geom, srid, check_extent)
         problems += layer_problems
         if report is not None:
             reports.append(report)
