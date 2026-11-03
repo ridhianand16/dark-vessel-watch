@@ -9,8 +9,11 @@ RUN = "20261103T172423Z-8b1198"
 PRODUCED = [Produced(0, 100, 109, 10), Produced(3, 50, 52, 3)]
 
 
+TAGS = {"zones_version": "zones-ee4167a002e7", "dist_eez_boundary_m": 9046.6}
+
+
 def rec(partition: int, offset: int, run_id: str | None = RUN, **extra: Any) -> dict[str, Any]:
-    return {"src_partition": partition, "src_offset": offset, "run_id": run_id, **extra}
+    return {"src_partition": partition, "src_offset": offset, "run_id": run_id, **TAGS, **extra}
 
 
 def count(partition: int, n: int, run_id: str = RUN) -> dict[str, Any]:
@@ -73,3 +76,11 @@ def test_render_shows_status_and_reasons() -> None:
     out = render(RUN, tallies, reasons)
     assert "OK" in out
     assert "dlq reasons: bad_mmsi 1" in out
+
+
+def test_enriched_record_without_zone_tags_fails() -> None:
+    enriched = [rec(3, 50), rec(3, 51, zones_version=None), rec(3, 52, dist_eez_boundary_m=None)]
+    tallies, _ = tally(RUN, PRODUCED[1:], enriched, [], [])
+    assert tallies[0].accounted == 3
+    assert not tallies[0].ok
+    assert tallies[0].note == "2 without zone tags"

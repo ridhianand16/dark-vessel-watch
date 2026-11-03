@@ -22,7 +22,9 @@ A third sink keeps `vessels_current` in PostGIS: one row per vessel with its lat
 
 A Flink job now sits on `ais.raw` as well ([Flink enrichment](#flink-enrichment)). It validates every message, sending rejects to `ais.dlq` with one of eight reason codes. It drops repeats of the same report heard by several base stations, and writes the rest to `ais.enriched` with the raw partition and offset each record came from. It is exactly-once end to end: output becomes visible only when a 3 s checkpoint completes ([ADR 0014](docs/adr/0014-flink-exactly-once-3s-checkpoints-5s-latency.md)). Dropped duplicates are counted exactly-once into their own topic ([ADR 0015](docs/adr/0015-dedup-key-and-counted-duplicates.md), [ADR 0016](docs/adr/0016-dedup-counts-topic.md)), so a check can prove, per run and partition, that every raw message is enriched, rejected or a counted duplicate. That holds when the TaskManager is killed partway through a run.
 
-Not built yet: zone tagging in Flink and the DARK_GAP zone check that depends on it (the zones are in PostGIS, but nothing reads them yet, so the check still passes everywhere), moving the tracker from `ais.raw` to `ais.enriched`, and MMSI_CLASH.
+The same job tags every record with its zones: EEZ, protected areas, port, and geodesic distances to the nearest EEZ boundary and protected area. It reads the active zone package from PostGIS when it starts, and records that arrive before the zones are held back rather than tagged "no zone" ([ADR 0018](docs/adr/0018-flink-zone-tagging-read-at-startup.md)). On a 400-record sample the tags agree with PostGIS exactly, and the distances agree to within 0.5 m.
+
+Not built yet: moving the tracker from `ais.raw` to `ais.enriched`, the DARK_GAP zone check that reads these tags (it still passes everywhere), and MMSI_CLASH.
 
 ## Detections
 
@@ -81,7 +83,7 @@ How a package is made and loaded:
 2. **Verify** (`make refdata-verify`). The signature over the manifest is checked against the committed `refdata/keys/dvw.pub`, then every file's hash. Changing one byte in any file fails this step.
 3. **Load** (`make refdata-load`). The loader verifies again, then fills a staging schema, checks row counts and geometry validity there, writes the metric copies described below, and swaps all the tables into place. All of that is one transaction. Each load adds a row to `refdata_packages` and marks it as the one active package. Loading the same package twice gives identical zones and two registry rows.
 
-The Flink enrichment job will keep the zones in memory and measure with JTS, which is planar. So the loader also writes `zones_25832` and `eez_boundaries_25832`: the same rows in EPSG:25832 (UTM zone 32N, the Danish metric grid), already repaired, checked and GiST-indexed ([ADR 0013](docs/adr/0013-metric-zone-copy-and-active-package.md)). Before reprojecting, it adds vertices to long segments: geodesic for boundary lines, so a metric distance matches a geography distance, and straight in degrees for polygons, so containment matches `zones`. Without that, a 50 km boundary segment becomes a different line in UTM and a Kattegat distance was 6 m off. With it, what remains is the projection's scale error: 0.7 m on 9 km in the Kattegat, but 0.16% around Bornholm and about 0.3% at the eastern edge of the area. So the job uses 25832 only to find the nearest point, then reports the geodesic distance to it. Near Bornholm that gives 19,324.5 m, the same as PostGIS geography, where UTM alone says 19,355.2 m.
+The Flink enrichment job keeps the zones in memory and measures with JTS, which is planar. So the loader also writes `zones_25832` and `eez_boundaries_25832`: the same rows in EPSG:25832 (UTM zone 32N, the Danish metric grid), already repaired, checked and GiST-indexed ([ADR 0013](docs/adr/0013-metric-zone-copy-and-active-package.md)). Before reprojecting, it adds vertices to long segments: geodesic for boundary lines, so a metric distance matches a geography distance, and straight in degrees for polygons, so containment matches `zones`. Without that, a 50 km boundary segment becomes a different line in UTM and a Kattegat distance was 6 m off. With it, what remains is the projection's scale error: 0.7 m on 9 km in the Kattegat, but 0.16% around Bornholm and about 0.3% at the eastern edge of the area. So the job uses 25832 only to find the nearest point, then reports the geodesic distance to it. Near Bornholm that gives 19,324.5 m, the same as PostGIS geography, where UTM alone says 19,355.2 m.
 
 One protected area alone has 977,787 vertices, and a point-in-polygon test scans all of them. So the loader also cuts every metric zone and boundary into pieces of at most 256 vertices (`ST_Subdivide`) and checks that each zone's pieces add up to its area and each boundary's to its length. That gives 34,535 zone pieces and 171 boundary pieces. A lookup in the job is then a tree query plus a scan of a few hundred vertices ([ADR 0017](docs/adr/0017-zone-pieces-for-in-memory-lookup.md)).
 
@@ -111,13 +113,15 @@ That one condition is why replays cannot corrupt the table. A redelivered batch,
 
 ## Flink enrichment
 
-The Flink job (Java 17, Flink 1.20 DataStream API, `flink/enrichment/`) reads `ais.raw` and writes three topics:
+The Flink job (Java 17, Flink 1.20 DataStream API, `flink/enrichment/`) reads `ais.raw` and the active zone package, and writes three topics:
 
 ```
-ais.raw -> parse + validate --invalid--------------------------------------> ais.dlq
-                 \--valid--> keyBy MMSI -> dedup --unique-------------------> ais.enriched
+ais.raw -> parse + validate --invalid--------------------------------------------> ais.dlq
+                 \--valid--> keyBy MMSI -> dedup --unique--> keyBy MMSI
+                                            |                -> zone tagging ----> ais.enriched
+PostGIS active package -> zone source -> broadcast --------------^
                                             \--duplicates--> keyBy (run, partition)
-                                                -> 10 s event-time count -----> ais.dedup_counts
+                                                -> 10 s event-time count ---------> ais.dedup_counts
 ```
 
 **Validation.** Rules are checked in a fixed order, and the first failure decides the code: `decode_error`, `bad_mmsi`, `no_position`, `position_unavailable` (lat 91 / lon 181), `position_out_of_range`, `null_island`, `bad_timestamp` (more than a day off the replayed day, `AIS_DAY`), `sog_invalid`. Each DLQ record carries its code, a detail string, the original payload, and the raw partition and offset. Base stations, buoys and other non-ship stations are valid. They go to `ais.enriched` with a `station_class` from the same MMSI table the tracker uses. A position far outside the receiver area is valid too, because catching impossible jumps is TELEPORT's job.
@@ -130,7 +134,16 @@ ais.raw -> parse + validate --invalid--------------------------------------> ais
 raw(run, partition) = enriched + dlq + sum(dedup_counts.count)     over the run's ais.raw offset range
 ```
 
-`make flink-check RUN=<run_id>` reads all three topics with `read_committed`. It also fails if any raw offset appears twice across `ais.enriched` and `ais.dlq`.
+`make flink-check RUN=<run_id>` reads all three topics with `read_committed`. It also fails if any raw offset appears twice across `ais.enriched` and `ais.dlq`, or if any enriched record has no zone tags.
+
+**Zone tagging.** Every record in `ais.enriched` gets `eez_id`, `mpa_ids`, `in_port`, `dist_eez_boundary_m`, `dist_mpa_m` (0 inside a protected area) and `zones_version`. How the zones get there ([ADR 0018](docs/adr/0018-flink-zone-tagging-read-at-startup.md)):
+
+- *Startup gate.* `make flink-up` waits until PostGIS has an active package, and says so. I checked this by clearing the active marker: the submit sat at the gate, and `make refdata-load` released it within 5 s.
+- *Read at startup.* A one-reader source reads the package's 34,706 pieces (ADR 0017) in one locked snapshot, in 2.7 s, and broadcasts them followed by a "zones complete" marker. It reads again on every restart, so a new package goes live by stopping with a savepoint, loading, and `make flink-restart`. Each record's `zones_version` says which package tagged it.
+- *One index per TaskManager.* The first task to see the marker builds three JTS STRtrees (65 MB), and the other three tasks share that index. The index is deliberately not Flink state, because broadcast state is copied by every task at every checkpoint.
+- *The buffer.* The AIS backlog reaches the tagging step long before the zones do. Until the marker arrives, records wait in per-vessel keyed state, and then they leave in order. Started on a 300,000-record backlog, the job held 58,344 records this way, and not one enriched record came out untagged.
+
+Distances follow ADR 0013. The job finds the nearest point in UTM, then measures the geodesic distance to it. `make zone-check RUN=<run_id>` recomputes a sample of tags in PostGIS on the 4326 tables, with geography distances. One subtlety came up there. A protected area's edges are straight in degrees, which is how the package and `ST_Contains` read them, but `::geography` reads each edge as a geodesic. Along long offshore edges that gave a 28 m difference until the check densified the polygons the same way.
 
 **Exactly-once.** Checkpoints every 3 s snapshot the dedup state together with the Kafka offsets. The three Kafka sinks write in transactions that commit only when a checkpoint completes. After a crash, the job restarts from the last checkpoint, and the broker aborts whatever was written after it. When I killed the TaskManager mid-run, a `read_uncommitted` reader saw 103 records twice and a `read_committed` reader saw each once ([Numbers](#numbers)). The cost is latency: output waits up to 3 s for its checkpoint, so the end-to-end target is now p99 under 5 s at 10x, not 2 s ([ADR 0014](docs/adr/0014-flink-exactly-once-3s-checkpoints-5s-latency.md)).
 
@@ -155,7 +168,8 @@ The Flink job (about 2 GB more; the image build compiles the job and runs its te
 ```sh
 make flink-up                                   # JobManager, TaskManager, submit the job; UI on http://localhost:8081
 make replay ARGS="--limit 10000"
-make flink-check RUN=<run_id>                   # per partition: raw = enriched + dlq + dups, no offset twice
+make flink-check RUN=<run_id>                   # per partition: raw = enriched + dlq + dups, no offset twice, all tagged
+make zone-check RUN=<run_id>                    # a sample of zone tags recomputed in PostGIS
 
 docker kill dvw-flink-taskmanager               # mid-replay; then bring it back:
 docker start dvw-flink-taskmanager              # the job restores the last checkpoint; flink-check still OK
@@ -247,6 +261,10 @@ Measured on 2026-11-02 on an Apple M1 laptop (8 GB RAM, macOS 26.5), Docker VM w
 | Flink check, 10,000 rows at 10x (2026-11-04) | `make replay ARGS="--limit 10000"`, `make flink-check RUN=...` | OK on all 6 partitions: 10,000 = 5,683 enriched + 294 DLQ (all `position_unavailable`) + 4,023 duplicates. No offset twice. A replay of the same rows from before Flink existed, read from the backlog, gives identical numbers |
 | Flink check, TaskManager killed mid-run (2026-11-04) | 10,000 rows at 1x, `docker kill dvw-flink-taskmanager` 20 s in, `docker start` 25 s later | Job restored checkpoint 75. `make flink-check` OK, same 5,683 / 294 / 4,023 as the clean run. Reading `ais.enriched` for that run: 5,786 records and 103 offsets twice with `read_uncommitted`, 5,683 and none twice with `read_committed` |
 | Flink check, 200,000 rows at 10x (2026-11-04) | `make replay ARGS="--limit 200000"` | 104.9 s. `make flink-check` OK: 117,277 enriched + 1,756 DLQ + 80,967 duplicates. `make reconcile` OK on the raw store too |
+| Zone tagging, started on a backlog (2026-11-04) | `make flink-savepoint`, `make replay SPEED=100 ARGS="--limit 300000"`, `make flink-restart` | Zone source read 34,706 pieces in 12.6 s (2.7 s on an idle stack). Shared index built in 0.6 to 0.9 s. 58,344 records buffered and flushed across 4 tasks. `make flink-check` OK: 176,245 enriched + 2,303 DLQ + 121,452 duplicates, 0 untagged |
+| Zone tags against PostGIS (2026-11-04) | `make zone-check RUN=20261103T200718Z-7f33b0` | 400 records (122 in a protected area, 176 in port): 0 differing `eez_id`, `mpa_ids` or `in_port`. Largest difference 0.10 m for `dist_eez_boundary_m`, 0.52 m for `dist_mpa_m` |
+| Zone index cost (2026-11-04) | The job's jar in a separate JVM: heap after GC before and after building, then 200,000 random points in the area | 65 MB retained, 115 MB at the build's peak. 36 µs per lookup: containment, two nearest searches, three projections, two geodesic distances |
+| Flink check after savepoint, restart and replay (2026-11-04) | `make flink-savepoint`, `make flink-restart`, `make replay SPEED=100 ARGS="--limit 100000"` | OK on all 6 partitions: 58,241 enriched + 1,178 DLQ + 40,581 duplicates, no offset twice, 0 untagged |
 | Memory with everything running (2026-11-04) | `docker stats` every 5 s during the 200,000-row replay, Console on too | Total 1.9 to 2.1 GiB of the 3.9 GiB VM. TaskManager 660 MiB (935 MiB peak after the 3.1 million backlog), ClickHouse 614, JobManager 352, Redpanda 276, tracker 92, the rest under 75 each |
 
 End-to-end latency and full-day throughput are still to be measured.

@@ -32,6 +32,16 @@ public class RawRecord {
     public double lon;
     public String stationClass;
 
+    /** Zone tags (ZoneTagging, docs/adr/0018). zonesVersion is set on every enriched record;
+     * the others are null or empty when the point is outside every zone or cannot be
+     * projected. */
+    public String zonesVersion;
+    public String eezId;
+    public String[] mpaIds;
+    public boolean inPort;
+    public Double distEezBoundaryM;
+    public Double distMpaM;
+
     public RawRecord() {}
 
     public boolean isValid() {

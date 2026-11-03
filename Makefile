@@ -154,6 +154,7 @@ score: .env
 ## Flink session cluster plus the enrichment job: ais.raw -> ais.enriched, ais.dlq,
 ## ais.dedup_counts (docs/adr/0014). Builds the image (which runs the Java tests), starts
 ## the JobManager and TaskManager, then submits the job unless it is already running.
+## Submitting waits until PostGIS has an active zone package (make refdata-load).
 ## Web UI: http://localhost:8081
 FLINK := $(COMPOSE) --profile flink
 flink-up: .env
@@ -166,7 +167,8 @@ flink-savepoint: .env
 	$(FLINK) run --rm --no-deps flink-submit stop
 
 ## Rebuild the job, stop it with a savepoint if it is running, and start it from the
-## latest savepoint. Use after changing the job or AIS_DAY.
+## latest savepoint. Use after changing the job or AIS_DAY, and after loading a new zone
+## package: the restarted job reads whichever package is active (docs/adr/0018).
 flink-restart: .env
 	$(FLINK) build flink-submit
 	$(FLINK) run --rm --no-deps flink-submit restart
@@ -180,6 +182,12 @@ flink-logs: .env
 flink-check: .env
 	@test -n "$(RUN)" || { echo "usage: make flink-check RUN=<run_id>  (see data/runs/)" >&2; exit 2; }
 	uv run python -m reconcile.flink_check $(RUN) --wait $(WAIT)
+
+## Recompute the zone tags of a sample of one run's ais.enriched records in PostGIS
+## (geography distances on the 4326 tables) and report differences. make zone-check RUN=<run_id>
+zone-check: .env
+	@test -n "$(RUN)" || { echo "usage: make zone-check RUN=<run_id>  (see data/runs/)" >&2; exit 2; }
+	uv run python -m reconcile.zone_check $(RUN)
 
 PY_DIRS := common ingest refdata sql sinks reconcile stream
 
