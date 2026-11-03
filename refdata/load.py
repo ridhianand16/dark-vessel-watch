@@ -23,6 +23,12 @@ One transaction:
 Any failure rolls everything back and the live zones stay as they were. Readers are
 only blocked from step 6 to the commit. Reloading the same package replaces the rows
 with identical ones and adds a refdata_packages row.
+
+    uv run python -m refdata ensure [--package DIR]   # make up runs this
+
+ensure() loads only when no package is active, e.g. after `make nuke` emptied PostGIS
+while the built package is still on disk. The Flink job's startup gate waits for an
+active package, so this is what lets `make up` submit the job unattended.
 """
 
 from __future__ import annotations
@@ -198,6 +204,30 @@ def _check_pieces(conn: psycopg.Connection[Any], metric: str) -> list[str]:
         f"{pieces}: {k} has no pieces" if n is None else f"{pieces}: {k} pieces add up to {total}, source has {whole}"
         for k, whole, total, n in bad
     ]
+
+
+def active_version() -> str | None:
+    """The active package's version, or None when none is (a fresh database)."""
+    with psycopg.connect(conninfo()) as conn:
+        row = conn.execute("SELECT package_version FROM refdata_packages WHERE active").fetchone()
+    return str(row[0]) if row is not None else None
+
+
+@dataclass(frozen=True)
+class EnsureReport:
+    version: str
+    loaded: LoadReport | None
+    """None when the package was already active and nothing was loaded."""
+
+
+def ensure(package: Path, public_key: Path = PUBLIC_KEY, area: Path = AREA) -> EnsureReport:
+    """Load `package` unless some package is already active. An active package is left
+    alone even if it is not `package`: replacing a live package is `make refdata-load`."""
+    active = active_version()
+    if active is not None:
+        return EnsureReport(active, None)
+    report = load(package, public_key, area)
+    return EnsureReport(report.version, report)
 
 
 def load(package: Path, public_key: Path = PUBLIC_KEY, area: Path = AREA) -> LoadReport:

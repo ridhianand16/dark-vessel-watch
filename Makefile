@@ -6,8 +6,8 @@ COMPOSE := docker compose -f deploy/compose/docker-compose.yml --env-file .env
 	@echo "Missing .env. Run: cp .env.example .env" >&2; exit 1
 
 SERVICES := redpanda clickhouse postgis
-# Every profile, so down and nuke also remove Flink, Console and one-shot tool containers.
-ALL_PROFILES := --profile flink --profile console --profile tools
+# Every profile, so down and nuke also remove Console and the one-shot tool containers.
+ALL_PROFILES := --profile console --profile tools
 
 # Read only the keys we need from .env rather than including the whole file.
 env_get = $(shell sed -n 's/^$(1)=//p' .env 2>/dev/null)
@@ -21,14 +21,16 @@ hooks:
 	git config core.hooksPath .githooks
 	chmod +x .githooks/*
 
-## Start the stack, wait until every service is healthy, then create topics.
-## init-topics is run separately: `up --wait` treats a one-shot container that
-## exits (even with 0) as a failure.
+## Start the whole pipeline: Redpanda, ClickHouse, PostGIS, topics, migrations, the
+## three sinks, the tracker (reads ais.enriched) and the Flink enrichment job that
+## writes ais.enriched. init-topics is run separately: `up --wait` treats a one-shot
+## container that exits (even with 0) as a failure.
 up: hooks .env
 	$(COMPOSE) up -d --wait --wait-timeout 180 $(SERVICES)
 	$(COMPOSE) run --rm init-topics
 	$(MAKE) migrate migrate-postgis
 	$(COMPOSE) up -d --build raw-sink alerts-sink vessels-sink tracker
+	$(MAKE) flink-up
 
 ## Stop and remove containers; named volumes (topic data, DBs) are kept.
 down: .env
@@ -153,29 +155,37 @@ score: .env
 	uv run python -m reconcile.score_alerts $(RUN) --wait $(WAIT)
 
 ## Flink session cluster plus the enrichment job: ais.raw -> ais.enriched, ais.dlq,
-## ais.dedup_counts (docs/adr/0014). Builds the image (which runs the Java tests), starts
-## the JobManager and TaskManager, then submits the job unless it is already running.
-## Submitting waits until PostGIS has an active zone package (make refdata-load).
+## ais.dedup_counts (docs/adr/0014). Part of `make up`. Builds the image (which runs the
+## Java tests), starts the JobManager and TaskManager, then submits the job unless it is
+## already running. The job's startup gate waits for an active zone package in PostGIS
+## (docs/adr/0018), so first `refdata ensure` loads the last built package if none is
+## active (after `make nuke`; offline, verified). With no package built at all the job is
+## not submitted: run `make fetch-refdata refdata`, then `make flink-up`.
 ## Web UI: http://localhost:8081
-FLINK := $(COMPOSE) --profile flink
 flink-up: .env
-	$(FLINK) up -d --build --wait --wait-timeout 180 flink-jobmanager flink-taskmanager
-	$(FLINK) run --rm flink-submit submit
+	$(COMPOSE) up -d --build --wait --wait-timeout 180 flink-jobmanager flink-taskmanager
+	@uv run python -m refdata ensure; rc=$$?; \
+	if [ $$rc -eq 3 ]; then \
+		echo "flink-up: Flink is running but the job is not submitted: it needs a zone package." >&2; \
+		echo "flink-up: run make fetch-refdata refdata, then make flink-up. Until then the tracker gets no input." >&2; \
+		exit 0; \
+	elif [ $$rc -ne 0 ]; then exit $$rc; fi; \
+	$(COMPOSE) run --rm flink-submit submit
 
 ## Stop the job with a savepoint: the sinks commit their last transactions and the state
 ## is written to the flink-data volume. The cluster keeps running.
 flink-savepoint: .env
-	$(FLINK) run --rm --no-deps flink-submit stop
+	$(COMPOSE) run --rm --no-deps flink-submit stop
 
 ## Rebuild the job, stop it with a savepoint if it is running, and start it from the
 ## latest savepoint. Use after changing the job or AIS_DAY, and after loading a new zone
 ## package: the restarted job reads whichever package is active (docs/adr/0018).
 flink-restart: .env
-	$(FLINK) build flink-submit
-	$(FLINK) run --rm --no-deps flink-submit restart
+	$(COMPOSE) build flink-submit
+	$(COMPOSE) run --rm --no-deps flink-submit restart
 
 flink-logs: .env
-	$(FLINK) logs -f flink-jobmanager flink-taskmanager
+	$(COMPOSE) logs -f flink-jobmanager flink-taskmanager
 
 ## Check one replay run through Flink, per partition: raw = enriched + dlq + dedup counts,
 ## and no raw offset written twice. Waits up to WAIT seconds while records are only missing.
