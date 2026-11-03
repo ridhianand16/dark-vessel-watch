@@ -1,12 +1,14 @@
-# Dark Vessel Watch – local stack (M0)
+# Dark Vessel Watch – local stack
 #
 # Run from the repo root via the Makefile (it passes --env-file .env).
-# Memory budget (mem_limit caps, not reservations):
-#   redpanda 1.5g (1G Seastar heap + overhead) | console 256m
-#   clickhouse 2g | postgis 512m               | raw-sink 384m
-#   tracker 512m  | alerts-sink 192m           | vessels-sink 192m
-#   total ≈ 5.5g ceiling
-#   refdata-tools 1g, only while `make refdata` builds a package (one-shot)
+# Memory budget (mem_limit caps, not reservations) for the 3.9 GiB Docker VM:
+#   redpanda 768m (512M Seastar memory + overhead) | clickhouse 1.25g | postgis 512m
+#   raw-sink 384m | tracker 512m | alerts-sink 192m | vessels-sink 192m
+#   flink-jobmanager 768m | flink-taskmanager 1280m        (profile flink, `make flink-up`)
+#   total ≈ 5.8g ceiling; measured use with everything running is in the README
+#   console 256m, only when needed (profile console, `make console`)
+#   flink-submit 384m, one-shot; refdata-tools 1g, only while `make refdata` builds a package
+#   Run GDAL package builds with Flink stopped.
 # Every image tag is pinned; never use :latest (reproducibility).
 
 name: dvw
@@ -31,7 +33,7 @@ services:
       - redpanda
       - start
       - --smp=1
-      - --memory=1G
+      - --memory=512M
       - --overprovisioned
       - --node-id=0
       - --check=false
@@ -45,7 +47,9 @@ services:
       - "19644:9644"    # Admin API (rpk cluster ops from host)
     volumes:
       - redpanda-data:/var/lib/redpanda/data
-    mem_limit: 1536m
+    # 512M is Seastar's own memory; the rest is the process outside it. If Redpanda refuses
+    # to start or logs memory pressure at 10x, raise --memory to 768M and this to 1g.
+    mem_limit: 768m
     healthcheck:
       test: ["CMD-SHELL", "rpk cluster health --exit-when-healthy --watch=false | grep -qE 'Healthy:.+true'"]
       interval: 5s
@@ -66,7 +70,7 @@ services:
     command:
       - |
         export RPK_BROKERS=redpanda:9092
-        TOPICS="ais.raw ais.enriched ais.tracks ais.alerts ais.dlq"
+        TOPICS="ais.raw ais.enriched ais.tracks ais.alerts ais.dlq ais.dedup_counts"
         rpk topic create $$TOPICS --partitions 6 --replicas 1 --if-not-exists
         for t in $$TOPICS; do
           n=$$(rpk topic describe "$$t" --print-partitions | tail -n +2 | grep -c .)
@@ -80,6 +84,7 @@ services:
   console:
     image: redpandadata/console:v3.13.1
     container_name: dvw-console
+    profiles: [console]
     depends_on:
       redpanda:
         condition: service_healthy
@@ -109,7 +114,8 @@ services:
       - "9000:9000"   # native TCP
     volumes:
       - clickhouse-data:/var/lib/clickhouse
-    mem_limit: 2g
+    # ClickHouse sizes its own caches from this (max_server_memory_usage = 90% of it).
+    mem_limit: 1280m
     ulimits:
       nofile: { soft: 262144, hard: 262144 }
     healthcheck:
@@ -239,6 +245,93 @@ services:
     stop_grace_period: 30s
     restart: unless-stopped
 
+  # Flink session cluster for the enrichment job (flink/enrichment, docs/adr/0014, 0015).
+  # One JobManager (coordinates, checkpoints) and one TaskManager (runs the 4 parallel
+  # subtasks in its 4 slots). The job itself is submitted by flink-submit. Checkpoints and
+  # savepoints go to the flink-data volume, which both must see at the same path.
+  flink-jobmanager:
+    build:
+      context: ../../flink/enrichment
+    image: dvw-flink:0.1.0
+    container_name: dvw-flink-jobmanager
+    profiles: [flink]
+    command: ["jobmanager"]
+    environment:
+      FLINK_PROPERTIES: &flink-properties |
+        jobmanager.rpc.address: flink-jobmanager
+        rest.address: flink-jobmanager
+        jobmanager.memory.process.size: 768m
+        taskmanager.memory.process.size: 1280m
+        taskmanager.memory.managed.fraction: 0.1
+        taskmanager.numberOfTaskSlots: 4
+        state.backend.type: hashmap
+        state.checkpoints.dir: file:///flink-data/checkpoints
+        state.savepoints.dir: file:///flink-data/savepoints
+        state.checkpoints.num-retained: 3
+        execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+        restart-strategy.type: fixed-delay
+        restart-strategy.fixed-delay.attempts: 2147483647
+        restart-strategy.fixed-delay.delay: 5 s
+        heartbeat.timeout: 20000
+    ports:
+      - "8081:8081"   # web UI and REST API
+    volumes:
+      - flink-data:/flink-data
+    # Equal to jobmanager.memory.process.size: Flink budgets heap, metaspace and JVM
+    # overhead inside it, so the container limit is the process size.
+    mem_limit: 768m
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8081/overview >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  flink-taskmanager:
+    build:
+      context: ../../flink/enrichment
+    image: dvw-flink:0.1.0
+    container_name: dvw-flink-taskmanager
+    profiles: [flink]
+    command: ["taskmanager"]
+    depends_on:
+      flink-jobmanager:
+        condition: service_healthy
+    environment:
+      FLINK_PROPERTIES: *flink-properties
+    volumes:
+      - flink-data:/flink-data
+    # Equal to taskmanager.memory.process.size. Heap state, so managed memory (for RocksDB
+    # and batch sorting) is cut to 10% and the task heap gets the rest (~410 MB).
+    mem_limit: 1280m
+    restart: unless-stopped
+
+  # Submits the enrichment job (or reports it is already running), then exits. Also runs
+  # stop-with-savepoint and restart for the Makefile; see flink/enrichment/docker/flinkctl.sh.
+  # The job reads KAFKA_BROKERS and AIS_DAY from this container's environment at submit time.
+  flink-submit:
+    build:
+      context: ../../flink/enrichment
+    image: dvw-flink:0.1.0
+    container_name: dvw-flink-submit
+    profiles: [flink]
+    entrypoint: ["/opt/dvw/flinkctl.sh"]
+    command: ["submit"]
+    depends_on:
+      init-topics:
+        condition: service_completed_successfully
+      flink-jobmanager:
+        condition: service_healthy
+    environment:
+      FLINK_JOBMANAGER: flink-jobmanager:8081
+      KAFKA_BROKERS: redpanda:9092   # internal listener
+      AIS_DAY: ${AIS_DAY:?set in .env}
+    volumes:
+      - flink-data:/flink-data
+    # The flink CLI is a JVM that builds the job graph and uploads the jar.
+    mem_limit: 384m
+    restart: "no"
+
   # GDAL + minisign for the zone package (refdata/build.py, docs/adr/0011). Not a
   # service: refdata/tools.py starts it with `compose run` for each ogr2ogr or minisign
   # call, mounting only the directories that call needs. No network at all, so the
@@ -253,6 +346,7 @@ services:
     mem_limit: 1g
 
 volumes:
+  flink-data:
   redpanda-data:
   clickhouse-data:
   postgis-data:
