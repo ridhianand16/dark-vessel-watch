@@ -19,8 +19,8 @@ The sources do not make that easy:
 - WDPA is released monthly on a URL that changes with the month. The previous
   month's file returns 404 as soon as the next one appears (checked on
   2026-11-03: `Nov2026` exists, `Oct2026` is gone).
-- NGA serves the WPI CSV from a fixed URL but answers scripted clients with HTTP
-  503 behind a bot check.
+- NGA's site answers scripted clients with HTTP 503 behind a bot check, and
+  refuses some manual downloads too.
 - Licences: WDPA forbids redistribution, Marine Regions is CC BY-NC-SA. The files
   can be fetched by a script but cannot be shipped in this repository.
 
@@ -34,20 +34,30 @@ outside the receiver area.
 ## Decision
 
 **Every source is a pinned file.** `refdata/sources.yaml` records each source's
-version, the SHA-256 of the downloaded bytes, its licence and its attribution.
-Everything lives under `data/refdata/incoming/<source>/<version>/`. Then
+version, file name, the SHA-256 of its bytes, its licence and its attribution. All
+three reference sources are `manual: true`: a person downloads them from the page
+in `url` and places them in `data/refdata/incoming/<source>/<version>/`. Then
 `make fetch-refdata`:
 
-- verifies files placed there by hand for `manual: true` sources (EEZ and WDPA),
-  and prints the download page and exact target path when one is missing;
-- downloads WPI, and falls back to the same instructions when NGA refuses;
-- fails on a hash mismatch, on an unpinned hash (after printing it), on an HTML
-  response, and when an archive lacks the files listed under `members`.
+- verifies each file's hash and unzips it;
+- prints the download page and exact target path when a file is missing;
+- fails on a hash mismatch, on an unpinned hash (after printing it), and when an
+  archive lacks the files listed under `members`.
 
-The EEZ boundary lines ship in the same zip as the polygons. They are a separate
-source entry that points at it with `archive: eez`, so the zip is verified once.
-The WDPA release is chosen with `WDPA_VERSION` in `.env` and must equal the pinned
-version while a hash is pinned.
+The pinned files:
+
+- **EEZ:** World EEZ v12, GeoPackage. One zip holds both the polygons
+  (`eez_v12.gpkg`) and the boundary lines (`eez_boundaries_v12.gpkg`), and both
+  are listed as members.
+- **WDPA:** the November 2026 marine release as a File Geodatabase, a single
+  `.gdb` that GDAL reads directly. The shapefile release is split into parts.
+  `WDPA_VERSION` in `.env` must equal the pinned version.
+- **WPI:** the 2019 edition as GeoJSON (3,669 ports) from the NASA Harvest mirror,
+  because NGA refuses the download. The hash pins that exact copy.
+
+The hashes were taken from the files as first placed (2026-11-03). They prove
+that later builds use the same bytes, not that those bytes match an upstream
+checksum; none of the three publishes one.
 
 **The package covers the area of the feed, plus a margin.** `make area` scans the
 pinned AIS day and drops invalid positions: missing, latitude outside ±90,
@@ -82,8 +92,11 @@ For 2026-10-28 the box is 2.69 to 17.53 E, 53.52 to 59.57 N.
 
 - The repository ships the fetcher, `sources.yaml`, `area.yaml` and the
   attribution, never the data. A fresh machine needs three manual downloads
-  (EEZ, WDPA, and WPI if NGA refuses the script) before the zone package can be
-  built.
+  before the zone package can be built.
+- WPI is the 2019 edition, taken from a mirror rather than from NGA. Ports built
+  or renamed since then are missing. Danish ports change slowly, and port zones
+  only matter for vessels that go dark while still moving, so this is acceptable
+  until NGA's download can be fetched.
 - A new WDPA month, EEZ version or WPI download means a new pinned hash and a new
   package version. A different AIS day or region means a new `area.yaml`.
 - Vessels in the trimmed tail that are more than 20 nm outside the box get no
