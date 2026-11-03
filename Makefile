@@ -161,16 +161,20 @@ score: .env
 ## (docs/adr/0018), so first `refdata ensure` loads the last built package if none is
 ## active (after `make nuke`; offline, verified). With no package built at all the job is
 ## not submitted: run `make fetch-refdata refdata`, then `make flink-up`.
+## --no-recreate, and --no-deps on the submit (whose `run` would otherwise recreate its
+## dependencies): a rebuilt image must not replace a running JobManager, which would drop
+## the job without a savepoint (a session cluster keeps no jobs across a restart). Job code
+## changes go live with `make flink-restart`, which stops with a savepoint first.
 ## Web UI: http://localhost:8081
 flink-up: .env
-	$(COMPOSE) up -d --build --wait --wait-timeout 180 flink-jobmanager flink-taskmanager
+	$(COMPOSE) up -d --build --no-recreate --wait --wait-timeout 180 flink-jobmanager flink-taskmanager
 	@uv run python -m refdata ensure; rc=$$?; \
 	if [ $$rc -eq 3 ]; then \
 		echo "flink-up: Flink is running but the job is not submitted: it needs a zone package." >&2; \
 		echo "flink-up: run make fetch-refdata refdata, then make flink-up. Until then the tracker gets no input." >&2; \
 		exit 0; \
 	elif [ $$rc -ne 0 ]; then exit $$rc; fi; \
-	$(COMPOSE) run --rm flink-submit submit
+	$(COMPOSE) run --rm --no-deps flink-submit submit
 
 ## Stop the job with a savepoint: the sinks commit their last transactions and the state
 ## is written to the flink-data volume. The cluster keeps running.
