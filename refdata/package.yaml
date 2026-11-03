@@ -1,0 +1,18 @@
+# Zone package parameters. refdata/area.py reads them now; the package builder
+# records them in manifest.json so every loaded package says how it was cut.
+
+# Largest "within N nm" distance any rule applies to a zone. Today that is DARK_GAP:
+# last seen within this distance of an EEZ boundary or protected area. The package
+# area gets twice this as margin, so a vessel at the edge of the feed still sees
+# every zone it could be measured against.
+max_distance_rule_nm: 10
+
+# Port zones are WPI points buffered by this radius (as geography, so it is metres
+# on the ground, not degrees).
+port_radius_nm: 2
+
+# Share of valid positions cut from each end of each axis before taking the
+# feed's extent. The 2026-10-28 day has 179 valid-looking fixes from 17 MMSIs far
+# outside the receiver area (60°S, 178°E, St Petersburg); plain min/max would make
+# the box half the globe. 0.0001 trims about 1,900 rows per side out of 18.9M.
+area_trim_fraction: 0.0001

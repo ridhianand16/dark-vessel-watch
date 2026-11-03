@@ -55,6 +55,11 @@ REFDATA_SOURCES := eez eez_boundaries wdpa_marine wpi
 fetch-refdata: .env
 	uv run python -m refdata.fetch --incoming $(REFDATA_DIR)/incoming $(addprefix --source ,$(REFDATA_SOURCES))
 
+## Recompute refdata/area.yaml (the zone package's bounding box) from the pinned AIS
+## day. Only needed when the day or refdata/package.yaml changes; commit the result.
+area: .env
+	uv run python -m refdata.area
+
 ## Replay the pinned AIS day into ais.raw at SPEED (default 10x, the speed the
 ## pipeline is sized for). Brokers default to REDPANDA_BROKERS in .env.
 ## Extra flags via ARGS, e.g. make replay ARGS="--limit 10000"; a --speed in ARGS wins.
