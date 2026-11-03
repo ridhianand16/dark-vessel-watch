@@ -1,6 +1,8 @@
 # 0007. Injected anomalies: synthetic vessels in the replay, scored by exact alert_id
 
-Status: accepted (2026-11-03)
+Status: accepted (2026-11-03). Amended by ADR 0008: the MMSI block moved to
+200000000-200000999, because a leading 99 marks an aid to navigation, which the
+tracker skips.
 
 ## Context
 

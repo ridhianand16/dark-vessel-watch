@@ -19,12 +19,12 @@ SHIPPED = Path(__file__).resolve().parents[1] / "anomalies.yaml"
 
 
 def doc(*vessels: dict[str, Any]) -> dict[str, Any]:
-    return {"version": 1, "mmsi_range": [999000000, 999000999], "report_every_s": 10, "noise_m": 0,
+    return {"version": 1, "mmsi_range": [200000000, 200000999], "report_every_s": 10, "noise_m": 0,
             "vessels": list(vessels)}
 
 
 def vessel(**kw: Any) -> dict[str, Any]:
-    v: dict[str, Any] = {"name": "T", "mmsi": 999000001, "start": [56.0, 11.0], "sog_kn": 12, "cog_deg": 90,
+    v: dict[str, Any] = {"name": "T", "mmsi": 200000001, "start": [56.0, 11.0], "sog_kn": 12, "cog_deg": 90,
                          "start_min": 0, "event": {"kind": "dark", "at_min": 5, "for_min": 10}, "expect": "DARK_GAP"}
     v.update(kw)
     return v
@@ -77,7 +77,7 @@ def test_dark_vessel_is_silent_and_labelled(tmp_path: Path) -> None:
     (label,) = p.labels
     assert label["trigger_ts"] == T0 + 5 * MIN == max(t for t in times if t <= T0 + 15 * MIN)
     assert label["returned_ts"] == T0 + 15 * MIN + 10_000
-    assert (label["mmsi"], label["expect"], label["kind"]) == (999000001, "DARK_GAP", "dark")
+    assert (label["mmsi"], label["expect"], label["kind"]) == (200000001, "DARK_GAP", "dark")
 
 
 def test_jump_shifts_every_later_report(tmp_path: Path) -> None:
@@ -97,7 +97,7 @@ def test_rows_go_through_build_message_like_csv_rows(tmp_path: Path) -> None:
     ts, line = inject.plan(spec, T0, T0 + 20 * MIN, len(lay.columns), lay.field_index, lay.timestamp_format).rows[3]
     assert next(csv.reader(io.StringIO(line))).__len__() == len(DMA_HEADER.split(","))
     key, value = build_message(line, ts, lay.field_index, "run")
-    assert key == b"999000001"
+    assert key == b"200000001"
     assert b'"name":"T"' in value and b'"sog":12.0' in value
 
 

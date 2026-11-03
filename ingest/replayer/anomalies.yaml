@@ -3,36 +3,37 @@
 # first event_ts. The run must cover required_min of event time (54 min here, about
 # 650k rows of the DMA day); the replayer refuses a shorter run.
 #
-# MMSI block 999000000-999000999: MID 999 is not allocated by the ITU, and the
-# 2026-10-28 DMA day has no MMSI starting with 999. The replayer still counts real
+# MMSI block 200000000-200000999: MID 200 is not allocated by the ITU, and the
+# 2026-10-28 DMA day has no MMSI starting with 200. The first digit 2 makes it a ship
+# station, so the tracker tracks it (ADR 0008). The replayer still counts real
 # rows in the block for every run, and the scorer refuses a run where it is not 0.
 version: 1
-mmsi_range: [999000000, 999000999]
+mmsi_range: [200000000, 200000999]
 report_every_s: 10
 noise_m: 5
 
 vessels:
   # Three vessels switch AIS off for 45 min while under way, and come back on their
   # dead-reckoned track. Each must raise exactly one DARK_GAP.
-  - {name: DVW TEST DARK 1, mmsi: 999000001, start: [56.40, 11.80], sog_kn: 12, cog_deg: 200,
+  - {name: DVW TEST DARK 1, mmsi: 200000001, start: [56.40, 11.80], sog_kn: 12, cog_deg: 200,
      start_min: 0.5, event: {kind: dark, at_min: 4, for_min: 45}, expect: DARK_GAP}
-  - {name: DVW TEST DARK 2, mmsi: 999000002, start: [57.90, 9.00], sog_kn: 9, cog_deg: 270,
+  - {name: DVW TEST DARK 2, mmsi: 200000002, start: [57.90, 9.00], sog_kn: 9, cog_deg: 270,
      start_min: 1, event: {kind: dark, at_min: 6, for_min: 45}, expect: DARK_GAP}
-  - {name: DVW TEST DARK 3, mmsi: 999000003, start: [55.10, 14.50], sog_kn: 15, cog_deg: 60,
+  - {name: DVW TEST DARK 3, mmsi: 200000003, start: [55.10, 14.50], sog_kn: 15, cog_deg: 60,
      start_min: 1, event: {kind: dark, at_min: 8, for_min: 45}, expect: DARK_GAP}
 
   # Three vessels whose reported position jumps 30 km in one report and stays there
   # (spoofing). Each must raise exactly one TELEPORT.
-  - {name: DVW TEST JUMP 1, mmsi: 999000011, start: [56.00, 7.00], sog_kn: 11, cog_deg: 300,
+  - {name: DVW TEST JUMP 1, mmsi: 200000011, start: [56.00, 7.00], sog_kn: 11, cog_deg: 300,
      start_min: 2, event: {kind: jump, at_min: 10, km: 30, bearing_deg: 90}, expect: TELEPORT}
-  - {name: DVW TEST JUMP 2, mmsi: 999000012, start: [55.50, 6.50], sog_kn: 14, cog_deg: 10,
+  - {name: DVW TEST JUMP 2, mmsi: 200000012, start: [55.50, 6.50], sog_kn: 14, cog_deg: 10,
      start_min: 2, event: {kind: jump, at_min: 20, km: 30, bearing_deg: 200}, expect: TELEPORT}
-  - {name: DVW TEST JUMP 3, mmsi: 999000013, start: [58.10, 10.00], sog_kn: 8, cog_deg: 150,
+  - {name: DVW TEST JUMP 3, mmsi: 200000013, start: [58.10, 10.00], sog_kn: 8, cog_deg: 150,
      start_min: 2, event: {kind: jump, at_min: 30, km: 30, bearing_deg: 330}, expect: TELEPORT}
 
   # Decoys that must not alert: a moored vessel silent for 45 min (not moving > 2 kn),
   # and a 0.5 km position shift (below the 1 km TELEPORT floor).
-  - {name: DVW TEST MOORED, mmsi: 999000021, start: [55.70, 12.62], sog_kn: 0, cog_deg: 0,
+  - {name: DVW TEST MOORED, mmsi: 200000021, start: [55.70, 12.62], sog_kn: 0, cog_deg: 0,
      start_min: 1, event: {kind: dark, at_min: 5, for_min: 45}, expect: null}
-  - {name: DVW TEST GLITCH, mmsi: 999000022, start: [56.90, 11.90], sog_kn: 10, cog_deg: 180,
+  - {name: DVW TEST GLITCH, mmsi: 200000022, start: [56.90, 11.90], sog_kn: 10, cog_deg: 180,
      start_min: 1, event: {kind: jump, at_min: 15, km: 0.5, bearing_deg: 90}, expect: null}
