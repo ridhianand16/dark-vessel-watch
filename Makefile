@@ -1,6 +1,6 @@
 COMPOSE := docker compose -f deploy/compose/docker-compose.yml --env-file .env
 
-.PHONY: hooks up down nuke topics ps fetch replay migrate sink sink-logs alerts-sink alerts-sink-logs tracker tracker-logs reconcile score test typecheck
+.PHONY: hooks up down nuke topics ps fetch fetch-refdata area replay migrate sink sink-logs alerts-sink alerts-sink-logs tracker tracker-logs reconcile score test typecheck
 
 .env:
 	@echo "Missing .env. Run: cp .env.example .env" >&2; exit 1
@@ -12,6 +12,7 @@ env_get = $(shell sed -n 's/^$(1)=//p' .env 2>/dev/null)
 AIS_DAY ?= $(call env_get,AIS_DAY)
 AIS_DATA_DIR ?= $(or $(call env_get,AIS_DATA_DIR),./data/ais)
 AIS_CSV ?= $(AIS_DATA_DIR)/aisdk-$(AIS_DAY).csv
+REFDATA_DIR ?= $(or $(call env_get,REFDATA_DIR),./data/refdata)
 
 ## Point git at the repo's hooks (commit-msg format and trailer stripping).
 hooks:
@@ -45,7 +46,19 @@ ps: .env
 ## Download, verify (SHA-256) and unzip the pinned DMA AIS day into AIS_DATA_DIR.
 fetch: .env
 	@test -n "$(AIS_DAY)" || { echo "AIS_DAY is not set in .env" >&2; exit 1; }
-	uv run python refdata/fetch.py --source dma_ais --day $(AIS_DAY) --dest $(AIS_DATA_DIR)
+	uv run python -m refdata.fetch --source dma_ais --day $(AIS_DAY) --dest $(AIS_DATA_DIR)
+
+## Verify (SHA-256) the reference layers for the zone package in
+## REFDATA_DIR/incoming/<source>/<version>/. EEZ and WDPA are placed by hand; WPI is
+## downloaded if possible. A missing file prints where to get it and where to put it.
+REFDATA_SOURCES := eez wdpa_marine wpi
+fetch-refdata: .env
+	uv run python -m refdata.fetch --incoming $(REFDATA_DIR)/incoming $(addprefix --source ,$(REFDATA_SOURCES))
+
+## Recompute refdata/area.yaml (the zone package's bounding box) from the pinned AIS
+## day. Only needed when the day or refdata/package.yaml changes; commit the result.
+area: .env
+	uv run python -m refdata.area
 
 ## Replay the pinned AIS day into ais.raw at SPEED (default 10x, the speed the
 ## pipeline is sized for). Brokers default to REDPANDA_BROKERS in .env.
