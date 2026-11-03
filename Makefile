@@ -1,6 +1,6 @@
 COMPOSE := docker compose -f deploy/compose/docker-compose.yml --env-file .env
 
-.PHONY: hooks up down nuke topics ps fetch fetch-refdata area replay migrate sink sink-logs alerts-sink alerts-sink-logs tracker tracker-logs reconcile score test typecheck
+.PHONY: hooks up down nuke topics ps fetch fetch-refdata area replay migrate migrate-postgis sink sink-logs alerts-sink alerts-sink-logs tracker tracker-logs reconcile score test typecheck
 
 .env:
 	@echo "Missing .env. Run: cp .env.example .env" >&2; exit 1
@@ -25,7 +25,7 @@ hooks:
 up: hooks .env
 	$(COMPOSE) up -d --wait --wait-timeout 180 $(SERVICES)
 	$(COMPOSE) run --rm init-topics
-	$(MAKE) migrate
+	$(MAKE) migrate migrate-postgis
 	$(COMPOSE) up -d --build raw-sink alerts-sink tracker
 
 ## Stop and remove containers; named volumes (topic data, DBs) are kept.
@@ -90,7 +90,11 @@ tracker-logs: .env
 
 ## Apply new ClickHouse migrations in sql/clickhouse/ (no-op when up to date).
 migrate: .env
-	uv run python -m sql.migrate
+	uv run python -m sql.migrate --target clickhouse
+
+## Apply new PostGIS migrations in sql/postgis/ (no-op when up to date).
+migrate-postgis: .env
+	uv run python -m sql.migrate --target postgis
 
 ## Check one replay run against ClickHouse, per partition. Waits up to WAIT seconds
 ## while rows are only missing (sink catching up). make reconcile RUN=<run_id>

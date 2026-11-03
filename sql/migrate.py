@@ -1,16 +1,22 @@
-"""Apply numbered ClickHouse migrations in order and record them.
+"""Apply numbered migrations to ClickHouse or PostGIS, in order, and record them.
 
-    uv run python -m sql.migrate            # or: make migrate
-    uv run python -m sql.migrate --dry-run  # show the plan, change nothing
+    uv run python -m sql.migrate                     # ClickHouse (make migrate)
+    uv run python -m sql.migrate --target postgis    # PostGIS (make migrate-postgis)
+    uv run python -m sql.migrate --dry-run           # show the plan, change nothing
 
-Files are sql/clickhouse/NNNN_name.sql. Each applied file is recorded in
-dvw.schema_migrations with the SHA-256 of its bytes. The run fails, before applying
+Files are sql/<target>/NNNN_name.sql. Each applied file is recorded in the target's
+schema_migrations table with the SHA-256 of its bytes. The run fails, before applying
 anything, if an applied file was edited, renamed or deleted, or if a new file is
-numbered below the latest applied one.
+numbered below the latest applied one. The rules are the same for both targets.
 
 ClickHouse DDL is not transactional: if a file fails halfway, its earlier statements
 stay applied and the file is not recorded, so the next run re-executes it from the top.
-Write every statement so that re-running it is harmless (IF NOT EXISTS and similar).
+Write every ClickHouse statement so that re-running it is harmless (IF NOT EXISTS and
+similar).
+
+PostgreSQL DDL is transactional: each PostGIS file runs as one transaction together
+with its schema_migrations row, so a file is either fully applied and recorded or not
+at all. The file is sent as one script, so dollar quoting and functions work.
 """
 
 from __future__ import annotations
@@ -21,14 +27,17 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Protocol
 
+import psycopg
 from clickhouse_connect.driver.client import Client
 
 from common.clickhouse import client_from_env
 from common.env import REPO_ROOT
+from common.postgis import conninfo
 
-DEFAULT_DIR = REPO_ROOT / "sql" / "clickhouse"
-TABLE = "dvw.schema_migrations"
+SQL_ROOT = REPO_ROOT / "sql"
+TARGETS = ("clickhouse", "postgis")
 FILE_RE = re.compile(r"^(\d{4})_([a-z0-9_]+)\.sql$")
 
 
@@ -146,8 +155,20 @@ def split_statements(sql: str) -> list[str]:
     return statements
 
 
-def table_exists(client: Client) -> bool:
-    return bool(client.command(f"EXISTS TABLE {TABLE}"))
+class Target(Protocol):
+    table: str
+
+    def has_table(self) -> bool: ...
+
+    def read_applied(self) -> list[Applied]: ...
+
+    def run(self, m: Migration) -> None:
+        """Execute a file's SQL without recording it (bootstrapping 0000)."""
+        ...
+
+    def apply(self, m: Migration) -> None:
+        """Execute a file's SQL and record it in table."""
+        ...
 
 
 def as_text(value: object) -> str:
@@ -155,54 +176,103 @@ def as_text(value: object) -> str:
     return value.decode("ascii") if isinstance(value, bytes) else str(value)
 
 
-def read_applied(client: Client) -> list[Applied]:
-    rows = client.query(f"SELECT version, name, checksum FROM {TABLE} ORDER BY version").result_rows
-    return [Applied(int(v), as_text(n), as_text(c)) for v, n, c in rows]
+class ClickHouseTarget:
+    table = "dvw.schema_migrations"
+
+    def __init__(self, client: Client) -> None:
+        self.client = client
+
+    def has_table(self) -> bool:
+        return bool(self.client.command(f"EXISTS TABLE {self.table}"))
+
+    def read_applied(self) -> list[Applied]:
+        rows = self.client.query(f"SELECT version, name, checksum FROM {self.table} ORDER BY version").result_rows
+        return [Applied(int(v), as_text(n), as_text(c)) for v, n, c in rows]
+
+    def run(self, m: Migration) -> None:
+        for stmt in split_statements(m.sql):
+            self.client.command(stmt)
+
+    def apply(self, m: Migration) -> None:
+        self.run(m)
+        self.client.insert(self.table, [[m.version, m.name, m.checksum]], column_names=["version", "name", "checksum"])
 
 
-def apply(client: Client, m: Migration) -> None:
-    for stmt in split_statements(m.sql):
-        client.command(stmt)
-    client.insert(TABLE, [[m.version, m.name, m.checksum]], column_names=["version", "name", "checksum"])
+class PostgisTarget:
+    table = "public.schema_migrations"
+
+    def __init__(self, conn: psycopg.Connection[Any]) -> None:
+        conn.autocommit = True  # every file gets its own explicit transaction
+        self.conn = conn
+
+    def has_table(self) -> bool:
+        row = self.conn.execute("SELECT to_regclass(%s) IS NOT NULL", (self.table,)).fetchone()
+        return bool(row and row[0])
+
+    def read_applied(self) -> list[Applied]:
+        rows = self.conn.execute("SELECT version, name, checksum FROM public.schema_migrations ORDER BY version")
+        return [Applied(int(v), str(n), str(c)) for v, n, c in rows.fetchall()]
+
+    def run(self, m: Migration) -> None:
+        with self.conn.transaction():
+            # Without parameters psycopg sends the file as one simple query, so it may
+            # hold several statements.
+            self.conn.execute(m.sql.encode("utf-8"))
+
+    def apply(self, m: Migration) -> None:
+        with self.conn.transaction():
+            self.conn.execute(m.sql.encode("utf-8"))
+            self.conn.execute(
+                "INSERT INTO public.schema_migrations (version, name, checksum) VALUES (%s, %s, %s)",
+                (m.version, m.name, m.checksum),
+            )
+
+
+def connect(target: str) -> Target:
+    if target == "clickhouse":
+        return ClickHouseTarget(client_from_env())
+    return PostgisTarget(psycopg.connect(conninfo()))
 
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="migrate", description=__doc__.splitlines()[0])
-    p.add_argument("--dir", type=Path, default=DEFAULT_DIR)
+    p.add_argument("--target", choices=TARGETS, default="clickhouse")
+    p.add_argument("--dir", type=Path, help="migrations directory (default: sql/<target>)")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args(argv)
+    directory: Path = args.dir or SQL_ROOT / args.target
+    tag = f"migrate[{args.target}]"
 
     try:
-        migrations = discover(args.dir)
+        migrations = discover(directory)
         if not migrations or migrations[0].version != 0:
-            raise MigrationError(f"{args.dir}: 0000_*.sql must exist and create {TABLE}")
-        client = client_from_env()
-        if not table_exists(client):
+            raise MigrationError(f"{directory}: 0000_*.sql must exist and create the schema_migrations table")
+        db = connect(args.target)
+        if not db.has_table():
             if args.dry_run:
                 applied: list[Applied] = []
             else:
                 # Bootstrap: 0000 creates the bookkeeping table. It is recorded below
                 # like any other file (re-running it is a no-op by design).
-                for stmt in split_statements(migrations[0].sql):
-                    client.command(stmt)
-                applied = read_applied(client)
+                db.run(migrations[0])
+                applied = db.read_applied()
         else:
-            applied = read_applied(client)
+            applied = db.read_applied()
         pending = plan(migrations, applied)
     except MigrationError as e:
-        print(f"migrate: ERROR: {e}", file=sys.stderr)
+        print(f"{tag}: ERROR: {e}", file=sys.stderr)
         return 1
 
     if not pending:
-        print(f"migrate: up to date ({len(applied)} applied, nothing to do)")
+        print(f"{tag}: up to date ({len(applied)} applied, nothing to do)")
         return 0
     for m in pending:
         label = f"{m.version:04d}_{m.name}"
         if args.dry_run:
-            print(f"migrate: would apply {label} sha256={m.checksum[:12]}")
+            print(f"{tag}: would apply {label} sha256={m.checksum[:12]}")
             continue
-        apply(client, m)
-        print(f"migrate: applied {label} sha256={m.checksum[:12]}")
+        db.apply(m)
+        print(f"{tag}: applied {label} sha256={m.checksum[:12]}")
     return 0
 
 
