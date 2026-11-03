@@ -10,7 +10,7 @@ A day of Danish AIS traffic replays into Redpanda in event-time order, and every
 
 A Faust worker tracks every vessel with a Kalman filter and writes one `ais.tracks` message per accepted fix: filtered position and velocity, and how far the fix landed from the prediction (the innovation). It is at-least-once with outputs stored before state, so a crash can repeat a track message but not lose one ([ADR 0004](docs/adr/0004-tracker-at-least-once-outputs-before-state.md)).
 
-Detections (DARK_GAP, TELEPORT), the alerts table, Flink enrichment and the reference data are not built yet.
+The same worker raises DARK_GAP and TELEPORT alerts on `ais.alerts`, each with a deterministic `alert_id` so a reprocessed alert is the same alert ([ADR 0005](docs/adr/0005-detections-in-the-tracker-event-time.md)). The DARK_GAP zone check is a stub that always passes until the PostGIS zones arrive. The alerts table, Flink enrichment and the reference data are not built yet.
 
 ## Quickstart
 
