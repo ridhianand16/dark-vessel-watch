@@ -85,7 +85,7 @@ reconcile: .env
 	uv run python -m reconcile.run_check $(RUN) --wait $(WAIT)
 
 ## Score a --inject run's alerts against its labels: TP/FP/FN per alert type. Waits up
-## to WAIT seconds while expected alerts are missing. make score RUN=<run_id>
+## to WAIT seconds for the tracker and alerts sink to finish the run. make score RUN=<run_id>
 score: .env
 	@test -n "$(RUN)" || { echo "usage: make score RUN=<run_id>  (a run replayed with --inject)" >&2; exit 2; }
 	uv run python -m reconcile.score_alerts $(RUN) --wait $(WAIT)

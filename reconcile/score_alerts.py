@@ -14,8 +14,14 @@ Per alert type:
         type, or any alert on a decoy (labels with expect: null)
 Alerts on real vessels have no ground truth; they are counted separately, not scored.
 
+Scores only once the pipeline has finished the run: the tracker has committed past the
+run's last ais.raw offsets (produced.json) and the alerts sink has committed up to the
+end of ais.alerts. Stopping as soon as the expected alerts appear would miss false
+positives raised later in the run. --wait bounds how long to wait for that.
+
 Also checks that FINAL holds each alert_id once. Exit codes: 0 no FP, no FN and no
-duplicate; 1 otherwise; 2 the run cannot be scored.
+duplicate; 1 otherwise, or the pipeline did not finish within --wait; 2 the run
+cannot be scored.
 """
 
 from __future__ import annotations
@@ -30,17 +36,17 @@ from pathlib import Path
 from typing import Any
 
 from clickhouse_connect.driver.client import Client
+from confluent_kafka import Consumer, TopicPartition
 
 from common.clickhouse import client_from_env
-from common.env import REPO_ROOT
+from common.env import REPO_ROOT, setting
+from reconcile.run_check import RunError, load_produced
 from stream.faust_app.detect import AlertType, alert_id
 
 TABLE = "dvw.alerts"
 TYPES = tuple(t.value for t in AlertType)
-
-
-class RunError(Exception):
-    pass
+TRACKER_GROUP = "dvw-tracker"
+ALERTS_SINK_GROUP = "dvw-alerts-sink"
 
 
 @dataclass(frozen=True)
@@ -110,6 +116,40 @@ def score(doc: dict[str, Any], stored: list[Stored]) -> Score:
     return s
 
 
+def behind(brokers: str, raw_last: dict[int, int]) -> list[str]:
+    """What the pipeline still has to process for the run; empty when it is done.
+
+    raw_last is the run's last ais.raw offset per partition. Committed offsets are the
+    next offset to read, so the tracker is done with a partition once its commit is past
+    the last one. Reading a group's commits does not join the group.
+    """
+    out: list[str] = []
+
+    def committed(group: str, tps: list[TopicPartition]) -> list[TopicPartition]:
+        c = Consumer({"bootstrap.servers": brokers, "group.id": group, "enable.auto.commit": False})
+        try:
+            return list(c.committed(tps, timeout=10))
+        finally:
+            c.close()
+
+    raw = committed(TRACKER_GROUP, [TopicPartition("ais.raw", p) for p in sorted(raw_last)])
+    for tp in raw:
+        left = raw_last[tp.partition] + 1 - max(tp.offset, 0)
+        if left > 0:
+            out.append(f"tracker: {left} records on ais.raw/{tp.partition}")
+    c = Consumer({"bootstrap.servers": brokers, "group.id": ALERTS_SINK_GROUP})
+    try:
+        meta = c.list_topics("ais.alerts", timeout=10).topics["ais.alerts"].partitions
+        ends = {p: c.get_watermark_offsets(TopicPartition("ais.alerts", p), timeout=10)[1] for p in meta}
+    finally:
+        c.close()
+    for tp in committed(ALERTS_SINK_GROUP, [TopicPartition("ais.alerts", p) for p in sorted(ends)]):
+        left = ends[tp.partition] - max(tp.offset, 0)
+        if left > 0:
+            out.append(f"alerts-sink: {left} records on ais.alerts/{tp.partition}")
+    return out
+
+
 def query(client: Client, run_id: str) -> tuple[list[Stored], int, int]:
     """(rows FINAL, count FINAL, distinct alert_id FINAL) for the run."""
     params = {"run": run_id}
@@ -145,22 +185,25 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("run_id")
     ap.add_argument("--runs-dir", type=Path, default=REPO_ROOT / "data" / "runs")
     ap.add_argument("--wait", type=float, default=0.0,
-                    help="seconds to keep re-checking while expected alerts are missing (tracker catching up)")
+                    help="seconds to wait for the tracker and alerts sink to finish the run")
     args = ap.parse_args(argv)
+    run_dir = args.runs_dir / args.run_id
     try:
-        doc = load_labels(args.runs_dir / args.run_id / "labels.json", args.run_id)
+        doc = load_labels(run_dir / "labels.json", args.run_id)
+        raw_last = {p.partition: p.last_offset for p in load_produced(run_dir / "produced.json", args.run_id)}
     except RunError as e:
         print(f"score: {e}", file=sys.stderr)
         return 2
-    client = client_from_env()
+    brokers = setting("REDPANDA_BROKERS", "localhost:19092")
     deadline = time.monotonic() + args.wait
-    while True:
-        stored, n, distinct = query(client, args.run_id)
-        s = score(doc, stored)
-        if not s.fn or time.monotonic() >= deadline:
-            break
+    while (pending := behind(brokers, raw_last)) and time.monotonic() < deadline:
         time.sleep(2.0)
+    stored, n, distinct = query(client_from_env(), args.run_id)
+    s = score(doc, stored)
     print(render(args.run_id, doc, s, n, distinct))
+    if pending:
+        print(f"score: INCOMPLETE, the pipeline has not finished the run: {'; '.join(pending)}", file=sys.stderr)
+        return 1
     if s.ok and n == distinct:
         print("score: OK, every injected event raised exactly its alert")
         return 0
