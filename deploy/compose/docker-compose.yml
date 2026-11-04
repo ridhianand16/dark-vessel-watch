@@ -69,7 +69,14 @@ services:
     # created earlier with the wrong layout (keys are MMSI; partitioning matters).
     command:
       - |
-        export RPK_BROKERS=redpanda:9092
+        export RPK_BROKERS=redpanda:9092 RPK_ADMIN_HOSTS=redpanda:9644
+        # The Flink job's Kafka transactions time out after 10 min (EnrichmentJob, ADR 0014).
+        # The broker must allow at least 15 min, or every transactional sink fails at start.
+        # Checked, not set: a broker that allows less is a misconfiguration to look at.
+        tx_max=$$(rpk cluster config get transaction_max_timeout_ms)
+        if [ "$$tx_max" -lt 900000 ]; then
+          echo "ERROR: transaction_max_timeout_ms is $$tx_max ms, the Flink job needs at least 900000" >&2; exit 1
+        fi
         TOPICS="ais.raw ais.enriched ais.tracks ais.alerts ais.dlq ais.dedup_counts"
         rpk topic create $$TOPICS --partitions 6 --replicas 1 --if-not-exists
         for t in $$TOPICS; do
