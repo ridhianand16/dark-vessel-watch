@@ -101,53 +101,112 @@ def test_delivery_tracker_min_max_count() -> None:
     }
 
 
-def test_cli_stamps_messages_with_the_runs_dir_run_id(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """run_id in every message must equal the data/runs/<run_id>/ directory name."""
+class FakeMessage:
+    def __init__(self, offset: int) -> None:
+        self._offset = offset
+
+    def partition(self) -> int:
+        return 0
+
+    def offset(self) -> int:
+        return self._offset
+
+
+class FakeProducer:
+    """Acknowledges everything on flush. raise_on: the produce() call (0-based) that
+    raises `error` instead; earlier messages are still acknowledged."""
+
+    def __init__(self, runs: Path, raise_on: int | None = None, error: BaseException | None = None) -> None:
+        self.runs = runs
+        self.raise_on, self.error = raise_on, error
+        self.sent: list[bytes] = []
+        self.statuses: list[str] = []  # produced.json status seen while producing
+        self.pending: list[tuple[int, Any]] = []
+
+    def produce(self, topic: str, value: bytes, key: bytes, on_delivery: Any) -> None:
+        if self.raise_on is not None and len(self.sent) == self.raise_on:
+            assert self.error is not None
+            raise self.error
+        (run_dir,) = self.runs.iterdir()
+        self.statuses.append(json.loads((run_dir / "produced.json").read_text())["status"])
+        self.sent.append(value)
+        self.pending.append((len(self.sent) - 1, on_delivery))
+
+    def poll(self, timeout: float = 0) -> int:
+        return 0
+
+    def flush(self, timeout: float = 0) -> int:
+        for offset, cb in self.pending:
+            cb(None, FakeMessage(offset))
+        self.pending.clear()
+        return 0
+
+
+def replay_two_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, producer_args: dict[str, Any]
+) -> tuple[int, dict[str, Any], FakeProducer]:
     import ingest.replayer.cli as cli
 
     path = write_csv(tmp_path, ROW, ROW.replace("219026147", "211000001"))
-    sent: list[bytes] = []
-    statuses: list[str] = []  # produced.json status seen while producing
-
-    class FakeProducer:
-        def __init__(self) -> None:
-            self.pending: list[tuple[int, Any]] = []
-
-        def produce(self, topic: str, value: bytes, key: bytes, on_delivery: Any) -> None:
-            (run_dir,) = runs.iterdir()
-            statuses.append(json.loads((run_dir / "produced.json").read_text())["status"])
-            sent.append(value)
-            self.pending.append((len(sent) - 1, on_delivery))
-
-        def poll(self, timeout: float = 0) -> int:
-            return 0
-
-        def flush(self, timeout: float = 0) -> int:
-            for offset, cb in self.pending:
-                cb(None, FakeMessage(offset))
-            self.pending.clear()
-            return 0
-
-    class FakeMessage:
-        def __init__(self, offset: int) -> None:
-            self._offset = offset
-
-        def partition(self) -> int:
-            return 0
-
-        def offset(self) -> int:
-            return self._offset
-
     runs = tmp_path / "runs"
-    monkeypatch.setattr(cli, "make_producer", lambda brokers, run_id: FakeProducer())
+    producer = FakeProducer(runs, **producer_args)
+    monkeypatch.setattr(cli, "make_producer", lambda brokers, run_id: producer)
     rc = cli.main(["--file", str(path), "--speed", "100", "--runs-dir", str(runs)])
-    assert rc == 0
     (run_dir,) = runs.iterdir()
     produced = json.loads((run_dir / "produced.json").read_text())
     assert produced["run_id"] == run_dir.name
+    return rc, produced, producer
+
+
+def test_cli_stamps_messages_with_the_runs_dir_run_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """run_id in every message must equal the data/runs/<run_id>/ directory name."""
+    rc, produced, producer = replay_two_rows(tmp_path, monkeypatch, {})
+    assert rc == 0
     assert produced["partitions"] == {"0": {"first_offset": 0, "last_offset": 1, "count": 2}}
-    assert [json.loads(v)["run_id"] for v in sent] == [run_dir.name, run_dir.name]
-    assert statuses == ["running", "running"]
+    assert [json.loads(v)["run_id"] for v in producer.sent] == [produced["run_id"]] * 2
+    assert producer.statuses == ["running", "running"]
     assert produced["status"] == "complete"
+
+
+def test_an_error_while_replaying_marks_the_run_failed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An error mid-replay must not leave produced.json at "running" (the reconciliation
+    job would wait for it until its timeout). What was acknowledged is still recorded."""
+    rc, produced, _ = replay_two_rows(tmp_path, monkeypatch, {"raise_on": 1, "error": RuntimeError("broker gone")})
+    assert rc == 1
+    assert produced["status"] == "failed"
+    assert produced["partitions"] == {"0": {"first_offset": 0, "last_offset": 0, "count": 1}}
+
+
+@pytest.mark.parametrize("error", [KeyboardInterrupt(), "sigterm"])
+def test_ctrl_c_or_sigterm_marks_the_run_interrupted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: BaseException | str
+) -> None:
+    import ingest.replayer.cli as cli
+
+    exc = cli.Interrupted("SIGTERM") if error == "sigterm" else error
+    assert isinstance(exc, BaseException)
+    rc, produced, _ = replay_two_rows(tmp_path, monkeypatch, {"raise_on": 1, "error": exc})
+    assert rc == 130
+    assert produced["status"] == "interrupted"
+    assert produced["partitions"] == {"0": {"first_offset": 0, "last_offset": 0, "count": 1}}
+
+
+def test_sigterm_handler_raises_interrupted_and_is_restored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import signal
+
+    import ingest.replayer.cli as cli
+
+    seen: list[object] = []
+
+    class Probe(FakeProducer):
+        def produce(self, topic: str, value: bytes, key: bytes, on_delivery: Any) -> None:
+            seen.append(signal.getsignal(signal.SIGTERM))
+            super().produce(topic, value, key, on_delivery)
+
+    before = signal.getsignal(signal.SIGTERM)
+    path = write_csv(tmp_path, ROW)
+    runs = tmp_path / "runs"
+    monkeypatch.setattr(cli, "make_producer", lambda brokers, run_id: Probe(runs))
+    assert cli.main(["--file", str(path), "--speed", "100", "--runs-dir", str(runs)]) == 0
+    assert seen == [cli.raise_interrupted]
+    assert signal.getsignal(signal.SIGTERM) == before
