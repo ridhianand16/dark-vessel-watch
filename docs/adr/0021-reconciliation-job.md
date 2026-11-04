@@ -99,3 +99,11 @@ Counting after a fixed sleep is either slow or wrong.
 Every reconciliation reader goes through `reconcile/kafka.py` and consumes with
 `read_committed`, so it never counts records from aborted Flink transactions. Each one
 uses `auto.offset.reset=earliest`, and a missing topic raises `RunError`.
+
+## Note (2026-11-04): every check on every run
+
+"A rerun replaces the verdict" held only per (run_id, partition, check) key. A run checked
+with `--baseline` wrote `tracks_match` rows, and a later rerun without it left them in the
+table. Every run now writes every check: without a baseline, `tracks_match` is a `warn` row
+per partition, "not run (no --baseline)". `warn` rather than a new status keeps the
+`status` column as it is; the cost is that the summary line counts those rows as warnings.

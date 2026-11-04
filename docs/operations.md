@@ -103,7 +103,7 @@ Every replay run writes `data/runs/<run_id>/produced.json`: for each of the 6 `a
    | `dlq_share` | warns when more than 5% went to the DLQ, with the count per reason |
 
    Plus one run-wide `latency` row: p50/p95/p99 from replayer send to the fix stored in `dvw.tracks` (warns above 5 s). With `BASELINE=<run_id>` of the same rows, `tracks_match` also compares every vessel's tracks with that run's.
-3. **Keep the verdict.** One row per run, partition and check goes into `dvw.reconciliation`, with the counts and DLQ reasons. Running it again replaces the verdict instead of adding to it. The exit code is 1 if any check fails.
+3. **Keep the verdict.** One row per run, partition and check goes into `dvw.reconciliation`, with the counts and DLQ reasons. Running it again replaces the verdict instead of adding to it. Every run writes every check: without `BASELINE`, `tracks_match` is a `warn` row per partition saying "not run (no --baseline)", so a rerun always replaces the whole verdict, and the summary line counts those six as warnings. The example below is from before that row existed. The exit code is 1 if any check fails.
 
 This is a real run: 10,000 rows with three broken lines added on purpose (an MMSI that is not a number, a latitude of `garbage`, a position at 0,0). All three land in the DLQ under their own reason, and everything still balances. Check rows that are the same on every partition are cut to one:
 

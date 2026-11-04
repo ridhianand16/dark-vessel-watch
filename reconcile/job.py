@@ -23,7 +23,9 @@
        latency        p50/p95/p99 of replay send to fix stored in dvw.tracks (warn above
                       --latency-warn-ms)
    With --baseline <run_id>, also tracks_match per partition: this run's tracks equal
-   the baseline's, vessel by vessel (reconcile/compare_tracks.py).
+   the baseline's, vessel by vessel (reconcile/compare_tracks.py). Without it,
+   tracks_match is still written, as a warn row "not run (no --baseline)", so every run
+   writes every check and a rerun always replaces the earlier verdict.
 4. Prints the tables, writes one row per partition and check to dvw.reconciliation
    (a rerun replaces them), exits non-zero on any fail.
 
@@ -314,6 +316,12 @@ def tracks_match(run_id: str, baseline: str, tracks: Iterable[dict[str, Any]]) -
     return out
 
 
+def tracks_match_not_run(partitions: Iterable[int]) -> list[Check]:
+    """The tracks_match rows of a run checked without --baseline. Written anyway, so a
+    rerun replaces an earlier tracks_match verdict instead of leaving it in the table."""
+    return [Check(p, "tracks_match", "warn", "not run (no --baseline)", 0, 0) for p in sorted(partitions)]
+
+
 # ----------------------------------------------------------------- output
 
 
@@ -446,6 +454,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.baseline and baseline_since is not None:
             since = min(since_ms, baseline_since - kafka.SEEK_MARGIN_MS)
             checks += tracks_match(run_id, args.baseline, kafka.read_topic(brokers, TRACKS_TOPIC, since))
+        else:
+            checks += tracks_match_not_run(counts)
     except RunError as e:
         print(f"reconcile: {e}", file=sys.stderr)
         return 2
