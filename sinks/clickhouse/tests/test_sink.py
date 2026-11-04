@@ -140,3 +140,34 @@ def test_every_mapper_fills_every_column(spec: SinkSpec) -> None:
     for value in (None, b"", b"\xff", b"[]", b'{"schema_version": 1}', FakeMessage(0, 0).value()):
         row = spec.to_row(value, 0, 0, 0)
         assert len(row) == len(spec.columns)
+
+
+class ClosingConsumer(FakeConsumer):
+    """Like the real consumer, close() revokes the partitions, which calls on_revoke."""
+
+    def subscribe(self, topics: list[str], on_assign: Any, on_revoke: Any) -> None:
+        self.on_revoke = on_revoke
+
+    def consume(self, num_messages: int, timeout: float) -> list[FakeMessage]:
+        if self.batches:
+            return self.batches.pop(0)
+        raise RuntimeError("fatal consumer error")  # stands in for KafkaException(fatal)
+
+    def close(self) -> None:
+        self.events.append("close")
+        self.on_revoke(self, [])
+
+
+def test_an_unexpected_error_neither_writes_nor_commits_on_close() -> None:
+    """A batch collected before an unexpected error is not written or committed by the
+    revoke that close() triggers: the process is failing, and the error that stops it is
+    the one that surfaces. The batch is re-read on restart."""
+    consumer = ClosingConsumer([[FakeMessage(0, 5)]])
+    client = FakeClient(0)
+    s = BatchSettings(max_rows=10, max_wait_s=5.0, write_attempts=1, backoff_base_s=0.0)
+    sink = ClickHouseSink(replace(SPECS["raw"], settings=s), cast(Consumer, consumer), cast(Client, client))
+    with pytest.raises(RuntimeError, match="fatal consumer error"):
+        sink.run()
+    assert sink.failed
+    assert client.inserted == [] and consumer.commits == []
+    assert consumer.events == ["close"]
