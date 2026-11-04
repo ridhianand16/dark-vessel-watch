@@ -51,7 +51,7 @@ from clickhouse_connect.driver.client import Client
 from common.clickhouse import client_from_env
 from common.env import REPO_ROOT, setting
 from reconcile import compare_tracks, flink_check, kafka, latency, run_check
-from reconcile.run_check import Produced, RunError
+from reconcile.run_check import Produced, RunError, RunStillRunning
 from reconcile.kafka import ALERTS_SINK_GROUP, FLINK_GROUP, Progress, lagging, run_last_offsets
 from stream.faust_app.config import ENRICHED_TOPIC, RAW_TOPIC
 
@@ -123,9 +123,7 @@ def wait_for_run(path: Path, run_id: str, deadline: float, poll_s: float = 2.0) 
     while True:
         try:
             return run_check.load_produced(path, run_id)
-        except RunError as e:
-            if not path.exists() or "status 'running'" not in str(e):
-                raise
+        except RunStillRunning:
             if time.monotonic() >= deadline:
                 raise RunError(f"run {run_id} is still running (or its replayer was killed)") from None
             if not announced:

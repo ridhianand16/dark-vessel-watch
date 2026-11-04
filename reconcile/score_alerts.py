@@ -37,6 +37,7 @@ import argparse
 import json
 import sys
 import time
+import uuid
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -143,7 +144,13 @@ def describe_zone(details: str) -> str:
 def behind(brokers: str, progress: Progress) -> list[str]:
     """What the pipeline still has to process for the run; empty when it is done."""
     out = progress.tracker_behind()
-    c = Consumer({"bootstrap.servers": brokers, "group.id": ALERTS_SINK_GROUP})
+    # Only reads the end offsets. A throwaway group, never the sink's: this consumer must
+    # not be able to touch the alerts sink's group in any way.
+    c = Consumer({
+        "bootstrap.servers": brokers,
+        "group.id": f"dvw-score-watermarks-{uuid.uuid4().hex[:8]}",
+        "enable.auto.commit": False,
+    })
     try:
         meta = c.list_topics("ais.alerts", timeout=10).topics["ais.alerts"].partitions
         ends = {p: c.get_watermark_offsets(TopicPartition("ais.alerts", p), timeout=10)[1] for p in meta}
