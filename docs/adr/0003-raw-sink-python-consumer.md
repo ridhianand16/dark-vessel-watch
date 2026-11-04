@@ -67,7 +67,7 @@ arrived, so a value that does not decode must still be stored.
   rows in a run's range must carry that run's `run_id`.
 - **More state to watch:** consumer lag for `dvw-raw-sink`, the sink's restart count,
   rows with `decode_error != ''`, and the parts count (many small parts mean batches
-  are too small). M6 puts these on the dashboard.
+  are too small). These belong on the dashboard.
 - **A poison batch can stall the sink.** If an insert fails deterministically (not
   because of a value, which is mapped, but because of something like a schema change),
   the sink restarts in a loop at the same offset. The loop is visible from the restart

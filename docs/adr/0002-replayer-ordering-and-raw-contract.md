@@ -5,8 +5,9 @@ Status: accepted (2026-11-02)
 ## Context
 
 The replayer models a one-way sensor feed: it must send every CSV row, in event-time
-order, keep enough to explain later rejects (DLQ in M4), and record exactly what was
-acknowledged for the zero-loss reconciliation (M5). A DMA day is 3.2 GB and 18.9M rows.
+order, keep enough to explain later rejects (the Flink enrichment job's DLQ), and
+record exactly what was acknowledged for the zero-loss reconciliation job. A DMA day
+is 3.2 GB and 18.9M rows.
 
 ## Decision
 
@@ -22,8 +23,9 @@ acknowledged for the zero-loss reconciliation (M5). A DMA day is 3.2 GB and 18.9
 4. **Timestamps are epoch milliseconds (UTC) ints** in `event_ts` and
    `replay_send_ts`, not ISO strings. They are unambiguous, cheap to parse, and map
    directly to ClickHouse `DateTime64(3)`.
-5. **`raw` is always present**, not only on rows that failed to parse. M4 decides
-   validity, and the replayer cannot know which rows M4 will reject.
+5. **`raw` is always present**, not only on rows that failed to parse. The Flink
+   enrichment job decides validity, and the replayer cannot know which rows it will
+   reject.
 6. **produced.json counts broker acknowledgements**, not produce() calls. Offsets
    come from delivery callbacks.
 7. **Every message carries `run_id`**, the same value as its `data/runs/<run_id>/`
@@ -52,6 +54,7 @@ cheap. Message building runs at about 73k rows/s; 100x needs about 22k/s.
 - Re-running the replayer appends a second copy to `ais.raw`. Producer idempotence
   only removes retry duplicates *within* a run. Reconciliation is therefore scoped
   per run: for each partition, the offset range in `data/runs/<run_id>/produced.json`,
-  checked against the `run_id` on the stored rows. Downstream dedup is M4's job.
+  checked against the `run_id` on the stored rows. Downstream dedup is the Flink
+  enrichment job's dedup step (ADR 0015).
 - Producing faster than the target rate is not throttled. Falling behind is not
   "repaid" later: the replayer bursts until it is back on schedule.

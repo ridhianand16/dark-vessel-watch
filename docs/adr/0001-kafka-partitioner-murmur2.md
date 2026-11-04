@@ -27,7 +27,7 @@ Every producer uses Java-compatible murmur2 on the UTF-8 key:
 In librdkafka that is `partitioner=murmur2_random`. The `_random` suffix only
 affects null keys, and we never send one: unparseable MMSIs use the key `"invalid"`.
 
-Verified on the M1 smoke run: 3,000 messages in `ais.raw` checked against a
+Verified on the first smoke run: 3,000 messages in `ais.raw` checked against a
 reference murmur2 implementation, 0 mismatches.
 
 ## Alternatives
