@@ -27,6 +27,10 @@ class RunError(Exception):
     pass
 
 
+class RunStillRunning(RunError):
+    """produced.json says "running": the replayer has not finished the run (or was killed)."""
+
+
 @dataclass(frozen=True)
 class Produced:
     partition: int
@@ -74,6 +78,8 @@ def load_produced(path: Path, run_id: str) -> list[Produced]:
         raise RunError(f"{path} not found") from None
     if doc.get("run_id") != run_id:
         raise RunError(f"{path} is for run {doc.get('run_id')!r}, not {run_id!r}")
+    if doc.get("status") == "running":
+        raise RunStillRunning(f"run {run_id} has status 'running'; only complete runs can be reconciled")
     if doc.get("status") != "complete":
         raise RunError(f"run {run_id} has status {doc.get('status')!r}; only complete runs can be reconciled")
     out = []

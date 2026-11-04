@@ -13,6 +13,12 @@
     {"wire": "epirb", "is_ship": false, "example_mmsis": [974123456]},
     {"wire": "other", "is_ship": false, "example_mmsis": [100000000, 110999999, 112000000, 971000000, 973000000, 975000000, 900000000, 979999999, 199999999, 1000000000, -1]}
   ],
+  "sog": {
+    "description": "Speed over ground in knots. The Flink job rejects a record whose sog is negative, above max_valid_kn and not not_available_kn, or not a number (sog_invalid). The tracker uses a sog in [min_valid_kn, max_valid_kn] and treats anything else, not_available_kn included, as unknown.",
+    "min_valid_kn": 0,
+    "max_valid_kn": 102.2,
+    "not_available_kn": 102.3
+  },
   "duplicate_key": {
     "description": "Two reports of one MMSI are the same report when run_id and event_ts are equal and lat and lon are equal after rounding. The Flink job drops the later copy; the tracker counts one that reaches it as leak_duplicate.",
     "fields": ["run_id", "event_ts", "lat", "lon"],

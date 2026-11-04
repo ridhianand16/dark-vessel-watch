@@ -61,8 +61,9 @@ public final class EnrichmentJob {
      * Fixed for the life of the state; it cannot change without discarding savepoints. */
     static final int MAX_PARALLELISM = 128;
     static final long CHECKPOINT_MS = 3_000L;
-    /** Below Redpanda's transaction_max_timeout_ms (15 min); also the longest the job may be
-     * down between a checkpoint and its recovery before that checkpoint's output is aborted. */
+    /** Below Redpanda's transaction_max_timeout_ms, which init-topics requires to be at least
+     * 15 min; also the longest the job may be down between a checkpoint and its recovery
+     * before that checkpoint's output is aborted. */
     static final String TRANSACTION_TIMEOUT_MS = Long.toString(Duration.ofMinutes(10).toMillis());
 
     /** The replayer sends in event-time order (ADR 0002); 5 s absorbs injected vessels and

@@ -37,6 +37,7 @@ import argparse
 import json
 import sys
 import time
+import uuid
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -143,7 +144,13 @@ def describe_zone(details: str) -> str:
 def behind(brokers: str, progress: Progress) -> list[str]:
     """What the pipeline still has to process for the run; empty when it is done."""
     out = progress.tracker_behind()
-    c = Consumer({"bootstrap.servers": brokers, "group.id": ALERTS_SINK_GROUP})
+    # Only reads the end offsets. A throwaway group, never the sink's: this consumer must
+    # not be able to touch the alerts sink's group in any way.
+    c = Consumer({
+        "bootstrap.servers": brokers,
+        "group.id": f"dvw-score-watermarks-{uuid.uuid4().hex[:8]}",
+        "enable.auto.commit": False,
+    })
     try:
         meta = c.list_topics("ais.alerts", timeout=10).topics["ais.alerts"].partitions
         ends = {p: c.get_watermark_offsets(TopicPartition("ais.alerts", p), timeout=10)[1] for p in meta}
@@ -206,8 +213,12 @@ def main(argv: list[str] | None = None) -> int:
     brokers = setting("REDPANDA_BROKERS", "localhost:19092")
     progress = Progress(brokers, setting("TRACKER_INPUT_TOPIC", ENRICHED_TOPIC), args.run_id, raw_last, since_ms)
     deadline = time.monotonic() + args.wait
-    while (pending := behind(brokers, progress)) and time.monotonic() < deadline:
-        time.sleep(2.0)
+    try:
+        while (pending := behind(brokers, progress)) and time.monotonic() < deadline:
+            time.sleep(2.0)
+    except RunError as e:  # a topic read that timed out
+        print(f"score: {e}", file=sys.stderr)
+        return 2
     stored, n, distinct = query(client_from_env(), args.run_id)
     s = score(doc, stored)
     print(render(args.run_id, doc, s, n, distinct))

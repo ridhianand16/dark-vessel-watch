@@ -19,7 +19,8 @@ public enum Reason {
     NULL_ISLAND("null_island"),
     /** event_ts null, not an integer, or more than one day off the replayed AIS day. */
     BAD_TIMESTAMP("bad_timestamp"),
-    /** SOG above 102.2 kn and not the 102.3 "not available" code, or not a number. */
+    /** SOG negative, above 102.2 kn and not the 102.3 "not available" code, or not a number
+     * (the sog rule in contracts/ais_enriched.json). */
     SOG_INVALID("sog_invalid");
 
     public final String code;

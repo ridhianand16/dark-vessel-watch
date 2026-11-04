@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from reconcile.run_check import Produced, RunError, Stored, compare, load_produced
+from reconcile.run_check import Produced, RunError, RunStillRunning, Stored, compare, load_produced
 
 RUN = "20261102T132701Z-6cdc0c"
 
@@ -66,3 +66,12 @@ def test_compare_flags_extra_rows() -> None:
     # Another producer wrote into the run's offset range while it was running.
     results = compare([Produced(0, 0, 9, 9)], {0: Stored(10, 1, 10)})
     assert results[0].note == "extra 1, 1 rows from another run"
+
+
+def test_a_running_run_is_its_own_error_type(tmp_path: Path) -> None:
+    """The reconciliation job waits on this type, not on the wording of the message."""
+    with pytest.raises(RunStillRunning):
+        load_produced(produced_json(tmp_path / "a", status="running"), RUN)
+    with pytest.raises(RunError) as failed:
+        load_produced(produced_json(tmp_path / "b", status="failed"), RUN)
+    assert not isinstance(failed.value, RunStillRunning)

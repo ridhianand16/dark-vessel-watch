@@ -23,7 +23,9 @@
        latency        p50/p95/p99 of replay send to fix stored in dvw.tracks (warn above
                       --latency-warn-ms)
    With --baseline <run_id>, also tracks_match per partition: this run's tracks equal
-   the baseline's, vessel by vessel (reconcile/compare_tracks.py).
+   the baseline's, vessel by vessel (reconcile/compare_tracks.py). Without it,
+   tracks_match is still written, as a warn row "not run (no --baseline)", so every run
+   writes every check and a rerun always replaces the earlier verdict.
 4. Prints the tables, writes one row per partition and check to dvw.reconciliation
    (a rerun replaces them), exits non-zero on any fail.
 
@@ -51,7 +53,7 @@ from clickhouse_connect.driver.client import Client
 from common.clickhouse import client_from_env
 from common.env import REPO_ROOT, setting
 from reconcile import compare_tracks, flink_check, kafka, latency, run_check
-from reconcile.run_check import Produced, RunError
+from reconcile.run_check import Produced, RunError, RunStillRunning
 from reconcile.kafka import ALERTS_SINK_GROUP, FLINK_GROUP, Progress, lagging, run_last_offsets
 from stream.faust_app.config import ENRICHED_TOPIC, RAW_TOPIC
 
@@ -123,9 +125,7 @@ def wait_for_run(path: Path, run_id: str, deadline: float, poll_s: float = 2.0) 
     while True:
         try:
             return run_check.load_produced(path, run_id)
-        except RunError as e:
-            if not path.exists() or "status 'running'" not in str(e):
-                raise
+        except RunStillRunning:
             if time.monotonic() >= deadline:
                 raise RunError(f"run {run_id} is still running (or its replayer was killed)") from None
             if not announced:
@@ -316,6 +316,12 @@ def tracks_match(run_id: str, baseline: str, tracks: Iterable[dict[str, Any]]) -
     return out
 
 
+def tracks_match_not_run(partitions: Iterable[int]) -> list[Check]:
+    """The tracks_match rows of a run checked without --baseline. Written anyway, so a
+    rerun replaces an earlier tracks_match verdict instead of leaving it in the table."""
+    return [Check(p, "tracks_match", "warn", "not run (no --baseline)", 0, 0) for p in sorted(partitions)]
+
+
 # ----------------------------------------------------------------- output
 
 
@@ -417,7 +423,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     tracker_input = setting("TRACKER_INPUT_TOPIC", ENRICHED_TOPIC)
-    pending = wait_for_pipeline(Pipeline(brokers, run_id, produced, since_ms, tracker_input), deadline)
+    try:
+        pending = wait_for_pipeline(Pipeline(brokers, run_id, produced, since_ms, tracker_input), deadline)
+    except RunError as e:  # a topic read that timed out
+        print(f"reconcile: {e}", file=sys.stderr)
+        return 2
     if pending:
         print(f"reconcile: INCOMPLETE, the pipeline did not finish run {run_id} within {args.timeout:.0f} s: "
               f"{'; '.join(pending)}. Nothing written.", file=sys.stderr)
@@ -444,6 +454,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.baseline and baseline_since is not None:
             since = min(since_ms, baseline_since - kafka.SEEK_MARGIN_MS)
             checks += tracks_match(run_id, args.baseline, kafka.read_topic(brokers, TRACKS_TOPIC, since))
+        else:
+            checks += tracks_match_not_run(counts)
     except RunError as e:
         print(f"reconcile: {e}", file=sys.stderr)
         return 2

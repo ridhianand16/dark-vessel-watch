@@ -14,7 +14,11 @@ of the job's EPSG:25832 pieces (docs/adr/0018):
     dist_mpa_m           0 inside a protected area, else the same to the nearest one, with
                          its edges densified to 0.001 degrees first
 
-and reports disagreements and the largest distance differences. A tag differs only for points
+and reports disagreements and the largest distance differences. Only records tagged with
+the package that is active now are compared, because PostGIS holds only that package's
+zones. Records a different package tagged (before a `make refdata-load` and
+`make flink-restart`) are counted per version and left out; when none is left the run
+cannot be checked. A tag differs only for points
 within centimetres of an edge, where the two tables' edges differ by the densification.
 
 Why densify the protected areas: a polygon edge in the package is straight in degrees, as
@@ -82,6 +86,20 @@ class Result:
     examples: list[str] = field(default_factory=list)  # every disagreement
 
 
+def split_by_package(
+    records: list[dict[str, Any]], active: str
+) -> tuple[list[dict[str, Any]], Counter[str]]:
+    """(records tagged with the active package, count of the others per zones_version)."""
+    current = [r for r in records if r.get("zones_version") == active]
+    others = Counter(str(r.get("zones_version")) for r in records if r.get("zones_version") != active)
+    return current, others
+
+
+def active_package(conn: psycopg.Connection[Any]) -> str | None:
+    row = conn.execute("SELECT package_version FROM refdata_packages WHERE active").fetchone()
+    return None if row is None else str(row[0])
+
+
 def sample(records: list[dict[str, Any]], n: int, seed: int) -> list[dict[str, Any]]:
     rng = random.Random(seed)
     tagged = [r for r in records if r.get("mpa_ids") or r.get("in_port")]
@@ -145,14 +163,27 @@ def main(argv: list[str] | None = None) -> int:
     if not records:
         print(f"zone_check: no ais.enriched records for {args.run_id}", file=sys.stderr)
         return 2
-    picked = sample(records, args.sample, args.seed)
     with psycopg.connect(conninfo()) as conn:
+        active = active_package(conn)
+        if active is None:
+            print("zone_check: no active zone package in PostGIS", file=sys.stderr)
+            return 2
+        current, others = split_by_package(records, active)
+        if others:
+            print(f"zone_check: {sum(others.values())} records were tagged by another package and are not "
+                  "checked: " + ", ".join(f"{v} {n}" for v, n in others.most_common()), file=sys.stderr)
+        if not current:
+            print(f"zone_check: no record of {args.run_id} was tagged with the active package {active}",
+                  file=sys.stderr)
+            return 2
+        picked = sample(current, args.sample, args.seed)
         rows = conn.execute(
             QUERY, {"lon": [float(r["lon"]) for r in picked], "lat": [float(r["lat"]) for r in picked]}
         ).fetchall()
     res = compare(picked, rows, args.tolerance)
 
-    print(f"run {args.run_id}: {len(records)} enriched records, {res.checked} checked against PostGIS")
+    print(f"run {args.run_id}: {len(records)} enriched records, {len(current)} tagged with the active package "
+          f"{active}, {res.checked} checked against PostGIS")
     print(f"  in a protected area {res.in_mpa}, in port {res.in_port}; eez_id: "
           + ", ".join(f"{k} {n}" for k, n in res.eez_ids.most_common()))
     print(f"  tags that differ: eez_id {res.eez}, mpa_ids {res.mpa}, in_port {res.port}")

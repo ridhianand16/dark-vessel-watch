@@ -80,8 +80,10 @@ def test_dlq_reasons_are_counted_per_partition() -> None:
 
 
 def test_enriched_record_without_zone_tags_fails() -> None:
-    enriched = [rec(3, 50), rec(3, 51, zones_version=None), rec(3, 52, dist_eez_boundary_m=None)]
+    """Untagged means no zones_version, as the Flink job defines it. Null distances are a
+    valid tag (a point the job could not project, ZoneIndex.Tags) and do not count."""
+    enriched = [rec(3, 50), rec(3, 51, zones_version=None), rec(3, 52, dist_eez_boundary_m=None, dist_mpa_m=None)]
     tallies, _ = tally(RUN, PRODUCED[1:], enriched, [], [])
     assert tallies[0].accounted == 3
     assert not tallies[0].ok
-    assert tallies[0].note == "2 without zone tags"
+    assert tallies[0].note == "1 without zone tags"

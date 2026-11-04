@@ -3,8 +3,11 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+import psycopg
 import pytest
+from clickhouse_connect.driver.exceptions import ClickHouseError
 
+from sql import migrate
 from sql.migrate import Applied, Migration, MigrationError, as_text, discover, plan, split_statements
 
 
@@ -83,3 +86,42 @@ def test_fixedstring_checksum_from_driver_compares_equal() -> None:
     m = mig(0, "migrations")
     from_db = Applied(0, as_text("migrations"), as_text(m.checksum.encode("ascii")))
     assert plan([m], [from_db]) == []
+
+
+class FailingTarget:
+    """Applies nothing: every statement fails the way a database driver reports it."""
+
+    table = "dvw.schema_migrations"
+
+    def __init__(self, error: Exception) -> None:
+        self.error, self.closed = error, False
+
+    def has_table(self) -> bool:
+        return True
+
+    def read_applied(self) -> list[Applied]:
+        return [Applied(0, "migrations", hashlib.sha256(b"-- 0\n").hexdigest())]
+
+    def run(self, m: Migration) -> None:
+        raise self.error
+
+    def apply(self, m: Migration) -> None:
+        raise self.error
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.parametrize("error", [ClickHouseError("Code: 62. Syntax error"), psycopg.OperationalError("refused")])
+def test_a_database_error_is_one_error_line_and_exit_1(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], error: Exception
+) -> None:
+    (tmp_path / "0000_migrations.sql").write_text("-- 0\n")
+    (tmp_path / "0001_bad.sql").write_text("CREATE TABLE x (\n")
+    target = FailingTarget(error)
+    rc = migrate.main(["--dir", str(tmp_path)], connect=lambda name: target)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert err.startswith("migrate[clickhouse]: ERROR: 0001_bad failed and is not recorded:")
+    assert "Traceback" not in err
+    assert target.closed

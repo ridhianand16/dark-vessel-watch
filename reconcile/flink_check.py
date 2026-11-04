@@ -13,8 +13,9 @@ whose src_offset is in the range. duplicates(p) sums `count` over the ais.dedup_
 with this run_id and src_partition p (docs/adr/0015). It also checks that no
 (src_partition, src_offset) appears twice across ais.enriched and ais.dlq, that every
 record in the range carries this run_id (a decode_error DLQ record may have none), and
-that every enriched record is zone-tagged: zones_version and dist_eez_boundary_m set
-(docs/adr/0018). The job buffers records until the zones are loaded, so an untagged
+that every enriched record is zone-tagged: zones_version set, which the job writes on every
+record it tagged (docs/adr/0018). Null distances are a valid tag, for a point the job
+could not project. The job buffers records until the zones are loaded, so an untagged
 record means that buffer leaked.
 
 All three topics are read with isolation.level=read_committed, so only output of completed
@@ -115,7 +116,7 @@ def tally(
     for rec in enriched:
         if (t := place(rec)) is not None:
             t.enriched += 1
-            if rec.get("zones_version") is None or rec.get("dist_eez_boundary_m") is None:
+            if rec.get("zones_version") is None:
                 t.untagged += 1
     for rec in dlq:
         if (t := place(rec)) is not None:

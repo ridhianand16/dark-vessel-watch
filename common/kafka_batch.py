@@ -106,6 +106,12 @@ class BatchSink(ABC, Generic[R]):
             self.log.error("%s; exiting without committing, the batch will be re-read on restart", e)
             self.failed = True  # keeps _on_revoke (called from close) from retrying the write
             return 1
+        except BaseException:
+            # Any other error (a fatal consumer error, a mapper that raised): do not write
+            # or commit the half-collected batch from close(), so this error is the one
+            # that surfaces. The batch is re-read on restart.
+            self.failed = True
+            raise
         finally:
             self.consumer.close()
         self.log.info("stopped cleanly")

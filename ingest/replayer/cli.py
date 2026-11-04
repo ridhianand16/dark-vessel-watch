@@ -6,9 +6,13 @@
 Writes data/runs/<run_id>/produced.json with status "running" when the replay starts,
 and again at the end with the offsets (also after Ctrl-C or delivery failures, with
 status != "complete"). The reconciliation job waits on "running" and refuses anything
-else that is not "complete". With --inject anomalies.yaml it mixes labelled
-synthetic vessels into the stream (inject.py) and also writes labels.json there. Exit codes: 0 every message acknowledged,
-1 delivery errors or undelivered messages, 2 bad arguments/input, 130 interrupted.
+else that is not "complete", so every way out of a replay rewrites the status: Ctrl-C and
+SIGTERM give "interrupted", any other error "failed". Only SIGKILL leaves "running"
+behind. With --inject anomalies.yaml it mixes labelled synthetic vessels into the
+stream (inject.py) and also writes labels.json there.
+
+Exit codes: 0 every message acknowledged; 1 failed (delivery errors, undelivered
+messages, or an error while replaying); 2 bad arguments or input; 130 interrupted.
 """
 
 from __future__ import annotations
@@ -18,11 +22,13 @@ import datetime as dt
 import heapq
 import json
 import math
+import signal
 import sys
 import time
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
+from types import FrameType
 from typing import Any
 
 from confluent_kafka import Producer
@@ -135,6 +141,14 @@ def write_json_atomic(path: Path, data: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+class Interrupted(Exception):
+    """SIGTERM, handled like Ctrl-C."""
+
+
+def raise_interrupted(signum: int, _frame: FrameType | None) -> None:
+    raise Interrupted(signal.Signals(signum).name)
+
+
 def produce_all(
     rows: Iterator[tuple[str | None, int | None, bool]],
     producer: Producer,
@@ -146,7 +160,9 @@ def produce_all(
     t0: float,
 ) -> tuple[int, int, int, str]:
     """Produce every row to ais.raw on the pacer's schedule. Returns (sent, injected,
-    CSV rows in the synthetic MMSI range, status); Ctrl-C stops it as "interrupted"."""
+    CSV rows in the synthetic MMSI range, status). Ctrl-C or SIGTERM stops it as
+    "interrupted"; any other error stops it as "failed". Either way the caller still
+    flushes and records what the broker acknowledged."""
     sent = injected = in_reserved_range = 0
     status = "complete"
     try:
@@ -168,9 +184,12 @@ def produce_all(
             if sent % 500_000 == 0:
                 rate = sent / (time.monotonic() - t0)
                 print(f"replayer: sent {sent:,} ({rate:,.0f}/s)", file=sys.stderr)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, Interrupted):
         status = "interrupted"
         print("replayer: interrupted, flushing what was already produced", file=sys.stderr)
+    except Exception as e:  # anything else: the run is over, and produced.json must say so
+        status = "failed"
+        print(f"replayer: failed after {sent:,} messages: {e!r}; flushing what was already produced", file=sys.stderr)
     return sent, injected, in_reserved_range, status
 
 
@@ -197,6 +216,17 @@ def main(argv: list[str] | None = None) -> int:
         file=sys.stderr,
     )
 
+    previous_sigterm = signal.signal(signal.SIGTERM, raise_interrupted)
+    try:
+        return replay(args, run_id, layout, spec, plan)
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
+
+
+def replay(
+    args: argparse.Namespace, run_id: str, layout: CsvLayout, spec: inject.Spec | None, plan: inject.Plan | None
+) -> int:
+    """Produce the run and record it. SIGTERM raises Interrupted until the rows are sent."""
     producer = make_producer(args.brokers, run_id)
     tracker = DeliveryTracker()
     pacer = Pacer(args.speed, sleep=lambda s: poll_until(producer, s))
@@ -209,6 +239,9 @@ def main(argv: list[str] | None = None) -> int:
     sent, injected, in_reserved_range, status = produce_all(
         rows, producer, tracker, pacer, layout, run_id, spec, t0
     )
+    # From here on the run is only flushed (at most FLUSH_TIMEOUT_S) and recorded. A
+    # SIGTERM now would leave produced.json at "running", so it is ignored.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
     undelivered = producer.flush(FLUSH_TIMEOUT_S)
     if status == "complete" and (undelivered or tracker.errors or tracker.delivered != sent):

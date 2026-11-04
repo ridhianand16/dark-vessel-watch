@@ -107,7 +107,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"latency: {e}", file=sys.stderr)
         return 2
     print(f"run {args.run_id}, from replay_send_ts")
-    tracks = track_latencies(setting("REDPANDA_BROKERS", "localhost:19092"), args.run_id, since)
+    try:
+        tracks = track_latencies(setting("REDPANDA_BROKERS", "localhost:19092"), args.run_id, since)
+    except RunError as e:  # the read of ais.tracks timed out
+        print(f"latency: {e}", file=sys.stderr)
+        return 2
     print(f"  to track sent (ais.tracks):      {percentiles(tracks)}")
     print(f"  to track stored (dvw.tracks):    {percentiles(stored_track_latencies(client_from_env(), args.run_id))}")
     print(f"  to TELEPORT stored (dvw.alerts): {percentiles(alert_latencies(args.run_id))}")

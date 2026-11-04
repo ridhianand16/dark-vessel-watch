@@ -20,6 +20,7 @@ from reconcile.job import (
     latency_check,
     rows,
     tracks_match,
+    tracks_match_not_run,
     wait_for_run,
 )
 from reconcile.run_check import Produced, RunError, Stored, compare
@@ -202,3 +203,13 @@ def test_rows_fit_the_table_and_carry_latency_only_run_wide() -> None:
     assert run_wide[0]["produced"] == 13 and run_wide[0]["latency_p99_ms"] == 7.0
     assert all(r["latency_p99_ms"] is None for r in named if r["partition"] != RUN_WIDE)
     assert next(r for r in named if r["partition"] == 0)["dlq_reasons"] == {"bad_mmsi": 1}
+
+
+def test_without_a_baseline_tracks_match_is_still_written_as_not_run() -> None:
+    """Every run writes every check: a rerun without --baseline must replace an earlier
+    tracks_match verdict, not leave it in dvw.reconciliation (ReplacingMergeTree key)."""
+    checks = tracks_match_not_run([3, 0])
+    assert [(c.partition, c.check, c.status, c.note) for c in checks] == [
+        (0, "tracks_match", "warn", "not run (no --baseline)"),
+        (3, "tracks_match", "warn", "not run (no --baseline)"),
+    ]

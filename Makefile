@@ -173,7 +173,8 @@ score: .env
 ## Flink session cluster plus the enrichment job: ais.raw -> ais.enriched, ais.dlq,
 ## ais.dedup_counts (docs/adr/0014). Part of `make up`. Builds the image (which runs the
 ## Java tests), starts the JobManager and TaskManager, then submits the job unless it is
-## already running. The job's startup gate waits for an active zone package in PostGIS
+## already running, from the newest savepoint or retained checkpoint (fresh only when the
+## volume has none, docs/adr/0022). The job's startup gate waits for an active zone package in PostGIS
 ## (docs/adr/0018), so first `refdata ensure` loads the last built package if none is
 ## active (after `make nuke`; offline, verified). With no package built at all the job is
 ## not submitted: run `make fetch-refdata refdata`, then `make flink-up`.
@@ -198,7 +199,7 @@ flink-savepoint: .env
 	$(COMPOSE) run --rm --no-deps flink-submit stop
 
 ## Rebuild the job, stop it with a savepoint if it is running, and start it from the
-## latest savepoint. Use after changing the job or AIS_DAY, and after loading a new zone
+## newest state (that savepoint). Use after changing the job or AIS_DAY, and after loading a new zone
 ## package: the restarted job reads whichever package is active (docs/adr/0018).
 flink-restart: .env
 	$(COMPOSE) build flink-submit

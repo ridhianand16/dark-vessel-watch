@@ -18,6 +18,9 @@ from reconcile.run_check import RunError
 from stream.faust_app.config import ENRICHED_TOPIC, RAW_TOPIC
 
 SEEK_MARGIN_MS = 60_000
+# Longest any one read of a topic may take. A partition that never reaches its end (the
+# broker went away mid-read) would otherwise hang the tool for good.
+READ_TIMEOUT_S = 120.0
 TRACKER_GROUP = "dvw-tracker"
 FLINK_GROUP = "dvw-flink-enrichment"  # EnrichmentJob.GROUP_ID
 ALERTS_SINK_GROUP = "dvw-alerts-sink"
@@ -36,13 +39,13 @@ class Record:
     timestamp_ms: int
 
 
-def read(brokers: str, topic: str, since_ms: int, group: str, timeout_s: float | None = None) -> Iterator[Record]:
+def read(brokers: str, topic: str, since_ms: int, group: str, timeout_s: float = READ_TIMEOUT_S) -> Iterator[Record]:
     """Every committed record of `topic` written at or after since_ms, up to the current end.
 
     With read_committed, the end of a partition is its last stable offset: records of a
     transaction Flink has not committed yet are neither returned nor waited for. Topics
     without transactions read the same either way. `group` is never committed.
-    timeout_s bounds the whole read; None waits until every partition reaches its end.
+    timeout_s bounds the whole read; past it, RunError.
     """
     c = Consumer({
         "bootstrap.servers": brokers,
@@ -61,9 +64,9 @@ def read(brokers: str, topic: str, since_ms: int, group: str, timeout_s: float |
         # -1: nothing written since since_ms, so start at the end.
         c.assign([TopicPartition(topic, tp.partition, tp.offset if tp.offset >= 0 else OFFSET_END) for tp in start])
         remaining = {tp.partition for tp in start}
-        deadline = None if timeout_s is None else time.monotonic() + timeout_s
+        deadline = time.monotonic() + timeout_s
         while remaining:
-            if deadline is not None and time.monotonic() > deadline:
+            if time.monotonic() > deadline:
                 raise RunError(f"{topic}: did not reach the end of partitions {sorted(remaining)} in {timeout_s:.0f} s")
             msg = c.poll(1.0)
             if msg is None:
@@ -81,7 +84,7 @@ def read(brokers: str, topic: str, since_ms: int, group: str, timeout_s: float |
         c.close()
 
 
-def read_topic(brokers: str, topic: str, since_ms: int, timeout_s: float = 120.0) -> Iterator[dict[str, Any]]:
+def read_topic(brokers: str, topic: str, since_ms: int, timeout_s: float = READ_TIMEOUT_S) -> Iterator[dict[str, Any]]:
     """The values of read(), within timeout_s."""
     for r in read(brokers, topic, since_ms, f"dvw-flink-check-{uuid.uuid4().hex[:8]}", timeout_s):
         yield r.value

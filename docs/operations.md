@@ -48,7 +48,7 @@ Every image tag is pinned. Each service has a `mem_limit`; the budget and what e
 | `make reconcile-run RUN=<run_id>` | prove zero loss for one run, per partition ([below](#reconciliation)) |
 | `make score RUN=<run_id> WAIT=600` | TP/FP/FN per alert type for a run replayed with `--inject` |
 | `make latency RUN=<run_id>` | replayer send to track sent, to track stored, and to TELEPORT stored |
-| `make zone-check RUN=<run_id>` | a sample of the run's zone tags recomputed in PostGIS |
+| `make zone-check RUN=<run_id>` | a sample of the run's zone tags recomputed in PostGIS; only records tagged with the active package are checked, the others are counted |
 | `make compare-tracks A=<run_id> B=<run_id>` | two runs of the same rows, vessel by vessel |
 | `make backfill-rollups` | fill the rollups from tracks stored before the views existed; safe to repeat, also while the sink runs |
 | `make ttl-demo` | the `ingested_at` TTL deleting rows, on a scratch table |
@@ -74,10 +74,10 @@ If a sink or the tracker crashes, Docker restarts it and it re-reads from its la
 
 ```sh
 make flink-savepoint     # stop the job with a savepoint; the sinks commit their last transactions
-make flink-restart       # rebuild, stop with a savepoint if running, start from the newest one
+make flink-restart       # rebuild, stop with a savepoint if running, start from the newest state
 ```
 
-`make flink-up` never replaces a running JobManager, because a session cluster keeps no jobs across a restart. Job code changes go live with `make flink-restart`. The first start reads `ais.raw` from the beginning, because there are no committed offsets yet. Later starts resume from the checkpoint or savepoint. Change `AIS_DAY` only together with `make flink-restart`: the `bad_timestamp` rule is fixed when the job is submitted.
+`make flink-up` never replaces a running JobManager, because a session cluster keeps no jobs across a restart. Job code changes go live with `make flink-restart`. Every start, `make flink-up` included, restores the newest savepoint or retained checkpoint on the `flink-data` volume, and says which ([ADR 0022](adr/0022-flink-restores-newest-retained-state.md)). Only when there is none does the job start fresh, from the committed offsets or from the beginning of `ais.raw`: on a fresh clone, after `make nuke`, and after a planned stop of the JobManager (`make down`, `docker stop` or `docker restart`), because Flink deletes a suspended job's checkpoints when there is no high availability. Run `make flink-savepoint` before a planned stop to keep the job's state. Change `AIS_DAY` only together with `make flink-restart`: the `bad_timestamp` rule is fixed when the job is submitted.
 
 To run without Flink, set `TRACKER_INPUT_TOPIC=ais.raw` in `.env` and run `make tracker`: tracks work, DARK_GAP does not.
 
@@ -103,7 +103,7 @@ Every replay run writes `data/runs/<run_id>/produced.json`: for each of the 6 `a
    | `dlq_share` | warns when more than 5% went to the DLQ, with the count per reason |
 
    Plus one run-wide `latency` row: p50/p95/p99 from replayer send to the fix stored in `dvw.tracks` (warns above 5 s). With `BASELINE=<run_id>` of the same rows, `tracks_match` also compares every vessel's tracks with that run's.
-3. **Keep the verdict.** One row per run, partition and check goes into `dvw.reconciliation`, with the counts and DLQ reasons. Running it again replaces the verdict instead of adding to it. The exit code is 1 if any check fails.
+3. **Keep the verdict.** One row per run, partition and check goes into `dvw.reconciliation`, with the counts and DLQ reasons. Running it again replaces the verdict instead of adding to it. Every run writes every check: without `BASELINE`, `tracks_match` is a `warn` row per partition saying "not run (no --baseline)", so a rerun always replaces the whole verdict, and the summary line counts those six as warnings. The example below is from before that row existed. The exit code is 1 if any check fails.
 
 This is a real run: 10,000 rows with three broken lines added on purpose (an MMSI that is not a number, a latitude of `garbage`, a position at 0,0). All three land in the DLQ under their own reason, and everything still balances. Check rows that are the same on every partition are cut to one:
 

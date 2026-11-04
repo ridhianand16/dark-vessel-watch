@@ -91,3 +91,8 @@ The laptop gives Docker a 3.9 GiB VM (OrbStack), and everything else is already 
   are not replayed. Transactions of a checkpoint that never completed are harmless. They are
   aborted and their records replayed. The Flink check would show the gap as "missing".
 - The job adds 2 GB of container limits. Measured use is in docs/results.md.
+
+## Note (2026-11-04): restoring after losing the JobManager
+
+Decision 1 said a crashed job "can be restored by hand". `make flink-up` now does it:
+every start restores the newest savepoint or retained checkpoint (ADR 0022).
