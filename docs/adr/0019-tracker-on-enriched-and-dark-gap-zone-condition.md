@@ -128,3 +128,11 @@ deploying it:
   the same error. That rules out rolling upgrades with old and new workers side by
   side, and a rollback that keeps the state. Rolling back needs the tracker's state
   cleared (its changelog topic and the tracker-data volume) or a new run.
+
+## Note (2026-11-04): only version 3 states are read
+
+The upgrade path for version 1 and 2 states is removed. `VesselState.from_dict` raises
+`unsupported vessel state version` on them, like on any other version. Every state
+volume was reset after version 3 shipped, so none can exist. A state from before
+version 3 now needs the tracker's state cleared (its changelog topic and the
+tracker-data volume), as a rollback already did.
