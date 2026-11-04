@@ -355,23 +355,6 @@ def test_redelivered_batch_after_crash_gives_identical_alerts() -> None:
 # --- state ------------------------------------------------------------------------
 
 
-def test_v1_state_upgrades() -> None:
-    v1 = {
-        "v": 1,
-        "run_id": RUN,
-        "anchor": [56.0, 10.0],
-        "x": [0.0, 0.0, 5.0, 0.0],
-        "P": [float(i == j) for i in range(4) for j in range(4)],
-        "last_event_ts": T0,
-        "last_fix": [56.0, 10.0],
-        "last_offset": 10,
-        "fix_seq": 1,
-    }
-    state = VesselState.from_bytes(json.dumps(v1).encode())
-    assert (state.partition, state.heard_ts, state.rejects, state.gap_alerted) == (None, T0, 0, False)
-    assert VesselState.from_bytes(state.to_bytes()).to_bytes() == state.to_bytes()
-
-
 def test_detection_config_validates() -> None:
     with pytest.raises(ValueError):
         DetectionConfig(teleport_max_rejects=1)

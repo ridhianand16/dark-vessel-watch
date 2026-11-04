@@ -198,8 +198,9 @@ def test_state_round_trips() -> None:
     assert state is not None
     back = VesselState.from_bytes(state.to_bytes())
     assert back.to_bytes() == state.to_bytes()
-    with pytest.raises(ValueError):
-        VesselState.from_bytes(b'{"v": 99}')
+    for v in (1, 2, 99):  # only the current version is read; older states need a fresh volume
+        with pytest.raises(ValueError):
+            VesselState.from_bytes(f'{{"v": {v}}}'.encode())
 
 
 # --- process_batch --------------------------------------------------------------

@@ -301,9 +301,8 @@ class VesselState:
     (its src_offset). All of a vessel's records are in one partition (keyed by MMSI),
     and the Flink job keeps per-key order, so offsets alone order them."""
     fix_seq: int
-    partition: int | None
-    """ais.raw partition of the vessel's records; picks the watermark for the gap scan.
-    None only in states upgraded from v1, until the vessel reports again."""
+    partition: int
+    """ais.raw partition of the vessel's records; picks the watermark for the gap scan."""
     last_sog: float | None
     """Reported SOG of the last accepted fix, when valid (DARK_GAP's "last moving")."""
     heard_ts: int
@@ -318,7 +317,7 @@ class VesselState:
     """DARK_GAP already raised for the current silence; cleared by the next fix heard."""
     zone: ZoneTags | None
     """Zone tags of the last accepted fix (DARK_GAP's zone condition). None when the
-    input is ais.raw, and in states from before version 3."""
+    input is ais.raw."""
 
     def to_bytes(self) -> bytes:
         return json.dumps(
@@ -350,18 +349,7 @@ class VesselState:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> VesselState:
         v = d.get("v")
-        if v == 1:  # before detections: nothing heard but accepted fixes, no flags
-            d.update(
-                partition=None,
-                last_sog=None,
-                heard=[d["last_event_ts"], *d["last_fix"]],
-                trace_id=None,
-                rejects=0,
-                gap_alerted=False,
-            )
-        if v in (1, 2):  # before zone tags
-            d.update(zone=None)
-        elif v != STATE_VERSION:
+        if v != STATE_VERSION:
             raise ValueError(f"unsupported vessel state version: {v!r}")
         return cls(
             run_id=d["run_id"],
@@ -724,7 +712,7 @@ def scan_dark_gaps(
         # vessel would make a scan ~10x slower, and nearly all vessels fail these.
         d = json.loads(blob)
         partition = d.get("partition")
-        if partition is None or partition not in partitions:
+        if partition not in partitions:
             continue
         out.scanned += 1
         wm = watermarks.get((partition, d["run_id"]))
