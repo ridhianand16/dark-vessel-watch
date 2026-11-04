@@ -12,11 +12,12 @@ the record to its producer:
     stored  every fix of the run in dvw.tracks: the first ingested_at of the fix minus
             its replay_send_ts. This adds the tracks sink; the reconciliation job
             stores these percentiles (reconcile/job.py).
-    alerts  TELEPORT rows of the run in dvw.alerts: ingested_at (the ClickHouse
-            insert) minus replay_send_ts of the ais.raw record with the alert's
-            trace_id. This adds the alerts sink, but there are only a few per run.
-            DARK_GAP is left out: its trace_id is the last report before the silence,
-            sent long before the gap could be detected.
+    alerts  rows of the run in dvw.alerts raised by a message (every type but
+            DARK_GAP): ingested_at (the ClickHouse insert) minus replay_send_ts of
+            the ais.raw record with the alert's trace_id. This adds the alerts sink,
+            but there are only a few per run. DARK_GAP is left out: it is raised by
+            the absence of messages, and its trace_id is the last report before the
+            silence, sent at least the gap threshold before the alert could exist.
 
 The replayer runs on the host and the services in the Docker VM, so the numbers also
 include any clock offset between the two (OrbStack keeps them in sync to well under
@@ -36,8 +37,11 @@ from common.env import REPO_ROOT, setting
 from reconcile import kafka
 from reconcile.kafka import SEEK_MARGIN_MS, run_started_ms
 from reconcile.run_check import RunError
+from stream.faust_app.detect import AlertType
 
 TRACKS = "ais.tracks"
+# Alerts raised on receiving a message, so send to stored is a pipeline latency.
+MESSAGE_TRIGGERED = tuple(t.value for t in AlertType if t is not AlertType.DARK_GAP)
 
 
 def quantiles(values: list[float], qs: tuple[float, ...] = (0.50, 0.95, 0.99, 1.0)) -> list[float]:
@@ -62,36 +66,45 @@ def track_latencies(brokers: str, run_id: str, since_ms: int) -> list[float]:
     return out
 
 
-def stored_track_latencies(client: Client, run_id: str) -> list[float]:
+def stored_track_latencies(client: Client, run_id: str, sent_before_ms: int | None = None) -> list[float]:
     """replay_send_ts to the first time each fix was stored in dvw.tracks, per fix.
 
     min(ingested_at) over the fix's copies, without FINAL: FINAL keeps the copy stored
     last, so a batch the sink re-inserted after a crash would count from its retry.
+    sent_before_ms (epoch ms) keeps only fixes the replayer sent before then.
     """
+    params: dict[str, object] = {"run": run_id}
+    cutoff = ""
+    if sent_before_ms is not None:
+        cutoff = "AND replay_send_ts < fromUnixTimestamp64Milli({before:Int64})"
+        params["before"] = sent_before_ms
     rows = client.query(
-        """
+        f"""
         SELECT dateDiff('millisecond', any(replay_send_ts), min(ingested_at))
         FROM dvw.tracks
-        WHERE run_id = {run:String} AND decode_error = '' AND replay_send_ts IS NOT NULL
+        WHERE run_id = {{run:String}} AND decode_error = '' AND replay_send_ts IS NOT NULL {cutoff}
         GROUP BY src_partition, src_offset
         """,
-        parameters={"run": run_id},
+        parameters=params,
     ).result_rows
     return [float(r[0]) for r in rows]
 
 
-def alert_latencies(run_id: str) -> list[float]:
-    rows = client_from_env().query(
+def alert_latencies(client: Client, run_id: str) -> list[float]:
+    """replay_send_ts of the triggering record to the alert's first insert, per alert
+    of a MESSAGE_TRIGGERED type."""
+    rows = client.query(
         """
         SELECT dateDiff('millisecond', r.replay_send_ts, a.ingested_at)
         FROM (SELECT trace_id, min(ingested_at) AS ingested_at FROM dvw.alerts
-              WHERE run_id = {run:String} AND type = 'TELEPORT' GROUP BY trace_id) AS a
+              WHERE run_id = {run:String} AND type IN {types:Array(String)} GROUP BY trace_id) AS a
         INNER JOIN (SELECT trace_id, any(replay_send_ts) AS replay_send_ts FROM dvw.ais_raw
                     WHERE run_id = {run:String} AND trace_id IN (
-                        SELECT trace_id FROM dvw.alerts WHERE run_id = {run:String} AND type = 'TELEPORT')
+                        SELECT trace_id FROM dvw.alerts
+                        WHERE run_id = {run:String} AND type IN {types:Array(String)})
                     GROUP BY trace_id) AS r USING trace_id
         """,
-        parameters={"run": run_id},
+        parameters={"run": run_id, "types": list(MESSAGE_TRIGGERED)},
     ).result_rows
     return [float(r[0]) for r in rows if r[0] is not None]
 
@@ -113,8 +126,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"latency: {e}", file=sys.stderr)
         return 2
     print(f"  to track sent (ais.tracks):      {percentiles(tracks)}")
-    print(f"  to track stored (dvw.tracks):    {percentiles(stored_track_latencies(client_from_env(), args.run_id))}")
-    print(f"  to TELEPORT stored (dvw.alerts): {percentiles(alert_latencies(args.run_id))}")
+    client = client_from_env()
+    print(f"  to track stored (dvw.tracks):    {percentiles(stored_track_latencies(client, args.run_id))}")
+    print(f"  to alert stored (dvw.alerts, {', '.join(MESSAGE_TRIGGERED)}): "
+          f"{percentiles(alert_latencies(client, args.run_id))}")
     return 0
 
 

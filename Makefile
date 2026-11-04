@@ -220,8 +220,8 @@ compare-tracks: .env
 	@test -n "$(A)" -a -n "$(B)" || { echo "usage: make compare-tracks A=<run_id> B=<run_id>" >&2; exit 2; }
 	uv run python -m reconcile.compare_tracks $(A) $(B)
 
-## End-to-end latency of one run: replayer send to track sent (every fix) and to
-## TELEPORT stored in ClickHouse. make latency RUN=<run_id>
+## End-to-end latency of one run: replayer send to track sent and stored (every fix),
+## and to message-triggered alerts (all but DARK_GAP) stored in ClickHouse. make latency RUN=<run_id>
 latency: .env
 	@test -n "$(RUN)" || { echo "usage: make latency RUN=<run_id>" >&2; exit 2; }
 	uv run python -m reconcile.latency $(RUN)
