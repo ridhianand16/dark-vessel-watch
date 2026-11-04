@@ -1,6 +1,6 @@
 COMPOSE := docker compose -f deploy/compose/docker-compose.yml --env-file .env
 
-.PHONY: hooks up down nuke topics ps console fetch fetch-refdata area refdata refdata-image refdata-key refdata-build refdata-verify refdata-load replay migrate migrate-postgis sink sink-logs tracks-alerts-sink tracks-alerts-sink-logs vessels-sink vessels-sink-logs tracker tracker-logs reconcile-run score flink-up flink-savepoint flink-restart flink-logs compare-tracks latency backfill-rollups ttl-demo test test-py test-flink typecheck
+.PHONY: hooks up down nuke topics ps console fetch fetch-refdata area refdata refdata-image refdata-key refdata-build refdata-verify refdata-load replay migrate migrate-postgis sink sink-logs tracks-alerts-sink tracks-alerts-sink-logs vessels-sink vessels-sink-logs tracker tracker-logs reconcile-run score flink-up flink-savepoint flink-restart flink-logs compare-tracks latency report backfill-rollups ttl-demo test test-py test-flink typecheck
 
 .env:
 	@echo "Missing .env. Run: cp .env.example .env" >&2; exit 1
@@ -226,7 +226,18 @@ latency: .env
 	@test -n "$(RUN)" || { echo "usage: make latency RUN=<run_id>" >&2; exit 2; }
 	uv run python -m reconcile.latency $(RUN)
 
-PY_DIRS := common ingest refdata sql sinks reconcile stream
+## Results report: replay ROWS rows at 10x (with the labelled anomalies when ROWS covers
+## their 54 min), sample lag, memory and Flink checkpoints every 5 s, reconcile and score
+## the run, and write docs/results/<date>-<sha>.md plus its line in docs/results.md.
+## CHAOS=1 kills the Flink TaskManager, the tracker and the JobManager partway through
+## and recovers each. Needs the whole stack up (make up). About 10 to 15 minutes.
+ROWS ?= 700000
+CHAOS ?= 0
+report: .env
+	uv run python -m report --csv $(AIS_CSV) --rows $(ROWS) $(if $(filter 1,$(CHAOS)),--chaos) \
+		--command "make report ROWS=$(ROWS)$(if $(filter 1,$(CHAOS)), CHAOS=1)"
+
+PY_DIRS := common ingest refdata sql sinks reconcile stream report
 
 test: test-py test-flink
 
