@@ -5,7 +5,7 @@
 #   redpanda 768m (512M Seastar memory + overhead) | clickhouse 1.25g | postgis 512m
 #   raw-sink 384m | tracker 512m | tracks-alerts-sink 320m | vessels-sink 192m
 #   flink-jobmanager 768m | flink-taskmanager 1280m        (`make up` starts them, via `make flink-up`)
-#   total ≈ 5.9g ceiling; measured use with everything running is in the README
+#   total ≈ 5.9g ceiling; measured use with everything running is in docs/results.md
 #   console 256m, only when needed (profile console, `make console`)
 #   flink-submit 384m, one-shot; refdata-tools 1g, only while `make refdata` builds a package
 #   Run GDAL package builds with Flink stopped.
@@ -168,7 +168,7 @@ services:
       CLICKHOUSE_PORT: "8123"
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:?set in .env}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set in .env}
-    # 50k-row batches plus a 16 MB librdkafka prefetch buffer; see README for measured usage.
+    # 50k-row batches plus a 16 MB librdkafka prefetch buffer; see docs/results.md for measured usage.
     mem_limit: 384m
     # Long enough to insert and commit an in-flight batch, including a retry or two.
     stop_grace_period: 30s
