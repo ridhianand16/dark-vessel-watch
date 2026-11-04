@@ -93,3 +93,9 @@ Counting after a fixed sleep is either slow or wrong.
   reconciled again within that window. Its stored verdict stays.
 - The tracks comparison is only meaningful against a run of the same rows. It reads both
   runs' tracks from Kafka.
+
+## Note (2026-11-04): how the reconciliation readers consume
+
+Every reconciliation reader goes through `reconcile/kafka.py` and consumes with
+`read_committed`, so it never counts records from aborted Flink transactions. Each one
+uses `auto.offset.reset=earliest`, and a missing topic raises `RunError`.
