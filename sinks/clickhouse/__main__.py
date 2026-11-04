@@ -11,6 +11,7 @@ import sys
 
 from confluent_kafka import Consumer
 
+from common import metrics
 from common.clickhouse import client_from_env
 from common.env import setting
 from common.kafka_batch import consumer_config
@@ -27,6 +28,8 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     log = logging.getLogger("sinks.clickhouse")
     brokers = setting("REDPANDA_BROKERS", "localhost:19092")
+    if (port := metrics.serve_from_env()) is not None:
+        log.info("serving /metrics on port %d", port)
     sinks: list[ClickHouseSink] = []
     for name in names:
         spec = SPECS[name]

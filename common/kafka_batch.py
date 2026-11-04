@@ -23,6 +23,8 @@ from typing import Generic, TypeVar
 
 from confluent_kafka import Consumer, KafkaException, TopicPartition
 
+from common.metrics import SinkMetrics
+
 R = TypeVar("R")
 
 
@@ -79,6 +81,7 @@ class BatchSink(ABC, Generic[R]):
         self.batch: Batch[R] = Batch()
         self.stopping = False
         self.failed = False
+        self.metrics = SinkMetrics(name)  # no-op unless METRICS_PORT is set (common/metrics.py)
 
     @abstractmethod
     def to_row(self, value: bytes | None, partition: int, offset: int, kafka_ts_ms: int) -> R | None:
@@ -156,7 +159,9 @@ class BatchSink(ABC, Generic[R]):
             # The rows are stored. If the commit is lost (e.g. during a rebalance) the
             # batch is re-delivered, and write() is idempotent.
             self.log.warning("offset commit failed after a successful write, will be re-read: %s", e)
+            self.metrics.commit_failed()
         t2 = time.monotonic()
+        self.metrics.batch(b.records, len(b.rows), b.skipped, t1 - t0, t2 - t1, counters, time.time())
         self.log.info(
             "batch rows=%d partitions=%d skipped=%d %swrite_ms=%.0f commit_ms=%.0f",
             len(b.rows), len(b.next_offsets), b.skipped,
@@ -171,6 +176,7 @@ class BatchSink(ABC, Generic[R]):
             except Exception as e:  # driver, network and server errors all look different
                 if attempt == self.s.write_attempts:
                     raise WriteFailed(f"write of {len(rows)} rows failed {attempt} times: {e}") from e
+                self.metrics.write_retry()
                 delay = min(self.s.backoff_base_s * 2 ** (attempt - 1), self.s.backoff_max_s)
                 self.log.warning("write attempt %d/%d failed (%s); retrying in %.1fs",
                                  attempt, self.s.write_attempts, e, delay)

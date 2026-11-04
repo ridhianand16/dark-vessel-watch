@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 import weakref
 from collections import Counter
 from collections.abc import Awaitable, Iterator, Sequence
@@ -49,6 +50,7 @@ import faust
 import faust.streams
 from faust.types import EventT
 
+from common import metrics
 from stream.faust_app import config, read_committed
 from stream.faust_app.detect import Watermarks
 from stream.faust_app.tracker import ACCEPTED, Leak, RawRecord, process_batch, scan_dark_gaps
@@ -130,6 +132,7 @@ def as_current_event(event: EventT[bytes]) -> Iterator[None]:
 
 
 async def handle(events: Sequence[EventT[bytes]]) -> None:
+    t0 = time.monotonic()
     records = [RawRecord(e.message.key, e.message.value, e.message.partition, e.message.offset) for e in events]
 
     def load(i: int) -> bytes | None:
@@ -149,6 +152,7 @@ async def handle(events: Sequence[EventT[bytes]]) -> None:
     due = watermarks.advance(result.seen.items())
     if due:
         await scan(events, due)
+    metrics.tracker_batch(time.monotonic() - t0, len(events))
 
 
 async def scan(events: Sequence[EventT[bytes]], partitions: set[int]) -> None:
@@ -200,5 +204,17 @@ async def log_counts() -> None:
              " ".join(f"{k}={v}" for k, v in sorted(counts.items())))
 
 
-# Not decorator syntax: app.timer is untyped, which mypy --strict rejects on a decorator.
+async def start_metrics() -> None:
+    """Serve /metrics when METRICS_PORT is set (common/metrics.py); otherwise nothing.
+    The outcome counts are the same Counter log_counts prints, not a copy."""
+    port = metrics.serve_from_env()
+    if port is not None:
+        metrics.export_counts("dvw_tracker_events", "Tracker outcomes per kind: read, accepted and "
+                              "rejected fixes, alerts per type, Flink leaks", "event", counts)
+        log.info("serving /metrics on port %d", port)
+
+
+# Not decorator syntax: app.timer and app.task are untyped, which mypy --strict rejects
+# on a decorator.
 app.timer(interval=30.0)(log_counts)
+app.task(start_metrics)

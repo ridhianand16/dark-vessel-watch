@@ -6,6 +6,7 @@ import sys
 
 from confluent_kafka import Consumer
 
+from common import metrics
 from common.env import setting
 from common.kafka_batch import consumer_config
 from sinks.postgis_vessels.sink import GROUP_ID, NAME, TOPIC, VesselsSink, connect
@@ -15,6 +16,8 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     log = logging.getLogger(f"{NAME}-sink")
     brokers = setting("REDPANDA_BROKERS", "localhost:19092")
+    if (port := metrics.serve_from_env()) is not None:
+        log.info("serving /metrics on port %d", port)
     with connect() as conn:
         if conn.execute("SELECT to_regclass('public.vessels_current')").fetchone() == (None,):
             log.error("vessels_current does not exist. Run: make migrate-postgis")
