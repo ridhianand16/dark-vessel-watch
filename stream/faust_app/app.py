@@ -74,33 +74,23 @@ app = faust.App(
     web_enabled=False,
 )
 
-input_topic = app.topic(
-    cfg.input_topic,
-    key_type=bytes,
-    value_type=bytes,
-    key_serializer="raw",
-    value_serializer="raw",
-    partitions=PARTITIONS,
-    internal=False,
-)
-tracks_topic = app.topic(
-    "ais.tracks",
-    key_type=bytes,
-    value_type=bytes,
-    key_serializer="raw",
-    value_serializer="raw",
-    partitions=PARTITIONS,
-    internal=False,
-)
-alerts_topic = app.topic(
-    "ais.alerts",
-    key_type=bytes,
-    value_type=bytes,
-    key_serializer="raw",
-    value_serializer="raw",
-    partitions=PARTITIONS,
-    internal=False,
-)
+
+def _bytes_topic(name: str) -> faust.TopicT:
+    """A topic of raw bytes keys and values (str(mmsi) keys, JSON values)."""
+    return app.topic(
+        name,
+        key_type=bytes,
+        value_type=bytes,
+        key_serializer="raw",
+        value_serializer="raw",
+        partitions=PARTITIONS,
+        internal=False,
+    )
+
+
+input_topic = _bytes_topic(cfg.input_topic)
+tracks_topic = _bytes_topic("ais.tracks")
+alerts_topic = _bytes_topic("ais.alerts")
 
 # Faust's RocksDB defaults are a 2 GB block cache (+500 MB compressed) per partition
 # DB. The state here is ~0.5 kB per vessel, a few MB in total, so keep them small.

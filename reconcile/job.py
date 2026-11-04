@@ -50,15 +50,9 @@ from clickhouse_connect.driver.client import Client
 
 from common.clickhouse import client_from_env
 from common.env import REPO_ROOT, setting
-from reconcile import compare_tracks, flink_check, latency, run_check
+from reconcile import compare_tracks, flink_check, kafka, latency, run_check
 from reconcile.run_check import Produced, RunError
-from reconcile.score_alerts import (
-    ALERTS_SINK_GROUP,
-    FLINK_GROUP,
-    Progress,
-    lagging,
-    run_last_offsets,
-)
+from reconcile.kafka import ALERTS_SINK_GROUP, FLINK_GROUP, Progress, lagging, run_last_offsets
 from stream.faust_app.config import ENRICHED_TOPIC, RAW_TOPIC
 
 TABLE = "dvw.reconciliation"
@@ -385,9 +379,9 @@ def check_once(
     stored = run_check.compare(produced, run_check.query_stored(client, run_id, produced))
     tallies, _ = flink_check.tally(
         run_id, produced,
-        flink_check.read_topic(brokers, flink_check.ENRICHED, since_ms),
-        flink_check.read_topic(brokers, flink_check.DLQ, since_ms),
-        flink_check.read_topic(brokers, flink_check.COUNTS, since_ms),
+        kafka.read_topic(brokers, flink_check.ENRICHED, since_ms),
+        kafka.read_topic(brokers, flink_check.DLQ, since_ms),
+        kafka.read_topic(brokers, flink_check.COUNTS, since_ms),
     )
     tracks, rollup, orphan = tracks_and_rollups(client, run_id)
     return stored, tallies, tracks, rollup, orphan
@@ -414,10 +408,10 @@ def main(argv: list[str] | None = None) -> int:
     deadline = time.monotonic() + args.timeout
     try:
         produced = wait_for_run(path, run_id, deadline)
-        since_ms = flink_check.run_started_ms(path) - flink_check.SEEK_MARGIN_MS
+        since_ms = kafka.run_started_ms(path) - kafka.SEEK_MARGIN_MS
         baseline_since = None
         if args.baseline:
-            baseline_since = flink_check.run_started_ms(args.runs_dir / args.baseline / "produced.json")
+            baseline_since = kafka.run_started_ms(args.runs_dir / args.baseline / "produced.json")
     except (RunError, FileNotFoundError) as e:
         print(f"reconcile: {e}", file=sys.stderr)
         return 2
@@ -448,8 +442,8 @@ def main(argv: list[str] | None = None) -> int:
         lat_check, lat = latency_check(latency.stored_track_latencies(client, run_id), limits)
         checks.append(lat_check)
         if args.baseline and baseline_since is not None:
-            since = min(since_ms, baseline_since - flink_check.SEEK_MARGIN_MS)
-            checks += tracks_match(run_id, args.baseline, flink_check.read_topic(brokers, TRACKS_TOPIC, since))
+            since = min(since_ms, baseline_since - kafka.SEEK_MARGIN_MS)
+            checks += tracks_match(run_id, args.baseline, kafka.read_topic(brokers, TRACKS_TOPIC, since))
     except RunError as e:
         print(f"reconcile: {e}", file=sys.stderr)
         return 2

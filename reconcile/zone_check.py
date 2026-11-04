@@ -42,7 +42,8 @@ import psycopg
 
 from common.env import REPO_ROOT, setting
 from common.postgis import conninfo
-from reconcile.flink_check import ENRICHED, read_topic, run_started_ms
+from reconcile.flink_check import ENRICHED
+from reconcile.kafka import read_topic, run_started_ms
 from reconcile.run_check import RunError
 
 # One row per sampled point. Nearest protected area: the 5 nearest in the metric copy by

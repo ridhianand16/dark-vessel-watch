@@ -37,27 +37,23 @@ import argparse
 import json
 import sys
 import time
-import uuid
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from clickhouse_connect.driver.client import Client
-from confluent_kafka import OFFSET_END, Consumer, KafkaError, KafkaException, TopicPartition
+from confluent_kafka import Consumer, TopicPartition
 
 from common.clickhouse import client_from_env
 from common.env import REPO_ROOT, setting
-from reconcile.flink_check import SEEK_MARGIN_MS, run_started_ms
+from reconcile.kafka import ALERTS_SINK_GROUP, SEEK_MARGIN_MS, Progress, committed, run_started_ms
 from reconcile.run_check import RunError, load_produced
-from stream.faust_app.config import ENRICHED_TOPIC, NM_M, RAW_TOPIC
+from stream.faust_app.config import ENRICHED_TOPIC, NM_M
 from stream.faust_app.detect import AlertType, alert_id
 
 TABLE = "dvw.alerts"
 TYPES = tuple(t.value for t in AlertType)
-TRACKER_GROUP = "dvw-tracker"
-FLINK_GROUP = "dvw-flink-enrichment"  # EnrichmentJob.GROUP_ID
-ALERTS_SINK_GROUP = "dvw-alerts-sink"
 
 
 @dataclass(frozen=True)
@@ -142,81 +138,6 @@ def describe_zone(details: str) -> str:
     mpas = ",".join(zone["mpa_ids"]) or "none"
     return (f"protected area {nm(zone['dist_mpa_m'])} (inside: {mpas}), EEZ boundary "
             f"{nm(zone['dist_eez_boundary_m'])}, in_port {zone['in_port']}, zones {zone['zones_version']}")
-
-
-def committed(brokers: str, group: str, tps: list[TopicPartition]) -> list[TopicPartition]:
-    """A group's committed offsets (the next offset to read). Does not join the group."""
-    c = Consumer({"bootstrap.servers": brokers, "group.id": group, "enable.auto.commit": False})
-    try:
-        return list(c.committed(tps, timeout=10))
-    finally:
-        c.close()
-
-
-def lagging(brokers: str, group: str, topic: str, last: dict[int, int]) -> list[str]:
-    """Partitions where `group` has not committed past offset last[p]."""
-    out = []
-    for tp in committed(brokers, group, [TopicPartition(topic, p) for p in sorted(last)]):
-        left = last[tp.partition] + 1 - max(tp.offset, 0)
-        if left > 0:
-            out.append(f"{group}: {left} records on {topic}/{tp.partition}")
-    return out
-
-
-def run_last_offsets(brokers: str, topic: str, run_id: str, since_ms: int) -> dict[int, int]:
-    """Offset of the run's last record per partition of `topic`, read committed from
-    since_ms to the current end. Partitions without the run's records are left out."""
-    c = Consumer({
-        "bootstrap.servers": brokers,
-        "group.id": f"dvw-score-{uuid.uuid4().hex[:8]}",  # never committed
-        "enable.auto.commit": False,
-        "isolation.level": "read_committed",
-        "enable.partition.eof": True,
-    })
-    last: dict[int, int] = {}
-    try:
-        parts = c.list_topics(topic, timeout=10).topics[topic].partitions
-        start = c.offsets_for_times([TopicPartition(topic, p, since_ms) for p in parts], timeout=10)
-        c.assign([TopicPartition(topic, tp.partition, tp.offset if tp.offset >= 0 else OFFSET_END) for tp in start])
-        remaining = set(parts)
-        while remaining:
-            msg = c.poll(1.0)
-            if msg is None:
-                continue
-            err = msg.error()
-            if err is not None:
-                if err.code() == KafkaError._PARTITION_EOF:
-                    remaining.discard(msg.partition())
-                    continue
-                raise KafkaException(err)
-            value, partition, offset = msg.value(), msg.partition(), msg.offset()
-            if value is not None and partition is not None and offset is not None:
-                if json.loads(value).get("run_id") == run_id:
-                    last[partition] = offset
-    finally:
-        c.close()
-    return last
-
-
-class Progress:
-    """Whether the tracker (and, on ais.enriched, the Flink job before it) is done with
-    the run. The run's last ais.enriched offsets are looked up once, after the Flink
-    job has finished the run: no record of it can be added after that."""
-
-    def __init__(self, brokers: str, input_topic: str, run_id: str, raw_last: dict[int, int], since_ms: int):
-        self.brokers, self.input_topic, self.run_id = brokers, input_topic, run_id
-        self.raw_last, self.since_ms = raw_last, since_ms
-        self.enriched_last: dict[int, int] | None = None
-
-    def tracker_behind(self) -> list[str]:
-        if self.input_topic == RAW_TOPIC:
-            return lagging(self.brokers, TRACKER_GROUP, RAW_TOPIC, self.raw_last)
-        if self.enriched_last is None:
-            flink = lagging(self.brokers, FLINK_GROUP, RAW_TOPIC, self.raw_last)
-            if flink:
-                return flink
-            self.enriched_last = run_last_offsets(self.brokers, ENRICHED_TOPIC, self.run_id, self.since_ms)
-        return lagging(self.brokers, TRACKER_GROUP, ENRICHED_TOPIC, self.enriched_last)
 
 
 def behind(brokers: str, progress: Progress) -> list[str]:
