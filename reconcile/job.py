@@ -415,7 +415,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     tracker_input = setting("TRACKER_INPUT_TOPIC", ENRICHED_TOPIC)
-    pending = wait_for_pipeline(Pipeline(brokers, run_id, produced, since_ms, tracker_input), deadline)
+    try:
+        pending = wait_for_pipeline(Pipeline(brokers, run_id, produced, since_ms, tracker_input), deadline)
+    except RunError as e:  # a topic read that timed out
+        print(f"reconcile: {e}", file=sys.stderr)
+        return 2
     if pending:
         print(f"reconcile: INCOMPLETE, the pipeline did not finish run {run_id} within {args.timeout:.0f} s: "
               f"{'; '.join(pending)}. Nothing written.", file=sys.stderr)
