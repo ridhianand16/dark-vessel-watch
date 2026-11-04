@@ -178,6 +178,7 @@ class ValidatorTest {
         "102.25, sog_invalid",
         "150, sog_invalid",
         "0, valid",
+        "-0.1, sog_invalid",
     })
     void sog(double sog, String expected) {
         ObjectNode n = valid();

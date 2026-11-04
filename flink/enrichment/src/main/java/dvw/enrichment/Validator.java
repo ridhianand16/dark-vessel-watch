@@ -20,6 +20,7 @@ public final class Validator {
     static final int SCHEMA_VERSION = 1;
     static final String[] REQUIRED = {"run_id", "mmsi", "event_ts", "lat", "lon"};
     static final long DAY_MS = 86_400_000L;
+    static final double SOG_MIN_KN = 0.0;
     static final double SOG_MAX_KN = 102.2;
     static final double SOG_NOT_AVAILABLE = 102.3;
 
@@ -120,7 +121,7 @@ public final class Validator {
                 return;
             }
             double kn = sog.asDouble();
-            if (kn > SOG_MAX_KN && kn != SOG_NOT_AVAILABLE) {
+            if (kn < SOG_MIN_KN || (kn > SOG_MAX_KN && kn != SOG_NOT_AVAILABLE)) {
                 reject(r, Reason.SOG_INVALID, "sog " + kn);
                 return;
             }
