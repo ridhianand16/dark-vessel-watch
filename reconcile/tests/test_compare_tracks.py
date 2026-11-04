@@ -27,3 +27,11 @@ def test_same_second_repeat_within_a_metre_is_flink_dedup() -> None:
     moved = by_vessel("r", [track(1, 12.422307, 1, 1), track(1, 12.4300, 2, 2)])[1]
     assert not only_flink_dedup(moved, b)  # 500 m apart: not a duplicate
     assert not only_flink_dedup(b, b)
+
+
+def test_dedup_rounds_like_the_flink_job_not_like_python() -> None:
+    """12.000005 and 12.000006 share Flink's key (both 1200001 after Math.round), but
+    Python's round() sends 12.000005 to 12.0 and would call them two positions."""
+    a = by_vessel("r", [track(1, 12.000005, 1, 1), track(1, 12.000006, 2, 2)])[1]
+    b = by_vessel("r", [track(1, 12.000005, 1, 1)])[1]
+    assert only_flink_dedup(a, b)

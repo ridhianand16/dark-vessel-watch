@@ -33,6 +33,7 @@ from typing import Any
 from common.env import REPO_ROOT, setting
 from reconcile.kafka import SEEK_MARGIN_MS, read_topic, run_started_ms
 from reconcile.run_check import RunError
+from stream.faust_app.tracker import duplicate_coord
 
 TRACKS = "ais.tracks"
 COMPARED = (
@@ -67,8 +68,9 @@ def first_difference(a: list[Track], b: list[Track]) -> str:
 
 
 def dedup_key(t: Track) -> tuple[Any, ...]:
-    """Flink's duplicate key without the MMSI: event_ts and position to 5 decimals."""
-    return (t[0], round(t[1], 5), round(t[2], 5))
+    """Flink's duplicate key without the MMSI: event_ts and position to 5 decimals, rounded
+    as contracts/ais_enriched.json says (ties up, like Java's Math.round), not round()."""
+    return (t[0], duplicate_coord(t[1]), duplicate_coord(t[2]))
 
 
 def only_flink_dedup(a: list[Track], b: list[Track]) -> bool:
