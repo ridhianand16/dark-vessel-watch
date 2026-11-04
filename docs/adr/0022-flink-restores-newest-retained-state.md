@@ -5,9 +5,17 @@ Status: accepted (2026-11-04)
 ## Context
 
 The enrichment job runs on a Flink session cluster in Compose, without high availability.
-A JobManager holds the running job in memory only, so a JobManager restart (a crash, an
-out-of-memory kill, `docker restart`) drops the job. Its checkpoints survive on the
-`flink-data` volume: they are retained on cancellation, three at a time (ADR 0014).
+A JobManager holds the running job in memory only, so a JobManager restart drops the job.
+What is left on the `flink-data` volume depends on how the JobManager went:
+
+- **It crashed** (killed, out of memory): it had no chance to clean up, and the job's
+  last checkpoints are still there. They are retained on cancellation, three at a time
+  (ADR 0014).
+- **It was stopped** (`docker stop`, `docker restart`, `make down`): it suspends the job
+  first, and without high availability Flink then deletes that job's checkpoints, since
+  no one could resume them. `RETAIN_ON_CANCELLATION` does not cover suspension. Measured
+  on 2026-11-04: after `docker restart dvw-flink-jobmanager` only the job's `shared/` and
+  `taskowned/` directories were left.
 
 Before this decision, `flinkctl.sh submit` (used by `make flink-up` and `make up`)
 started the job from the Kafka group's committed offsets whenever no savepoint was
@@ -45,9 +53,20 @@ the volume holds neither, which is the case on a fresh clone or after `make nuke
 
 ## Consequences
 
-- After a JobManager restart the job stays down until `make flink-up` (or `make up`), and
-  then resumes exactly where its last checkpoint left off. The tracker gets no input in
-  between. This is listed under Known issues.
+- After a JobManager crash the job stays down until `make flink-up` (or `make up`), and
+  then resumes exactly where its last checkpoint left off. Measured on 2026-11-04: the
+  JobManager killed (`SIGKILL`) 25 s into a 10,000-row replay at 1x, `make flink-up`
+  restored the newest checkpoint, and `make reconcile-run` was OK on all 6 partitions
+  with no raw offset written twice. The tracker gets no input in between.
+- After a planned stop of the JobManager there is no state left to restore, so the job
+  starts fresh from the committed offsets. No output should be lost (reasoned, not yet
+  measured): the suspension aborts only transactions after the last completed
+  checkpoint, whose input offsets were not committed either, so those records are read
+  and written again. The dedup keys are lost, though: a copy of a report whose first
+  copy came before the stop passes as new, and the tracker counts it as
+  `leak_duplicate`. To keep the state across a planned stop, run `make flink-savepoint`
+  first; the next start restores that savepoint.
+- Both are listed under Known issues.
 - A state the current job cannot restore (an operator removed from the graph) fails the
   submit loudly. `--allowNonRestoredState` is never used: silently dropping state is what
   this decision avoids. To start over deliberately, `make nuke`, or move the

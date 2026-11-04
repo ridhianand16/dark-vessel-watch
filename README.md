@@ -48,7 +48,7 @@ A day of Danish AIS traffic replays at 10x through validation, dedup, zone taggi
 
 - p99 latency misses the 5 s target on long runs: 8.2 s over a 700,000-row run, cause not yet known.
 - Vessels transmitting under a buoy or base-station MMSI are not tracked; the tracker classifies stations by MMSI range.
-- A JobManager restart stops the Flink job until `make flink-up` restores it from its last checkpoint; there is no high availability.
+- There is no Flink high availability: a JobManager restart stops the job until `make flink-up`, which restores it from its last checkpoint after a crash, or from a savepoint taken before a planned stop.
 - MMSI_CLASH is not built yet, and DARK_GAP does not yet exclude gaps at the edge of receiver coverage.
 - No monitoring stack runs locally, by design: components log their counters, and the reconciliation job stores each run's verdict.
 
