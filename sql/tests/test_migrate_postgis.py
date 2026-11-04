@@ -30,11 +30,13 @@ def test_applies_once_then_is_up_to_date(scratch_db: str, capsys: pytest.Capture
     assert "up to date (5 applied" in capsys.readouterr().out
 
 
-def test_failing_file_leaves_nothing_behind(scratch_db: str, tmp_path: Path) -> None:
+def test_failing_file_leaves_nothing_behind(
+    scratch_db: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     (tmp_path / "0000_migrations.sql").write_bytes((REPO_ROOT / "sql" / "postgis" / "0000_migrations.sql").read_bytes())
     (tmp_path / "0001_half.sql").write_text("CREATE TABLE half_done (x int);\nSELECT no_such_function();\n")
-    with pytest.raises(psycopg.errors.UndefinedFunction):
-        main(["--target", "postgis", "--dir", str(tmp_path)])
+    assert main(["--target", "postgis", "--dir", str(tmp_path)]) == 1
+    assert "ERROR: 0001_half failed and is not recorded: UndefinedFunction" in capsys.readouterr().err
     # The file ran in one transaction with its bookkeeping row: neither survived.
     assert "half_done" not in tables()
     with psycopg.connect(conninfo()) as conn:

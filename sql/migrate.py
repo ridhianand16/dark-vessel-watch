@@ -27,10 +27,12 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any, Protocol
 
 import psycopg
 from clickhouse_connect.driver.client import Client
+from clickhouse_connect.driver.exceptions import ClickHouseError
 
 from common.clickhouse import client_from_env
 from common.env import REPO_ROOT
@@ -43,6 +45,11 @@ FILE_RE = re.compile(r"^(\d{4})_([a-z0-9_]+)\.sql$")
 
 class MigrationError(Exception):
     pass
+
+
+# Errors from the database itself (unreachable, a statement it rejected): reported as one
+# ERROR line like a plan error, not as a traceback.
+DATABASE_ERRORS = (psycopg.Error, ClickHouseError)
 
 
 @dataclass(frozen=True)
@@ -170,6 +177,8 @@ class Target(Protocol):
         """Execute a file's SQL and record it in table."""
         ...
 
+    def close(self) -> None: ...
+
 
 def as_text(value: object) -> str:
     """clickhouse-connect returns FixedString as bytes; str(b"..") would give "b'..'"."""
@@ -196,6 +205,9 @@ class ClickHouseTarget:
     def apply(self, m: Migration) -> None:
         self.run(m)
         self.client.insert(self.table, [[m.version, m.name, m.checksum]], column_names=["version", "name", "checksum"])
+
+    def close(self) -> None:
+        self.client.close()
 
 
 class PostgisTarget:
@@ -227,6 +239,9 @@ class PostgisTarget:
                 (m.version, m.name, m.checksum),
             )
 
+    def close(self) -> None:
+        self.conn.close()
+
 
 def connect(target: str) -> Target:
     if target == "clickhouse":
@@ -234,7 +249,7 @@ def connect(target: str) -> Target:
     return PostgisTarget(psycopg.connect(conninfo()))
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, connect: Callable[[str], Target] = connect) -> int:
     p = argparse.ArgumentParser(prog="migrate", description=__doc__.splitlines()[0])
     p.add_argument("--target", choices=TARGETS, default="clickhouse")
     p.add_argument("--dir", type=Path, help="migrations directory (default: sql/<target>)")
@@ -243,6 +258,8 @@ def main(argv: list[str] | None = None) -> int:
     directory: Path = args.dir or SQL_ROOT / args.target
     tag = f"migrate[{args.target}]"
 
+    db: Target | None = None
+    label = ""  # the file being applied, for the error message
     try:
         migrations = discover(directory)
         if not migrations or migrations[0].version != 0:
@@ -254,26 +271,33 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 # Bootstrap: 0000 creates the bookkeeping table. It is recorded below
                 # like any other file (re-running it is a no-op by design).
+                label = f"{migrations[0].version:04d}_{migrations[0].name}"
                 db.run(migrations[0])
                 applied = db.read_applied()
         else:
             applied = db.read_applied()
         pending = plan(migrations, applied)
+        if not pending:
+            print(f"{tag}: up to date ({len(applied)} applied, nothing to do)")
+            return 0
+        for m in pending:
+            label = f"{m.version:04d}_{m.name}"
+            if args.dry_run:
+                print(f"{tag}: would apply {label} sha256={m.checksum[:12]}")
+                continue
+            db.apply(m)
+            print(f"{tag}: applied {label} sha256={m.checksum[:12]}")
+        return 0
     except MigrationError as e:
         print(f"{tag}: ERROR: {e}", file=sys.stderr)
         return 1
-
-    if not pending:
-        print(f"{tag}: up to date ({len(applied)} applied, nothing to do)")
-        return 0
-    for m in pending:
-        label = f"{m.version:04d}_{m.name}"
-        if args.dry_run:
-            print(f"{tag}: would apply {label} sha256={m.checksum[:12]}")
-            continue
-        db.apply(m)
-        print(f"{tag}: applied {label} sha256={m.checksum[:12]}")
-    return 0
+    except DATABASE_ERRORS as e:
+        where = f"{label} failed and is not recorded" if label else "cannot read the migration state"
+        print(f"{tag}: ERROR: {where}: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
+    finally:
+        if db is not None:
+            db.close()
 
 
 if __name__ == "__main__":
