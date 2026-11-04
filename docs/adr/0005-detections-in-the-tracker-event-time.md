@@ -1,14 +1,15 @@
 # 0005. Detections: in the tracker, on event time, one deterministic alert per event
 
-Status: accepted (2026-11-03)
+Status: accepted (2026-11-03). Zone condition superseded by ADR 0019: DARK_GAP reads
+the Flink job's zone tags, and the stub predicate described below is gone.
 
 ## Context
 
-M2 adds two alert rules to the Faust tracker (`stream/faust_app`, ADR 0004):
+This adds two alert rules to the Faust tracker (`stream/faust_app`, ADR 0004):
 
 - **DARK_GAP**: a vessel last moving faster than 2 kn has not been heard for more than
   30 min, and a zone predicate holds (near an EEZ boundary or protected area, not in
-  port, not at the coverage edge; a stub returning true until PostGIS lands in M3).
+  port, not at the coverage edge; a stub returning true until the zones exist).
   The alert carries the Kalman-predicted position.
 - **TELEPORT**: implied speed between consecutive fixes above 50 kn (ignoring pairs
   under 10 s or 1 km apart, which are GPS noise), or a Kalman innovation above a
@@ -124,12 +125,12 @@ how uncertain the prediction is after a long silence.
   alert. That is at most 60 s of event time at the very end of a replay.
 - **A bogus future `event_ts`** moves its partition's watermark ahead and makes every
   moving vessel on that partition look dark. The raw stream is not validated yet. The
-  Flink job (M4) must drop such records before Faust reads `ais.enriched`.
+  Flink enrichment job must drop such records before Faust reads `ais.enriched`.
 - **Rolling back to v1 code is not possible** once v2 states are in the changelog:
   the v1 tracker rejects them. Rolling back means `make nuke` or deleting the tracker
   changelog and local state.
 - **Still one worker.** The scan is per assigned partition, so it is rebalance-safe in
   principle. It needs the same multi-worker testing as ADR 0004.
 - **The zone predicate is called only for vessels that already passed the cheap
-  checks**, so when PostGIS backs it in M3 it is queried for a handful of vessels per
-  scan, not all of them.
+  checks**, so a real zone lookup behind it runs for a handful of vessels per scan,
+  not all of them.

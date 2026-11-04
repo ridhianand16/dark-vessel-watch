@@ -1,4 +1,4 @@
-# Zone package parameters. refdata/area.py reads them now; the package builder
+# Zone package parameters. Read by refdata/area.py and refdata/build.py; the build
 # records them in manifest.json so every loaded package says how it was cut.
 
 # Largest "within N nm" distance any rule applies to a zone. Today that is DARK_GAP:

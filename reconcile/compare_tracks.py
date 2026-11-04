@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from common.env import REPO_ROOT, setting
-from reconcile.flink_check import SEEK_MARGIN_MS, read_topic, run_started_ms
+from reconcile.kafka import SEEK_MARGIN_MS, read_topic, run_started_ms
 from reconcile.run_check import RunError
 
 TRACKS = "ais.tracks"

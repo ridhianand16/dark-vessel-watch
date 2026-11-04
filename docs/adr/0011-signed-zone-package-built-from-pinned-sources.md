@@ -87,7 +87,7 @@ repository ships the builder, the hashes and the public key.
 ## Consequences
 
 - `make refdata` builds, verifies and loads offline. On the pinned day it takes about
-  20 s on the laptop (see the README for the breakdown). The first build needs the
+  20 s on the laptop (see docs/results.md for the breakdown). The first build needs the
   tools image (`make refdata-image`, online once) and a key (`make refdata-key`).
 - A change to any input (a new WDPA month, another radius, a different area or tool
   image) gives a new package version. A rebuild from the same inputs reuses the

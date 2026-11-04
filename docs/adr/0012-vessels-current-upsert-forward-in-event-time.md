@@ -69,4 +69,4 @@ row backwards or make the table depend on how often or in what order it was fed.
 - **Verifying a run needs an empty table.** A table filled by earlier runs holds
   vessels the new run never sees, and vessels whose stored fix is later.
 - **One more container** (192 MB limit), one more consumer group (`dvw-vessels-sink`).
-  The sink image is now shared by all three sinks (`sinks/Dockerfile`, `dvw-sinks`).
+  The sink image is shared by all three sinks (`sinks/Dockerfile`, `dvw-sinks`).

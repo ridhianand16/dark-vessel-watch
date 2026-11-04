@@ -527,10 +527,8 @@ def apply(
         )
         return Outcome(Result.REJECTED, state, None, tuple(alerts))
 
-    state = VesselState(
-        run_id=prev.run_id,
-        anchor_lat=prev.anchor_lat,
-        anchor_lon=prev.anchor_lon,
+    state = replace(
+        prev,
         estimate=est,
         last_event_ts=fix.event_ts,
         last_lat=fix.lat,

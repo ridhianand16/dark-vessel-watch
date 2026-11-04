@@ -4,12 +4,12 @@ Status: accepted (2026-11-04)
 
 ## Context
 
-Until now the Faust tracker read `ais.raw` and did its own filtering: it skipped
+Before this, the Faust tracker read `ais.raw` and did its own filtering: it skipped
 invalid records and non-ship stations, and ignored exact repeats of the last report.
 Its DARK_GAP rule had a zone predicate that returned true everywhere, so every
 qualifying silence fired, in port and in open water alike.
 
-The Flink enrichment job now writes `ais.enriched` (ADR 0014 to 0018): only valid
+The Flink enrichment job writes `ais.enriched` (ADR 0014 to 0018): only valid
 records, repeats dropped, each record carrying its `ais.raw` partition and offset, a
 `station_class`, and zone tags (`in_port`, `dist_eez_boundary_m`, `dist_mpa_m`,
 `mpa_ids`, `eez_id`, `zones_version`). It writes in Kafka transactions that commit with

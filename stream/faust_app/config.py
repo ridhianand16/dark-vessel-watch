@@ -1,31 +1,32 @@
-"""Tracker settings from the environment (then .env), with defaults.
+"""Tracker settings from the environment (then .env). Defaults are in load(),
+KalmanConfig and DetectionConfig.
 
-    TRACKER_INPUT_TOPIC             ais.enriched   ais.enriched (the Flink job's output)
-                                           or ais.raw (no zone tags, so no DARK_GAP)
-    TRACKER_MEAS_SIGMA_M            20     AIS position noise per axis, metres
-    TRACKER_ACCEL_PSD               0.05   process noise q, m^2/s^3
-    TRACKER_INIT_SPEED_SIGMA_MS     1.0    first-fix velocity sigma with SOG/COG, m/s
-    TRACKER_UNKNOWN_SPEED_SIGMA_MS  10.0   first-fix velocity sigma without, m/s
-    TRACKER_BATCH_MAX               1000   records per batch (see app.py)
-    TRACKER_BATCH_WITHIN_S          0.1    max wait to fill a batch, seconds
-    TRACKER_DATA_DIR                ./data/tracker   RocksDB and Faust local state
-    REDPANDA_BROKERS                localhost:19092
+    TRACKER_INPUT_TOPIC             ais.enriched (the Flink job's output) or ais.raw
+                                    (no zone tags, so no DARK_GAP)
+    TRACKER_MEAS_SIGMA_M            AIS position noise per axis, metres
+    TRACKER_ACCEL_PSD               process noise q, m^2/s^3
+    TRACKER_INIT_SPEED_SIGMA_MS     first-fix velocity sigma with SOG/COG, m/s
+    TRACKER_UNKNOWN_SPEED_SIGMA_MS  first-fix velocity sigma without, m/s
+    TRACKER_BATCH_MAX               records per batch (see app.py)
+    TRACKER_BATCH_WITHIN_S          max wait to fill a batch, seconds
+    TRACKER_DATA_DIR                RocksDB and Faust local state
+    REDPANDA_BROKERS                bootstrap servers
 
 Detection thresholds (DetectionConfig; ADR 0005). Every alert rule reads its numbers
 from here and nowhere else:
 
-    DARK_GAP_S                      1800   silence before DARK_GAP, event-time seconds
-    DARK_GAP_MIN_SOG_KN             2.0    vessel must have been moving faster than this
-    DARK_GAP_ZONE_NM                10.0   last accepted fix within this distance of an
-                                           EEZ boundary or protected area (and not in port)
-    DARK_SCAN_STEP_S                60     scan a partition each time its watermark
-                                           advances this much event time
-    TELEPORT_MAX_SPEED_KN           50.0   implied speed above this is a TELEPORT
-    TELEPORT_MIN_DT_S               10     implied speed ignored below this dt (noise)
-    TELEPORT_MIN_DISTANCE_M         1000   implied speed and innovation rules ignore
-                                           jumps shorter than this (GPS noise)
-    TELEPORT_MAX_NIS                50.0   innovation NIS above this is a TELEPORT
-    TELEPORT_MAX_REJECTS            3      the Nth rejected fix in a row restarts the filter
+    DARK_GAP_S                      silence before DARK_GAP, event-time seconds
+    DARK_GAP_MIN_SOG_KN             vessel must have been moving faster than this
+    DARK_GAP_ZONE_NM                last accepted fix within this distance of an EEZ
+                                    boundary or protected area (and not in port)
+    DARK_SCAN_STEP_S                scan a partition each time its watermark advances
+                                    this much event time
+    TELEPORT_MAX_SPEED_KN           implied speed above this is a TELEPORT
+    TELEPORT_MIN_DT_S               implied speed ignored below this dt (noise)
+    TELEPORT_MIN_DISTANCE_M         implied speed and innovation rules ignore jumps
+                                    shorter than this (GPS noise)
+    TELEPORT_MAX_NIS                innovation NIS above this is a TELEPORT
+    TELEPORT_MAX_REJECTS            the Nth rejected fix in a row restarts the filter
 """
 
 from __future__ import annotations

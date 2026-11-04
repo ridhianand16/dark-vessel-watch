@@ -62,7 +62,6 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=dotenv_value("REDPANDA_BROKERS") or "localhost:19092",
         help="bootstrap servers (default: REDPANDA_BROKERS from env or .env)",
     )
-    p.add_argument("--topic", default=TOPIC, help=argparse.SUPPRESS)
     p.add_argument("--runs-dir", type=Path, default=REPO_ROOT / "data" / "runs")
     p.add_argument(
         "--inject",
@@ -136,6 +135,45 @@ def write_json_atomic(path: Path, data: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+def produce_all(
+    rows: Iterator[tuple[str | None, int | None, bool]],
+    producer: Producer,
+    tracker: DeliveryTracker,
+    pacer: Pacer,
+    layout: CsvLayout,
+    run_id: str,
+    spec: inject.Spec | None,
+    t0: float,
+) -> tuple[int, int, int, str]:
+    """Produce every row to ais.raw on the pacer's schedule. Returns (sent, injected,
+    CSV rows in the synthetic MMSI range, status); Ctrl-C stops it as "interrupted"."""
+    sent = injected = in_reserved_range = 0
+    status = "complete"
+    try:
+        for line, ts, synthetic in rows:
+            pacer.wait_for(ts)
+            key, value = build_message(line, ts, layout.field_index, run_id)
+            if synthetic:
+                injected += 1
+            elif spec is not None and key != INVALID_KEY and spec.in_range(int(key)):
+                in_reserved_range += 1  # a real vessel the scorer would mistake for a synthetic one
+            while True:
+                try:
+                    producer.produce(TOPIC, value, key, on_delivery=tracker.on_delivery)
+                    break
+                except BufferError:  # local queue full: let librdkafka drain it
+                    producer.poll(0.1)
+            producer.poll(0)
+            sent += 1
+            if sent % 500_000 == 0:
+                rate = sent / (time.monotonic() - t0)
+                print(f"replayer: sent {sent:,} ({rate:,.0f}/s)", file=sys.stderr)
+    except KeyboardInterrupt:
+        status = "interrupted"
+        print("replayer: interrupted, flushing what was already produced", file=sys.stderr)
+    return sent, injected, in_reserved_range, status
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     run_id = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6]
@@ -166,32 +204,11 @@ def main(argv: list[str] | None = None) -> int:
     out = args.runs_dir / run_id / "produced.json"
     # Marks the run as in progress, so a reconciliation started now waits for it. A
     # replayer killed with SIGKILL leaves this behind; the job then times out.
-    write_json_atomic(out, {"run_id": run_id, "status": "running", "topic": args.topic, "started_at": started_at})
-    sent = injected = in_reserved_range = 0
-    status = "complete"
+    write_json_atomic(out, {"run_id": run_id, "status": "running", "topic": TOPIC, "started_at": started_at})
     rows = merged(csv_rows(args.file, layout, args.limit), plan.rows if plan else [])
-    try:
-        for line, ts, synthetic in rows:
-            pacer.wait_for(ts)
-            key, value = build_message(line, ts, layout.field_index, run_id)
-            if synthetic:
-                injected += 1
-            elif spec is not None and key != INVALID_KEY and spec.in_range(int(key)):
-                in_reserved_range += 1  # a real vessel the scorer would mistake for a synthetic one
-            while True:
-                try:
-                    producer.produce(args.topic, value, key, on_delivery=tracker.on_delivery)
-                    break
-                except BufferError:  # local queue full: let librdkafka drain it
-                    producer.poll(0.1)
-            producer.poll(0)
-            sent += 1
-            if sent % 500_000 == 0:
-                rate = sent / (time.monotonic() - t0)
-                print(f"replayer: sent {sent:,} ({rate:,.0f}/s)", file=sys.stderr)
-    except KeyboardInterrupt:
-        status = "interrupted"
-        print("replayer: interrupted, flushing what was already produced", file=sys.stderr)
+    sent, injected, in_reserved_range, status = produce_all(
+        rows, producer, tracker, pacer, layout, run_id, spec, t0
+    )
 
     undelivered = producer.flush(FLUSH_TIMEOUT_S)
     if status == "complete" and (undelivered or tracker.errors or tracker.delivered != sent):
@@ -203,7 +220,7 @@ def main(argv: list[str] | None = None) -> int:
         {
             "run_id": run_id,
             "status": status,
-            "topic": args.topic,
+            "topic": TOPIC,
             "source_file": str(args.file),
             "speed": args.speed,
             "limit": args.limit,
