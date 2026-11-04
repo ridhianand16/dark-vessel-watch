@@ -61,7 +61,7 @@ needs about 54 minutes (650,000 rows). And an alert is identified by its event t
 
 - **Verification runs need 700,000 rows** (58 min of event time), 75 s at 50x.
 - **Precision is measured on decoys we chose**, so it says that known non-events do not
-  fire, not how the rules behave on real traffic. Real-traffic alerts need zones (M3)
+  fire, not how the rules behave on real traffic. Real-traffic alerts need zones
   and a look at the map before they mean anything.
 - **Synthetic tracks are simpler than real ones:** straight lines, constant speed,
   Gaussian noise of 5 m, a report every 10 s. They test the rules and the delivery

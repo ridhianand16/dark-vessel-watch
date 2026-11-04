@@ -13,7 +13,7 @@ depending on latitude. So the job needs the zones in a metric projection. It sho
 also get them already validated, so that every Flink task does not repeat the
 cleaning that the loader's staging checks already do (ADR 0010).
 
-The job also needs one answer to "which package is live". Until now the active package
+The job also needs one answer to "which package is live". Before this, the active package
 was implied: the latest `loaded_at` in `refdata_packages`. A startup gate that waits
 for zones and an alert that records the zone version both need that answer, and an
 implied rule is easy to get subtly wrong (ties, a failed load, a rollback that reloads

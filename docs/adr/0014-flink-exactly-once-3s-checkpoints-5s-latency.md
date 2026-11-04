@@ -90,4 +90,4 @@ The laptop gives Docker a 3.9 GiB VM (OrbStack), and everything else is already 
   10 minutes. The records in those transactions come before the checkpoint's offsets, so they
   are not replayed. Transactions of a checkpoint that never completed are harmless. They are
   aborted and their records replayed. The Flink check would show the gap as "missing".
-- The job adds 2 GB of container limits. Measured use is in the README.
+- The job adds 2 GB of container limits. Measured use is in docs/results.md.

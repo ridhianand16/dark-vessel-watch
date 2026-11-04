@@ -26,7 +26,7 @@ navigation.
 Replay at 10x is the target, with one worker per service and 6 partitions, because the
 project runs on an 8 GB laptop. Non-ship stations (identified by MMSI range) are stored
 in full but skipped by the tracker, with a counted reason. Faster replay is out of
-scope; the README explains how to get there (more workers up to the partition count,
+scope; docs/architecture.md explains how to get there (more workers up to the partition count,
 dropping numpy from the Kalman step, filtering earlier in Flink).
 
 In practice:
@@ -59,8 +59,8 @@ In practice:
 
 - **The latency target is p99 under 2 s at 10x.** A full day takes about 2.4 hours to
   replay at that speed, so measured runs use slices of the day.
-- **Faster replay is documented, not built.** The README lists the levers in order of
-  cost.
+- **Faster replay is documented, not built.** docs/architecture.md lists the levers
+  in order of cost.
 - **A ship that transmits under a non-ship MMSI is invisible to detection.** A vessel
   faking an aid-to-navigation MMSI would raise no DARK_GAP or TELEPORT. Its rows are
   still in the raw store, and the `not_a_ship` counter shows the volume. Detecting
