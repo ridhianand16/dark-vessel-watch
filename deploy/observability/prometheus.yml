@@ -1,0 +1,38 @@
+# Scrape config for the Compose stack (`make observability`). Every target is a service
+# name on the dvw Docker network. In Kubernetes the chart creates ServiceMonitors and
+# PodMonitors for the same endpoints instead (deploy/helm, observability.enabled).
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  external_labels:
+    stack: dvw-compose
+
+scrape_configs:
+  # The Python services: common/metrics.py, METRICS_PORT=9108.
+  - job_name: dvw-sinks
+    static_configs:
+      - targets: ["raw-sink:9108", "tracks-alerts-sink:9108", "vessels-sink:9108"]
+  - job_name: dvw-tracker
+    static_configs:
+      - targets: ["tracker:9108"]
+
+  # Flink's Prometheus reporter on every JVM. Checkpoint stats come from the JobManager,
+  # operator, Kafka source lag and heap from the TaskManager.
+  - job_name: flink
+    static_configs:
+      - targets: ["flink-jobmanager:9249", "flink-taskmanager:9249"]
+
+  # config.d/prometheus.xml: system.metrics, system.events, system.asynchronous_metrics.
+  - job_name: clickhouse
+    static_configs:
+      - targets: ["clickhouse:9363"]
+
+  # Redpanda's public metrics on the admin API (port 9644 inside the network).
+  - job_name: redpanda
+    metrics_path: /public_metrics
+    static_configs:
+      - targets: ["redpanda:9644"]
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

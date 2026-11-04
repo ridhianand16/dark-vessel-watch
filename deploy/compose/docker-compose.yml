@@ -7,6 +7,7 @@
 #   flink-jobmanager 768m | flink-taskmanager 1280m        (`make up` starts them, via `make flink-up`)
 #   total ≈ 5.9g ceiling; measured use with everything running is in docs/results.md
 #   console 256m, only when needed (profile console, `make console`)
+#   prometheus 256m + grafana 256m, only with `make observability` (profile observability)
 #   flink-submit 384m, one-shot; refdata-tools 1g, only while `make refdata` builds a package
 #   Run GDAL package builds with Flink stopped.
 # Every image tag is pinned; never use :latest (reproducibility).
@@ -121,6 +122,9 @@ services:
       - "9000:9000"   # native TCP
     volumes:
       - clickhouse-data:/var/lib/clickhouse
+      # /metrics on 9363, inside the Docker network only. A listener on ClickHouse's existing
+      # HTTP server: no extra process, cache or memory. Scraped only by the observability profile.
+      - ./clickhouse-config/prometheus.xml:/etc/clickhouse-server/config.d/prometheus.xml:ro
     # ClickHouse sizes its own caches from this (max_server_memory_usage = 90% of it).
     mem_limit: 1280m
     ulimits:
@@ -175,6 +179,8 @@ services:
       CLICKHOUSE_PORT: "8123"
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:?set in .env}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set in .env}
+      # Empty (metrics off, common/metrics.py) unless `make observability` sets it.
+      METRICS_PORT: ${DVW_METRICS_PORT:-}
     # 50k-row batches plus a 16 MB librdkafka prefetch buffer; see docs/results.md for measured usage.
     mem_limit: 384m
     # Long enough to insert and commit an in-flight batch, including a retry or two.
@@ -229,6 +235,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:?set in .env}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
       POSTGRES_DB: ${POSTGRES_DB:?set in .env}
+      METRICS_PORT: ${DVW_METRICS_PORT:-}
     # Batches of at most 10k small rows; the 16 MB prefetch buffer dominates.
     mem_limit: 192m
     stop_grace_period: 30s
@@ -252,6 +259,7 @@ services:
       # ais.enriched is written by the Flink job (started by make up); ais.raw tracks
       # without it, but raises no DARK_GAP (no zone tags).
       TRACKER_INPUT_TOPIC: ${TRACKER_INPUT_TOPIC:-ais.enriched}
+      METRICS_PORT: ${DVW_METRICS_PORT:-}
     volumes:
       - tracker-data:/data
     # Python + numpy + 6 small RocksDB instances (8 MB block cache each, see app.py).
@@ -289,6 +297,12 @@ services:
         restart-strategy.fixed-delay.attempts: 2147483647
         restart-strategy.fixed-delay.delay: 5 s
         heartbeat.timeout: 20000
+        # Prometheus reporter (plugin shipped in the image) on 9249. Configured always, started
+        # only when listed: `none` names no reporter, so `make up` starts none and the JVMs
+        # carry no metrics registry. `make observability` sets DVW_FLINK_REPORTERS=prom.
+        metrics.reporters: ${DVW_FLINK_REPORTERS:-none}
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9249
     ports:
       - "8081:8081"   # web UI and REST API
     volumes:
@@ -367,7 +381,45 @@ services:
     # ogr2ogr streams features; the largest WDPA polygons clipped with GEOS dominate.
     mem_limit: 1g
 
+  # Profile observability (`make observability`): scrapes every /metrics endpoint above with
+  # deploy/observability/prometheus.yml and shows the one dashboard. Bound to localhost.
+  prometheus:
+    image: prom/prometheus:v3.15.1
+    container_name: dvw-prometheus
+    profiles: [observability]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=2d
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ../observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    # A few thousand series (Flink's per-operator metrics dominate) at 15 s.
+    mem_limit: 256m
+
+  grafana:
+    image: grafana/grafana:13.2.5
+    container_name: dvw-grafana
+    profiles: [observability]
+    depends_on: [prometheus]
+    environment:
+      # Local only: anonymous read-only access, no login. Nothing here is reachable off the host.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ../observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../observability/dashboards:/var/lib/grafana/dashboards:ro
+    mem_limit: 256m
+
 volumes:
+  prometheus-data:
   flink-data:
   redpanda-data:
   clickhouse-data:

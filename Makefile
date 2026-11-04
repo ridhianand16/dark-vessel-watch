@@ -1,13 +1,13 @@
 COMPOSE := docker compose -f deploy/compose/docker-compose.yml --env-file .env
 
-.PHONY: hooks up down nuke topics ps console fetch fetch-refdata area refdata refdata-image refdata-key refdata-build refdata-verify refdata-load replay migrate migrate-postgis sink sink-logs tracks-alerts-sink tracks-alerts-sink-logs vessels-sink vessels-sink-logs tracker tracker-logs reconcile-run score flink-up flink-savepoint flink-restart flink-logs compare-tracks latency backfill-rollups ttl-demo test test-py test-flink typecheck
+.PHONY: hooks up down nuke topics ps console observability observability-down fetch fetch-refdata area refdata refdata-image refdata-key refdata-build refdata-verify refdata-load replay migrate migrate-postgis sink sink-logs tracks-alerts-sink tracks-alerts-sink-logs vessels-sink vessels-sink-logs tracker tracker-logs reconcile-run score flink-up flink-savepoint flink-restart flink-logs compare-tracks latency backfill-rollups ttl-demo test test-py test-flink typecheck
 
 .env:
 	@echo "Missing .env. Run: cp .env.example .env" >&2; exit 1
 
 SERVICES := redpanda clickhouse postgis
 # Every profile, so down and nuke also remove Console and the one-shot tool containers.
-ALL_PROFILES := --profile console --profile tools
+ALL_PROFILES := --profile console --profile tools --profile observability
 
 # Read only the keys we need from .env rather than including the whole file.
 env_get = $(shell sed -n 's/^$(1)=//p' .env 2>/dev/null)
@@ -39,6 +39,30 @@ down: .env
 ## Stop and delete everything including volumes. Destroys all data.
 nuke: .env
 	$(COMPOSE) $(ALL_PROFILES) down -v --remove-orphans
+
+## Metrics on every service, Prometheus on http://localhost:9090 and the dashboard on
+## http://localhost:3000. Off by default: `make up` serves no metrics (common/metrics.py).
+## Recreates the Python services with METRICS_PORT, and the Flink cluster with its
+## Prometheus reporter started: the job is stopped with a savepoint first and resubmitted
+## from it (docs/adr/0022). Adds about 512 MiB (Prometheus and Grafana). Undo with
+## make observability-down. See docs/deploy.md.
+OBS_ENV := DVW_METRICS_PORT=9108 DVW_FLINK_REPORTERS=prom
+OBS_PY := raw-sink tracks-alerts-sink vessels-sink tracker
+observability: .env
+	-$(COMPOSE) run --rm --no-deps flink-submit stop
+	$(OBS_ENV) $(COMPOSE) up -d --wait --wait-timeout 180 --no-deps flink-jobmanager flink-taskmanager
+	$(OBS_ENV) $(MAKE) flink-up
+	$(OBS_ENV) $(COMPOSE) up -d --no-deps $(OBS_PY)
+	docker exec dvw-redpanda rpk cluster config set enable_consumer_group_metrics '["group","partition","consumer_lag"]'
+	$(COMPOSE) --profile observability up -d --wait prometheus grafana
+
+## Stop Prometheus and Grafana and turn every metrics endpoint off again (same restarts).
+observability-down: .env
+	$(COMPOSE) --profile observability rm -sf prometheus grafana
+	-$(COMPOSE) run --rm --no-deps flink-submit stop
+	$(COMPOSE) up -d --wait --wait-timeout 180 --no-deps flink-jobmanager flink-taskmanager
+	$(MAKE) flink-up
+	$(COMPOSE) up -d --no-deps $(OBS_PY)
 
 ## (Re)create topics. Idempotent: safe to run any number of times.
 topics: .env

@@ -1,0 +1,777 @@
+{
+  "uid": "dvw-pipeline",
+  "title": "Dark Vessel Watch pipeline",
+  "tags": [
+    "dvw"
+  ],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "timezone": "utc",
+  "refresh": "15s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Prometheus",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0
+      }
+    ]
+  },
+  "annotations": {
+    "list": []
+  },
+  "links": [],
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Pipeline flow",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "panels": []
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Records consumed per second, by sink",
+      "description": "Records each sink has written and committed (dvw_sink_records_total). Compare raw with tracks: the gap is Flink's DLQ and duplicates plus non-ship stations.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "rps"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (sink) (rate(dvw_sink_records_total[1m]))",
+          "legendFormat": "{{sink}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Tracker events per second",
+      "description": "The tracker's outcome counter: records read, fixes accepted, rejects by reason, alerts by type.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "rps"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (event) (rate(dvw_tracker_events_total[1m]))",
+          "legendFormat": "{{event}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Flink leaks into the tracker",
+      "description": "Records the Flink job should have removed but the tracker saw anyway (leak_invalid, leak_station_class, leak_duplicate). Every value should stay 0.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(dvw_tracker_events_total{event=~\"leak_.*\"})",
+          "legendFormat": "leaks"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value"
+      }
+    },
+    {
+      "id": 5,
+      "type": "row",
+      "title": "Latency and stalls",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      },
+      "panels": []
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Sink write p99",
+      "description": "99th percentile of one batch write, retries included.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 10
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (sink, le) (rate(dvw_sink_write_seconds_bucket[5m])))",
+          "legendFormat": "{{sink}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Seconds since each sink's last commit",
+      "description": "Grows without bound when a sink is stuck. A sink with no input also stops committing, so read it next to the input rate.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 10
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "time() - max by (sink) (dvw_sink_last_commit_timestamp_seconds)",
+          "legendFormat": "{{sink}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Tracker batch p99",
+      "description": "Time to process one batch: Kalman updates, waiting for the broker's acks, state writes.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 10
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(dvw_tracker_batch_seconds_bucket[5m])))",
+          "legendFormat": "p99"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(dvw_tracker_batch_seconds_bucket[5m])))",
+          "legendFormat": "p50"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "type": "row",
+      "title": "Failures",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 18
+      },
+      "panels": []
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Sink write retries and failed commits",
+      "description": "A retry is a failed write attempt that was tried again; a failed commit is re-read and deduplicated by the store.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 19
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (sink) (increase(dvw_sink_write_retries_total[5m]))",
+          "legendFormat": "retries {{sink}}"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (sink) (increase(dvw_sink_commit_failures_total[5m]))",
+          "legendFormat": "commit failures {{sink}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Flink restarts and failed checkpoints",
+      "description": "Any increase means the exactly-once job rolled back to its last checkpoint.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 19
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(flink_jobmanager_job_numRestarts)",
+          "legendFormat": "restarts"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(flink_jobmanager_job_numberOfFailedCheckpoints)",
+          "legendFormat": "failed checkpoints"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Flink records out per operator",
+      "description": "Records per second each operator emits. The sinks are named after their topics: ais.enriched, ais.dlq, ais.dedup_counts.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 19
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "rps"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (operator_name) (rate(flink_taskmanager_job_task_operator_numRecordsOut[1m]))",
+          "legendFormat": "{{operator_name}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 13,
+      "type": "row",
+      "title": "Flink",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 27
+      },
+      "panels": []
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Checkpoint duration",
+      "description": "Each checkpoint commits the job's Kafka transactions, so this plus the 3 s interval bounds end-to-end latency.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 28
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(flink_jobmanager_job_lastCheckpointDuration) / 1000",
+          "legendFormat": "last checkpoint"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Kafka source lag",
+      "description": "Records in ais.raw not yet read by the Flink job (FLIP-33 pendingRecords).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 28
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(flink_taskmanager_job_task_operator_pendingRecords)",
+          "legendFormat": "pending records"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "JVM heap used",
+      "description": "Heap state lives here (hashmap state backend).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 28
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (job, instance) (flink_taskmanager_Status_JVM_Memory_Heap_Used)",
+          "legendFormat": "TaskManager {{instance}}"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (job, instance) (flink_jobmanager_Status_JVM_Memory_Heap_Used)",
+          "legendFormat": "JobManager {{instance}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 17,
+      "type": "row",
+      "title": "Stores and broker",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 36
+      },
+      "panels": []
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "ClickHouse rows inserted per second",
+      "description": "All tables, materialised views included.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 37
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "rps"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(ClickHouseProfileEvents_InsertedRows[1m])",
+          "legendFormat": "inserted rows"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "ClickHouse memory",
+      "description": "Memory ClickHouse's own tracker accounts for; its limit is 90% of the container's.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 37
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "ClickHouseMetrics_MemoryTracking",
+          "legendFormat": "tracked"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Redpanda consumer group lag",
+      "description": "Needs the cluster setting enable_consumer_group_metrics to include consumer_lag (make observability and the chart set it).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 37
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (redpanda_group) (redpanda_kafka_consumer_group_lag_sum)",
+          "legendFormat": "{{redpanda_group}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    }
+  ]
+}
