@@ -10,6 +10,7 @@ from report.sampler import (
     GroupSample,
     Sample,
     checkpoint_summary,
+    job_down,
     lag_summary,
     memory_summary,
     parse_checkpoints,
@@ -150,3 +151,9 @@ def test_checkpoints_across_a_resubmitted_job() -> None:
 def test_checkpoints_without_flink_samples() -> None:
     c = checkpoint_summary([Sample(0.0)])
     assert (c.completed, c.sampled, c.avg_ms, c.max_ms, c.jobs) == (0, 0, None, None, ())
+
+
+def test_job_down_outside_fault_windows() -> None:
+    up = flink("j", 0, 0, 0, [])
+    samples = [Sample(0.0, flink=up), Sample(5.0), Sample(10.0, flink=up), Sample(20.0), Sample(25.0)]
+    assert job_down(samples, [(18.0, 22.0)]) == [5.0, 25.0]

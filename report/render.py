@@ -44,10 +44,12 @@ class Report:
     copies: list[Copies]
     finished_at: datetime
     sample_errors: dict[str, int] = field(default_factory=dict)
+    job_down: list[float] = field(default_factory=list)  # samples with no running job outside the faults
 
     @property
     def ok(self) -> bool:
         return (self.produced.get("status") == "complete" and self.reconcile_rc == 0 and self.chaos_error is None
+                and not self.job_down
                 and self.score_rc in (None, 0) and all(c.duplicates == 0 for c in self.copies))
 
 
@@ -133,6 +135,10 @@ def summary(r: Report) -> list[str]:
                      f"{' (the killed job)' if jm.job_before and jm.job_before in (jm.restored or '') else ''}.")
     if r.chaos_error:
         parts.append(f"The fault sequence did not complete: {r.chaos_error}.")
+    if r.job_down:
+        parts.append(f"**The Flink job was also down outside the injected faults** ({len(r.job_down)} samples, "
+                     f"first at {datetime.fromtimestamp(r.job_down[0], UTC):%H:%M:%S} UTC), so latency and "
+                     "throughput include an unplanned restart.")
     return [" ".join(parts)]
 
 
@@ -273,7 +279,7 @@ def checkpoints_section(r: Report) -> list[str]:
     rows = [
         ["Completed", n(c.completed)],
         ["Failed", n(c.failed)],
-        ["Restores (failover or submit from state)", n(c.restores)],
+        ["Restores (every restart attempt counts)", n(c.restores)],
         ["Average duration", "-" if c.avg_ms is None else ms(c.avg_ms)],
         ["Max duration", "-" if c.max_ms is None else ms(c.max_ms)],
         ["Job instances", ", ".join(f"`{j}`" for j in c.jobs) or "-"],

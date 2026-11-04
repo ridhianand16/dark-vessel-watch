@@ -323,7 +323,7 @@ def memory_summary(samples: list[Sample]) -> Memory:
 class Checkpoints:
     completed: int  # from the counters: every checkpoint completed in the window
     failed: int
-    restores: int  # times a job instance restored state (a failover, or a submit from state)
+    restores: int  # restores of state; every restart attempt counts, also one that then waits for slots
     sampled: int  # completed checkpoints whose duration was seen in the history
     avg_ms: float | None
     max_ms: int | None
@@ -371,3 +371,9 @@ def checkpoint_summary(samples: list[Sample]) -> Checkpoints:
         jobs=tuple(order),
         restored=restored,
     )
+
+
+def job_down(samples: list[Sample], windows: list[tuple[float, float]]) -> list[float]:
+    """Times of samples with no running enrichment job outside the given (start, end)
+    windows: restarts the injected faults do not explain."""
+    return [s.t for s in samples if s.flink is None and not any(a <= s.t <= b for a, b in windows)]

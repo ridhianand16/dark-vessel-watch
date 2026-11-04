@@ -131,3 +131,10 @@ def test_flink_recovered_needs_a_checkpoint_after_the_restart() -> None:
     # After a JobManager kill only a new job instance counts.
     assert flink_recovered(FakeFlink("j", True, [after]), 2_000, old_job="j") is None  # type: ignore[arg-type]
     assert flink_recovered(FakeFlink(None, False, []), 2_000) is None  # type: ignore[arg-type]
+
+
+def test_unplanned_flink_restart_is_flagged() -> None:
+    r = report([])
+    r.job_down = [datetime(2026, 11, 4, 12, 1, 5, tzinfo=UTC).timestamp()]
+    assert "The Flink job was also down outside the injected faults** (1 samples, first at 12:01:05 UTC)" in render(r)
+    assert not r.ok

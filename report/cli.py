@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -86,6 +88,50 @@ def preflight(flink: sampler.FlinkRest) -> str | None:
     return None
 
 
+SETTLE_S = 60.0
+SETTLE_TIMEOUT_S = 300.0
+SETTLED_LAG = 1_000
+
+
+def settle(flink: sampler.FlinkRest) -> str | None:
+    """Wait until the stack is steady: the Flink job has run every task for SETTLE_S with
+    checkpoints completing and none failing or restoring, and no group lags more than
+    SETTLED_LAG. Measuring a stack still recovering (after a laptop wake, a restart or
+    a backlog) would report its recovery as the pipeline's numbers. None when steady."""
+    deadline = time.monotonic() + SETTLE_TIMEOUT_S
+    base: sampler.FlinkSample | None = None
+    since = time.monotonic()
+    why = "not checked yet"
+    while time.monotonic() < deadline:
+        jid = flink.running_job()
+        cur = flink.checkpoints(jid) if jid and flink.all_tasks_running(jid) else None
+        if cur is None:
+            base, why = None, "the Flink job is not running every task"
+        elif base is None or cur.job_id != base.job_id or any(
+                cur.counts.get(k, 0) != base.counts.get(k, 0) for k in ("failed", "restored")):
+            base, since, why = cur, time.monotonic(), "Flink checkpoints failed or the job restarted"
+        else:
+            lags = {g: gs.lag for g, gs in sampler.rpk_groups(list(sampler.STAGES)).items()}
+            behind = {g: v for g, v in lags.items() if v > SETTLED_LAG}
+            if behind:
+                why = "lagging: " + ", ".join(f"{g} {v:,}" for g, v in behind.items())
+            elif time.monotonic() - since >= SETTLE_S and cur.counts.get("completed", 0) > base.counts.get(
+                    "completed", 0):
+                return None
+            else:
+                why = f"waiting for {SETTLE_S:.0f} s of clean checkpoints"
+        time.sleep(5.0)
+    return f"the stack did not settle within {SETTLE_TIMEOUT_S:.0f} s: {why}"
+
+
+def keep_awake() -> subprocess.Popen[bytes] | None:
+    """macOS: hold off idle sleep while the report runs. A laptop that sleeps mid-run
+    times out Flink's heartbeats and the report measures the wake-up instead."""
+    if shutil.which("caffeinate") is None:
+        return None
+    return subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())])
+
+
 def plan(csv: Path, rows: int) -> tuple[float, bool, str]:
     """(expected replay seconds at SPEED, inject?, why not)."""
     layout = read_layout(csv)
@@ -143,6 +189,12 @@ def main(argv: list[str] | None = None) -> int:
     if not injected:
         log(f"no anomaly injection: {inject_note}")
 
+    keep_awake()
+    log("waiting for the stack to be steady")
+    if (why := settle(flink)) is not None:
+        print(f"report: {why}", file=sys.stderr)
+        return 2
+
     env = environment.collect()
     log(f"commit {env.git_short}{' (uncommitted changes)' if env.git_dirty else ''}, zone package "
         f"{env.zone_package}, replay about {expected_s:.0f} s")
@@ -195,6 +247,7 @@ def main(argv: list[str] | None = None) -> int:
         lag=sampler.lag_summary(samples),
         memory=sampler.memory_summary(samples),
         checkpoints=sampler.checkpoint_summary(samples),
+        job_down=sampler.job_down(samples, [(f.killed_at, f.recovered_at or time.time()) for f in faults]),
         latencies=collect.latencies(client, run_id, first_fault_ms),
         reconciliation=collect.reconciliation(client, run_id),
         reconcile_rc=reconcile_rc,
