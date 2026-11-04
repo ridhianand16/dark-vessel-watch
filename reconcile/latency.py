@@ -26,16 +26,15 @@ a millisecond).
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
 from clickhouse_connect.driver.client import Client
-from confluent_kafka import OFFSET_END, Consumer, KafkaError, KafkaException, TopicPartition
 
 from common.clickhouse import client_from_env
 from common.env import REPO_ROOT, setting
-from reconcile.flink_check import SEEK_MARGIN_MS, run_started_ms
+from reconcile import kafka
+from reconcile.kafka import SEEK_MARGIN_MS, run_started_ms
 from reconcile.run_check import RunError
 
 TRACKS = "ais.tracks"
@@ -55,37 +54,11 @@ def percentiles(values: list[float]) -> str:
 
 
 def track_latencies(brokers: str, run_id: str, since_ms: int) -> list[float]:
-    c = Consumer({
-        "bootstrap.servers": brokers,
-        "group.id": "dvw-latency",  # never committed
-        "enable.auto.commit": False,
-        "enable.partition.eof": True,
-    })
     out: list[float] = []
-    try:
-        parts = c.list_topics(TRACKS, timeout=10).topics[TRACKS].partitions
-        start = c.offsets_for_times([TopicPartition(TRACKS, p, since_ms) for p in parts], timeout=10)
-        c.assign([TopicPartition(TRACKS, tp.partition, tp.offset if tp.offset >= 0 else OFFSET_END) for tp in start])
-        remaining = set(parts)
-        while remaining:
-            msg = c.poll(1.0)
-            if msg is None:
-                continue
-            err = msg.error()
-            if err is not None:
-                if err.code() == KafkaError._PARTITION_EOF:
-                    remaining.discard(msg.partition())
-                    continue
-                raise KafkaException(err)
-            value = msg.value()
-            if value is None:
-                continue
-            t = json.loads(value)
-            sent = t.get("replay_send_ts")
-            if t.get("run_id") == run_id and isinstance(sent, int):
-                out.append(float(msg.timestamp()[1] - sent))
-    finally:
-        c.close()
+    for r in kafka.read(brokers, TRACKS, since_ms, "dvw-latency"):
+        sent = r.value.get("replay_send_ts")
+        if r.value.get("run_id") == run_id and isinstance(sent, int):
+            out.append(float(r.timestamp_ms - sent))
     return out
 
 
