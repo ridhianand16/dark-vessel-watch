@@ -62,7 +62,6 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=dotenv_value("REDPANDA_BROKERS") or "localhost:19092",
         help="bootstrap servers (default: REDPANDA_BROKERS from env or .env)",
     )
-    p.add_argument("--topic", default=TOPIC, help=argparse.SUPPRESS)
     p.add_argument("--runs-dir", type=Path, default=REPO_ROOT / "data" / "runs")
     p.add_argument(
         "--inject",
@@ -166,7 +165,7 @@ def main(argv: list[str] | None = None) -> int:
     out = args.runs_dir / run_id / "produced.json"
     # Marks the run as in progress, so a reconciliation started now waits for it. A
     # replayer killed with SIGKILL leaves this behind; the job then times out.
-    write_json_atomic(out, {"run_id": run_id, "status": "running", "topic": args.topic, "started_at": started_at})
+    write_json_atomic(out, {"run_id": run_id, "status": "running", "topic": TOPIC, "started_at": started_at})
     sent = injected = in_reserved_range = 0
     status = "complete"
     rows = merged(csv_rows(args.file, layout, args.limit), plan.rows if plan else [])
@@ -180,7 +179,7 @@ def main(argv: list[str] | None = None) -> int:
                 in_reserved_range += 1  # a real vessel the scorer would mistake for a synthetic one
             while True:
                 try:
-                    producer.produce(args.topic, value, key, on_delivery=tracker.on_delivery)
+                    producer.produce(TOPIC, value, key, on_delivery=tracker.on_delivery)
                     break
                 except BufferError:  # local queue full: let librdkafka drain it
                     producer.poll(0.1)
@@ -203,7 +202,7 @@ def main(argv: list[str] | None = None) -> int:
         {
             "run_id": run_id,
             "status": status,
-            "topic": args.topic,
+            "topic": TOPIC,
             "source_file": str(args.file),
             "speed": args.speed,
             "limit": args.limit,
