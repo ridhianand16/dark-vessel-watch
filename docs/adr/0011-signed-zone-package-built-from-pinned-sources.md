@@ -99,3 +99,13 @@ repository ships the builder, the hashes and the public key.
 - Full detail is expensive in the MPA layer: 2.9 million vertices in 2,169 polygons,
   against about 110,000 for the other three layers together. That is fine for PostGIS.
   Before Flink holds zones in broadcast state, it is the first number to look at.
+
+## Note (2026-11-04): the build extracts its sources itself
+
+The pinned hash of a zip source covers the archive, but the cut used to read the files
+that `make fetch-refdata` had unzipped next to it in `incoming/`, and that unzip skips a
+member already present with the same size. An edited or stale extracted file could then
+reach a package whose manifest names the archive's hash. The build now extracts each
+verified archive again into its work directory and cuts from that copy; the tools
+container no longer mounts `incoming/` at all. Package versions do not change: the
+inputs are the same.

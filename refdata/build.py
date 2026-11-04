@@ -6,6 +6,11 @@ Offline: reads only data/refdata/incoming/ (checked against refdata/sources.yaml
 refdata/area.yaml and refdata/package.yaml, and runs GDAL and minisign in the
 refdata-tools container, which has no network.
 
+Only files whose SHA-256 is pinned are read. A zip source is extracted again, into the
+build directory, right after its hash check, and the layers are cut from that copy:
+files left in incoming/ by an earlier unzip are never read, so the package is built from
+exactly the bytes the manifest's source hashes name.
+
 Per layer, ogr2ogr first cuts the source to the package bbox at full detail (-spat
 selects features, -clipsrc cuts their geometry, -makevalid repairs before cutting),
 then a second pass renames columns to the loader's schema and drops anything the cut
@@ -24,6 +29,7 @@ import hashlib
 import json
 import shutil
 import sys
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -33,7 +39,7 @@ import yaml
 from common.env import REPO_ROOT, setting
 from refdata import gpkg, tools
 from refdata.area import BBox, load_config
-from refdata.fetch import Source, load_source, resolve_version, sha256_file, verify
+from refdata.fetch import Source, load_source, resolve_version, sha256_file, unzip, verify
 from refdata.package import (
     FORMAT,
     LATEST,
@@ -68,7 +74,8 @@ class Cut:
     layer: Layer
     source: str
     path: str
-    """Path inside the source's incoming directory: a file name or a sources.yaml member."""
+    """A file or directory name inside the source's archive, as extracted by the build, or
+    work/<file> for a file the build writes itself."""
     src_layer: str
     fields: tuple[str, ...]
     where: str
@@ -150,9 +157,9 @@ def version_of(inputs: dict[str, Any]) -> str:
 
 
 def ogr_cut(cut: Cut, src: str, bbox: BBox, build_dir: Path) -> None:
-    """Cut src into build_dir/<layer>.gpkg. src is a path inside the container (/in or /build)."""
+    """Cut src into build_dir/<layer>.gpkg. src is a path inside the container, under /build."""
     box = [str(v) for v in (bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)]
-    mounts = [tools.Mount(refdata_dir() / "incoming", "/in"), tools.Mount(build_dir, "/build", read_only=False)]
+    mounts = [tools.Mount(build_dir, "/build", read_only=False)]
     env = {"OGR_CURRENT_DATE": FIXED_DATE}
     clip = f"/build/work/{cut.layer.name}.clip.gpkg"
     common = ["-f", "GPKG", "-lco", "GEOMETRY_NAME=geom", "-lco", "SPATIAL_INDEX=NO", "-nlt", cut.layer.geometry]
@@ -217,6 +224,11 @@ def build(key_path: Path, public_key: Path = PUBLIC_KEY) -> Path:
     shutil.rmtree(tmp, ignore_errors=True)
     (tmp / "work").mkdir(parents=True)
     try:
+        extracted = tmp / "work" / "src"
+        for key, source in sources.items():
+            archive = incoming / key / versions[key] / source.file
+            if zipfile.is_zipfile(archive):
+                unzip(archive, extracted / key)
         wpi_dir = incoming / "wpi" / versions["wpi"]
         circles = tmp / "work" / "port_circles.geojson"
         n_ports = write_port_circles(wpi_dir / sources["wpi"].file, circles, bbox, cfg.port_radius_nm)
@@ -227,8 +239,8 @@ def build(key_path: Path, public_key: Path = PUBLIC_KEY) -> Path:
             if cut.path.startswith("work/"):
                 src = f"/build/{cut.path}"
             else:
-                rel = find(incoming / cut.source / versions[cut.source], cut.path).relative_to(incoming)
-                src = f"/in/{rel.as_posix()}"
+                rel = find(extracted / cut.source, cut.path).relative_to(tmp)
+                src = f"/build/{rel.as_posix()}"
             print(f"build: cutting {cut.layer.name} from {cut.src_layer}", file=sys.stderr)
             ogr_cut(cut, src, bbox, tmp)
             out = tmp / f"{cut.layer.name}.gpkg"
