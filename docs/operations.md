@@ -48,7 +48,7 @@ Every image tag is pinned. Each service has a `mem_limit`; the budget and what e
 | `make reconcile-run RUN=<run_id>` | prove zero loss for one run, per partition ([below](#reconciliation)) |
 | `make score RUN=<run_id> WAIT=600` | TP/FP/FN per alert type for a run replayed with `--inject` |
 | `make latency RUN=<run_id>` | replayer send to track sent, to track stored, and to TELEPORT stored |
-| `make zone-check RUN=<run_id>` | a sample of the run's zone tags recomputed in PostGIS |
+| `make zone-check RUN=<run_id>` | a sample of the run's zone tags recomputed in PostGIS; only records tagged with the active package are checked, the others are counted |
 | `make compare-tracks A=<run_id> B=<run_id>` | two runs of the same rows, vessel by vessel |
 | `make backfill-rollups` | fill the rollups from tracks stored before the views existed; safe to repeat, also while the sink runs |
 | `make ttl-demo` | the `ingested_at` TTL deleting rows, on a scratch table |

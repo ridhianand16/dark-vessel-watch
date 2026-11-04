@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from reconcile.zone_check import compare, sample
+from reconcile.zone_check import compare, sample, split_by_package
 
 
 def rec(**kw: Any) -> dict[str, Any]:
@@ -44,3 +44,11 @@ def test_sample_takes_tagged_records_first() -> None:
     picked = sample(records, 10, seed=1)
     assert len(picked) == 10
     assert sum(bool(r["mpa_ids"]) for r in picked) == 3
+
+
+def test_only_records_of_the_active_package_are_checked() -> None:
+    records = [rec(zones_version="zones-new"), rec(zones_version="zones-old"), rec(zones_version="zones-old"),
+               rec(zones_version=None)]  # fmt: skip
+    current, others = split_by_package(records, "zones-new")
+    assert current == [records[0]]
+    assert others == {"zones-old": 2, "None": 1}
