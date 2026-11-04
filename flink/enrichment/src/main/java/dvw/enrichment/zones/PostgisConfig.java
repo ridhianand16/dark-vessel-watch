@@ -41,6 +41,11 @@ public final class PostgisConfig implements Serializable {
         return v == null || v.isBlank() ? fallback : v;
     }
 
+    /** Seconds a read may wait on PostGIS. Without it, a database that stops answering mid-read
+     * blocks the zone source's thread for good; with it the read fails, and the job restarts
+     * and reads the package again. Far above the 0.15 s the read takes (ADR 0017). */
+    static final int SOCKET_TIMEOUT_S = 60;
+
     /**
      * A new connection. Calls the driver directly instead of going through DriverManager:
      * DriverManager only hands out drivers visible to its own classloader, and Flink loads
@@ -52,6 +57,7 @@ public final class PostgisConfig implements Serializable {
         p.setProperty("password", password);
         p.setProperty("ApplicationName", "dvw-flink-zones");
         p.setProperty("connectTimeout", "10");
+        p.setProperty("socketTimeout", Integer.toString(SOCKET_TIMEOUT_S));
         Connection c = new org.postgresql.Driver().connect(url(), p);
         if (c == null) {
             throw new SQLException("PostgreSQL driver refused " + url());
