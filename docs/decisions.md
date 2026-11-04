@@ -25,3 +25,4 @@ Each decision has an Architecture Decision Record in [adr/](adr/) with its conte
 | [0019](adr/0019-tracker-on-enriched-and-dark-gap-zone-condition.md) | The tracker reads `ais.enriched` with `read_committed`, and DARK_GAP's zone condition reads Flink's tags. |
 | [0020](adr/0020-rollups-from-tracks-and-ttl.md) | Rollups use only aggregates a repeated track cannot change, and TTL is measured from `ingested_at`. |
 | [0021](adr/0021-reconciliation-job.md) | One reconciliation job per run waits on committed offsets, checks every stage per partition and stores the verdict. |
+| [0022](adr/0022-flink-restores-newest-retained-state.md) | Every Flink job start restores the newest savepoint or retained checkpoint; fresh only when there is none. |

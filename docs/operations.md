@@ -74,10 +74,10 @@ If a sink or the tracker crashes, Docker restarts it and it re-reads from its la
 
 ```sh
 make flink-savepoint     # stop the job with a savepoint; the sinks commit their last transactions
-make flink-restart       # rebuild, stop with a savepoint if running, start from the newest one
+make flink-restart       # rebuild, stop with a savepoint if running, start from the newest state
 ```
 
-`make flink-up` never replaces a running JobManager, because a session cluster keeps no jobs across a restart. Job code changes go live with `make flink-restart`. The first start reads `ais.raw` from the beginning, because there are no committed offsets yet. Later starts resume from the checkpoint or savepoint. Change `AIS_DAY` only together with `make flink-restart`: the `bad_timestamp` rule is fixed when the job is submitted.
+`make flink-up` never replaces a running JobManager, because a session cluster keeps no jobs across a restart. Job code changes go live with `make flink-restart`. Every start, `make flink-up` included, restores the newest savepoint or retained checkpoint on the `flink-data` volume, and says which ([ADR 0022](adr/0022-flink-restores-newest-retained-state.md)). Only when there is none, on a fresh clone or after `make nuke`, does the job start fresh: from the committed offsets, or from the beginning of `ais.raw`. Change `AIS_DAY` only together with `make flink-restart`: the `bad_timestamp` rule is fixed when the job is submitted.
 
 To run without Flink, set `TRACKER_INPUT_TOPIC=ais.raw` in `.env` and run `make tracker`: tracks work, DARK_GAP does not.
 
