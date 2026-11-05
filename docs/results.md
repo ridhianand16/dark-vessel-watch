@@ -1,5 +1,17 @@
 # Results
 
+## Reports
+
+Each report comes from one command, `make report`, and is written by it: the exact command is at its top, followed by the environment, the faults injected, the reconciliation verdict, exact latency percentiles from ClickHouse, throughput per stage, consumer lag, Flink checkpoint statistics, memory per container, precision and recall, the DLQ by reason and duplicates. How to run one is in [operations.md](operations.md#results-report). Newest first:
+
+<!-- reports:start -->
+- [2026-11-05, `319c8bd`](results/2026-11-05-319c8bd.md): 700,000 rows at 10x, three components killed, reconciliation OK
+<!-- reports:end -->
+
+## Hand-measured, before the report
+
+These were taken by hand, one command at a time, before `make report` existed. They are kept as they were, each with its original command.
+
 Measured on an Apple M1 laptop (8 GB RAM, macOS 26.5), Docker VM with 8 CPUs and 3.9 GB, using the 2026-10-28 DMA day. Dates are when each number was taken. Rows that name `make reconcile` or `make flink-check` were measured with those commands, before the reconciliation job (ADR 0021) replaced both; the job runs the same checks as `raw_stored` and `flink_balance`.
 
 ## Detections

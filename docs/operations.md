@@ -47,7 +47,8 @@ Every image tag is pinned. Each service has a `mem_limit`; the budget and what e
 |---|---|
 | `make reconcile-run RUN=<run_id>` | prove zero loss for one run, per partition ([below](#reconciliation)) |
 | `make score RUN=<run_id> WAIT=600` | TP/FP/FN per alert type for a run replayed with `--inject` |
-| `make latency RUN=<run_id>` | replayer send to track sent, to track stored, and to TELEPORT stored |
+| `make latency RUN=<run_id>` | replayer send to track sent, to track stored, and to stored for alerts raised by a message (all but DARK_GAP) |
+| `make report [ROWS=700000] [CHAOS=1]` | one 10x replay measured end to end, written to `docs/results/` ([below](#results-report)) |
 | `make zone-check RUN=<run_id>` | a sample of the run's zone tags recomputed in PostGIS; only records tagged with the active package are checked, the others are counted |
 | `make compare-tracks A=<run_id> B=<run_id>` | two runs of the same rows, vessel by vessel |
 | `make backfill-rollups` | fill the rollups from tracks stored before the views existed; safe to repeat, also while the sink runs |
@@ -145,6 +146,18 @@ docker kill dvw-flink-taskmanager               # terminal 2, while the replay r
 docker start dvw-flink-taskmanager              # the job restores the last checkpoint
 make reconcile-run RUN=<run_id>                 # still OK on every partition
 ```
+
+## Results report
+
+`make report` replays `ROWS` rows (default 700,000) at 10x and writes `docs/results/<date>-<short sha>.md`, then adds it to the top of the index in [results.md](results.md). The report includes the environment (commit, machine, Docker VM, images, AIS day, zone package), the reconciliation verdict, exact latency percentiles from ClickHouse, throughput per stage, consumer lag, Flink checkpoint statistics, memory per container, precision and recall, the DLQ by reason and duplicates ([ADR 0023](adr/0023-results-report-one-command.md)). It needs the whole stack up and takes 10 to 15 minutes at the default size. Commit first: the report names the commit and says when the tree had uncommitted changes.
+
+```sh
+make report                 # clean run, with the labelled anomalies
+make report CHAOS=1         # also kills the TaskManager, the tracker and the JobManager mid-run
+make report ROWS=20000      # a quick smoke test: no anomalies (they need about 650,000 rows), not scored
+```
+
+With `CHAOS=1` the faults come at 20%, 45% and 70% of the replay, each after the one before has recovered. The TaskManager and the tracker are killed and started again with `docker start`. The JobManager is killed with SIGKILL, not stopped, and recovered with `make flink-up`, which restores the newest checkpoint. A graceful stop would make Flink delete the checkpoints (ADR 0022). The report states which checkpoint each Flink recovery restored. Before replaying, it waits up to 5 minutes for the stack to be steady: the Flink job has run every task for 60 s with checkpoints completing and none failing, and no consumer group lags more than 1,000 records. Otherwise it exits 2 without measuring. On macOS it holds off idle sleep with `caffeinate` while it runs. A run measured right after a laptop wake saw Flink's TaskManager heartbeat time out twice, and the job restart, before any fault was injected. If the Flink job is down outside the injected faults, the report says so in its first paragraph. A report is written even when a check fails; the command then exits 1.
 
 ## Applying a new zone package
 
