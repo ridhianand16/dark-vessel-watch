@@ -5,6 +5,7 @@
 Each report comes from one command, `make report`, and is written by it: the exact command is at its top, followed by the environment, the faults injected, the reconciliation verdict, exact latency percentiles from ClickHouse, throughput per stage, consumer lag, Flink checkpoint statistics, memory per container, precision and recall, the DLQ by reason and duplicates. How to run one is in [operations.md](operations.md#results-report). Newest first:
 
 <!-- reports:start -->
+- [2026-11-05, `319c8bd`](results/2026-11-05-319c8bd.md): 700,000 rows at 10x, three components killed, reconciliation OK
 <!-- reports:end -->
 
 ## Hand-measured, before the report
