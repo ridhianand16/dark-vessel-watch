@@ -29,18 +29,18 @@ Every topic has 6 partitions. Vessel topics are keyed by MMSI; `ais.dedup_counts
 
 ## Results
 
-Measured on an 8 GB Apple M1 laptop, Docker VM with 3.9 GB, on the 2026-10-28 DMA day. Every number, with its date and command, is in [docs/results.md](docs/results.md).
+From one command, `make report CHAOS=1`, at commit `319c8bd` on an 8 GB Apple M1 laptop with a 3.9 GB Docker VM: 700,000 rows of the 2026-10-28 DMA day plus labelled anomalies at 10x. The Flink TaskManager, the tracker and the Flink JobManager were killed one after another partway through. Full report: [docs/results/2026-11-05-319c8bd.md](docs/results/2026-11-05-319c8bd.md); every report and the earlier hand-measured numbers are in [docs/results.md](docs/results.md).
 
 | What | Result |
 |---|---|
-| Zero loss, 10,000 rows at 10x (`make reconcile-run`) | every check OK on all 6 partitions: 10,000 stored = 5,683 enriched + 294 DLQ + 4,023 counted duplicates |
-| Zero loss with the Flink TaskManager and raw sink killed mid-run | same counts as the clean run, every check OK |
-| Flink exactly-once, TaskManager killed mid-run | 103 offsets twice with `read_uncommitted`, none with `read_committed` |
-| Injected anomalies, 700,000 rows at 10x (`make score`) | DARK_GAP 3 / 0 / 0 and TELEPORT 3 / 0 / 0 (TP / FP / FN), 4 decoys silent |
-| End-to-end latency at 10x, replay send to track | p99 3.5 to 5.7 s on 10,000-row runs; 8.2 s over a 700,000-row run, against a 5 s target |
-| Zone tags against PostGIS, 400 records | 0 differing tags; distances within 0.52 m |
-| Throughput, one worker each | tracker about 4,200 records/s; Flink 25,000 to 30,000 messages/s on a backlog |
-| Peak memory, everything running | 2.65 GiB of the 3.9 GiB Docker VM |
+| Zero loss with three components killed (`make reconcile-run`) | every check OK on all 6 partitions: 701,815 produced = 701,815 stored; 413,113 enriched + 4,538 DLQ + 284,164 counted duplicates |
+| Flink recovery | TaskManager failover restored checkpoint 1017; after the JobManager kill, `make flink-up` restored checkpoint 1055 of the killed job |
+| Duplicates after `FINAL` | 0 in raw, tracks and alerts; 24 alerts = 24 distinct `alert_id` |
+| Injected anomalies (`make score`) | DARK_GAP 3 / 0 / 0 and TELEPORT 3 / 0 / 0 (TP / FP / FN), precision and recall 1.00, 4 decoys silent |
+| End-to-end latency, replay send to track stored | p99 171 s for records sent before the first fault, 166 s over the whole run, against a 5 s target: the tracker is the bottleneck |
+| Throughput, one worker each | replay 1,953 records/s; Flink 5,974/s peak while catching up; tracker 575/s average, 3,054/s peak |
+| Flink checkpoints | 228 completed, 13 failed, average 301 ms, max 7.6 s |
+| Peak memory, everything running | 2,861 MiB of the 3.9 GiB Docker VM |
 
 ## Status and limitations
 
