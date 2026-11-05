@@ -39,7 +39,12 @@ twice: `make replay`, `make reconcile-run` (its verdict is read back from
 - **Latency.** Send to track stored, and send to stored for alerts raised by a message.
   DARK_GAP is left out because it is raised by silence. With faults, the report also
   gives track latency for records sent before the first fault, the steady state.
-- **Steady start.** The report replays only once the Flink job has run for 60 s with no failed checkpoint or restore and every group lags less than 1,000 records, and keeps a Mac awake with `caffeinate`. A first full run, started as the laptop woke from sleep, saw the TaskManager's heartbeat time out twice before any fault and measured the recovery instead of the pipeline. Samples where the job is down outside an injected fault are reported as an unplanned restart, and the run counts as failed.
+- **Steady start.** The report replays only once the Flink job has run for 60 s with no
+  failed checkpoint or restore and every group lags less than 1,000 records, and keeps a
+  Mac awake with `caffeinate`. A first full run, started as the laptop woke from sleep,
+  saw the TaskManager's heartbeat time out twice before any fault and measured the
+  recovery instead of the pipeline. Samples where the job is down outside an injected
+  fault are reported as an unplanned restart, and the run counts as failed.
 - A report is written whatever the outcome; a failed check is in it, and the command
   exits 1.
 
