@@ -96,8 +96,10 @@ def flink_recovered(flink: FlinkRest, after_ms: int, old_job: str | None = None)
 def kill_taskmanager(flink: FlinkRest) -> Fault:
     before = flink.running_job()
     log(f"fault: SIGKILL {TASKMANAGER}")
-    docker("kill", TASKMANAGER)
+    # The fault's window opens before the kill, so a sample taken while `docker kill`
+    # runs is inside it and not reported as an unplanned restart.
     f = Fault("taskmanager", time.time(), 0.0, job_before=before)
+    docker("kill", TASKMANAGER)
     time.sleep(DOWN_S["taskmanager"])
     docker("start", TASKMANAGER)
     f.started_at = time.time()
@@ -120,8 +122,8 @@ def kill_taskmanager(flink: FlinkRest) -> Fault:
 def kill_tracker() -> Fault:
     before = rpk_groups([TRACKER_GROUP])[TRACKER_GROUP].consumed
     log(f"fault: SIGKILL {TRACKER}")
-    docker("kill", TRACKER)
     f = Fault("tracker", time.time(), 0.0)
+    docker("kill", TRACKER)
     time.sleep(DOWN_S["tracker"])
     docker("start", TRACKER)
     f.started_at = time.time()
@@ -135,8 +137,8 @@ def kill_tracker() -> Fault:
 def kill_jobmanager(flink: FlinkRest) -> Fault:
     old = flink.running_job()
     log(f"fault: SIGKILL {JOBMANAGER} (job {old})")
-    docker("kill", JOBMANAGER)
     f = Fault("jobmanager", time.time(), 0.0, job_before=old)
+    docker("kill", JOBMANAGER)
     time.sleep(DOWN_S["jobmanager"])
     f.started_at = time.time()
     log("recovering: make flink-up")
