@@ -29,6 +29,8 @@ Every image tag is pinned. Each service has a `mem_limit`; the budget and what e
 | `make console` | Redpanda Console on http://localhost:8080 (256 MB, so not part of `make up`) |
 | `make migrate`, `make migrate-postgis` | apply new files in `sql/clickhouse/` and `sql/postgis/`; no-op when up to date (`make up` runs both) |
 | `make topics` | (re)create the topics; idempotent, fails unless each has 6 partitions |
+| `make observability` | metrics on every service, Prometheus on http://localhost:9090 and the dashboard on http://localhost:3000; restarts the Python services and resubmits the Flink job from a savepoint; about 512 MB more ([deploy.md](deploy.md#observability)) |
+| `make observability-down` | stop Prometheus and Grafana and turn the metrics off again |
 
 **Data and replay**
 
@@ -53,6 +55,7 @@ Every image tag is pinned. Each service has a `mem_limit`; the budget and what e
 | `make backfill-rollups` | fill the rollups from tracks stored before the views existed; safe to repeat, also while the sink runs |
 | `make ttl-demo` | the `ingested_at` TTL deleting rows, on a scratch table |
 | `make test`, `make typecheck` | pytest and the Flink job's JUnit tests (in Docker), and `mypy --strict` |
+| `make validate-deploy` | the deploy kit's CI checks: helm lint, kubeconform, the image list, promtool, the dashboard ([deploy.md](deploy.md#validation-in-ci)); Docker only, online the first time |
 
 **Logs**
 

@@ -108,6 +108,7 @@ make reconcile-run RUN=<run_id>
 - [Data](docs/data.md): sources, licences and attribution, manual downloads, the zone package
 - [Operations](docs/operations.md): make targets, reconciliation, Flink, applying a new zone package
 - [Results](docs/results.md): every measurement, with date and command
+- [Deploy kit](docs/deploy.md): Helm chart for an air-gapped Kubernetes cluster and optional metrics, validated in CI but not run on the laptop
 - [Design decisions](docs/decisions.md): one line per ADR
 
 ## Attribution
