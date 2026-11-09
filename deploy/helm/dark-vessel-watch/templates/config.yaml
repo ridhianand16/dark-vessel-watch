@@ -1,0 +1,34 @@
+# Non-secret settings, read from the environment by common/env.py, the tracker config
+# and the Flink job. Credentials come from the two secrets (dvw.env).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "dvw.name" . }}-env
+  labels: {{- include "dvw.labels" . | nindent 4 }}
+data:
+  REDPANDA_BROKERS: {{ include "dvw.brokers" . | quote }}
+  KAFKA_BROKERS: {{ include "dvw.brokers" . | quote }}
+  CLICKHOUSE_HOST: {{ include "dvw.clickhouseHost" . | quote }}
+  CLICKHOUSE_PORT: {{ .Values.clickhouse.port | quote }}
+  POSTGRES_HOST: {{ include "dvw.postgisHost" . | quote }}
+  POSTGRES_PORT: {{ .Values.postgis.port | quote }}
+  POSTGRES_DB: {{ .Values.postgis.database | quote }}
+  AIS_DAY: {{ .Values.aisDay | quote }}
+  METRICS_PORT: {{ if .Values.observability.enabled }}{{ .Values.observability.metricsPort | quote }}{{ else }}""{{ end }}
+---
+{{- if and .Values.clickhouse.enabled (not .Values.clickhouse.existingSecret) }}
+# Generated once and kept across upgrades (lookup), so an upgrade does not rotate the
+# password under a running ClickHouse. `helm template` (CI) has no cluster and generates one.
+{{- $name := include "dvw.clickhouseSecret" . }}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace $name }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}
+  labels: {{- include "dvw.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+type: Opaque
+data:
+  password: {{ if $existing }}{{ index $existing.data "password" }}{{ else }}{{ randAlphaNum 32 | b64enc }}{{ end }}
+{{- end }}

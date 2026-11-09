@@ -1,0 +1,130 @@
+{{- /* Run on every install and upgrade, in weight order: topics, then schema migrations,
+       then (optionally) the zone package. All are idempotent: topics are created
+       --if-not-exists and checked, migrations skip what schema_migrations records, and
+       loading the active package again is a no-op swap. The databases come up alongside
+       these hooks, so a Job retries (backoffLimit) until they accept connections. */}}
+{{- if .Values.jobs.initTopics.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "dvw.name" . }}-init-topics
+  labels: {{- include "dvw.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 10
+  template:
+    metadata:
+      labels: {{- include "dvw.labels" . | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: init-topics
+          image: {{ include "dvw.image" (list . "redpanda") }}
+          command: ["/bin/bash", "-euo", "pipefail", "-c"]
+          # Same checks as init-topics in deploy/compose/docker-compose.yml.
+          args:
+            - |
+              export RPK_BROKERS={{ include "dvw.brokers" . }}
+              {{- if .Values.bundle.redpanda }}
+              export RPK_ADMIN_HOSTS={{ .Values.redpanda.fullnameOverride }}.{{ .Release.Namespace }}.svc.cluster.local:9644
+              {{- end }}
+              tx_max=$(rpk cluster config get transaction_max_timeout_ms)
+              if [ "$tx_max" -lt {{ .Values.kafka.minTransactionMaxTimeoutMs }} ]; then
+                echo "ERROR: transaction_max_timeout_ms is $tx_max ms, the Flink job needs at least {{ .Values.kafka.minTransactionMaxTimeoutMs }}" >&2; exit 1
+              fi
+              TOPICS="{{ join " " .Values.kafka.topics }}"
+              rpk topic create $TOPICS --partitions {{ .Values.kafka.partitions }} --replicas {{ .Values.kafka.replicas }} --if-not-exists
+              for t in $TOPICS; do
+                n=$(rpk topic describe "$t" --print-partitions | tail -n +2 | grep -c .)
+                if [ "$n" -ne {{ .Values.kafka.partitions }} ]; then
+                  echo "ERROR: $t has $n partitions, expected {{ .Values.kafka.partitions }}" >&2; exit 1
+                fi
+              done
+          resources: {{- include "dvw.resources" (list "128Mi" "100m") | nindent 12 }}
+{{- end }}
+{{- if .Values.jobs.migrate.enabled }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "dvw.name" . }}-migrate
+  labels: {{- include "dvw.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "-5"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 10
+  template:
+    metadata:
+      labels: {{- include "dvw.labels" . | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      securityContext: {{- include "dvw.podSecurity" . | nindent 8 }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # ClickHouse first, then PostGIS, as `make migrate migrate-postgis`.
+      initContainers:
+        - name: migrate-clickhouse
+          image: {{ include "dvw.image" (list . "jobs") }}
+          args: ["sql.migrate", "--target", "clickhouse"]
+          envFrom: {{- include "dvw.envFrom" . | nindent 12 }}
+          env: {{- include "dvw.env" . | nindent 12 }}
+          resources: {{- include "dvw.resources" (list .Values.jobs.migrate.memory "250m") | nindent 12 }}
+          securityContext: {{- include "dvw.containerSecurity" . | nindent 12 }}
+      containers:
+        - name: migrate-postgis
+          image: {{ include "dvw.image" (list . "jobs") }}
+          args: ["sql.migrate", "--target", "postgis"]
+          envFrom: {{- include "dvw.envFrom" . | nindent 12 }}
+          env: {{- include "dvw.env" . | nindent 12 }}
+          resources: {{- include "dvw.resources" (list .Values.jobs.migrate.memory "250m") | nindent 12 }}
+          securityContext: {{- include "dvw.containerSecurity" . | nindent 12 }}
+{{- end }}
+{{- with .Values.jobs.refdataLoad }}
+{{- if .enabled }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "dvw.name" $ }}-refdata-load
+  labels: {{- include "dvw.labels" $ | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels: {{- include "dvw.labels" $ | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      securityContext: {{- include "dvw.podSecurity" $ | nindent 8 }}
+      {{- with $.Values.global.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        # Verifies the signature and every checksum, then loads through the staging schema
+        # and activates it (ADR 0010, 0011). A package that fails verification is not loaded.
+        - name: refdata-load
+          image: {{ include "dvw.image" (list $ "jobs") }}
+          args: ["refdata", "load"{{ with .package }}, "--package", "/data/refdata/{{ . }}"{{ end }}]
+          envFrom: {{- include "dvw.envFrom" $ | nindent 12 }}
+          env: {{- include "dvw.env" $ | nindent 12 }}
+          resources: {{- include "dvw.resources" (list .memory "500m") | nindent 12 }}
+          securityContext: {{- include "dvw.containerSecurity" $ | nindent 12 }}
+          volumeMounts:
+            - { name: refdata, mountPath: /data/refdata, readOnly: true }
+      volumes:
+        - name: refdata
+          persistentVolumeClaim: { claimName: {{ $.Values.data.refdataClaim }}, readOnly: true }
+{{- end }}
+{{- end }}

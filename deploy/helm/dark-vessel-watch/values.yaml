@@ -1,0 +1,214 @@
+# Dark Vessel Watch chart. Defaults mirror the Compose stack: one worker per service and
+# the same memory limits as the compose mem_limits (deploy/compose/docker-compose.yml).
+# values-local.yaml and values-prod.yaml override what differs per environment.
+
+# Every image is pulled from this registry. In an air-gapped cluster it is the local
+# mirror that deploy/images.txt was copied into.
+global:
+  imageRegistry: ""        # e.g. registry.internal:5000; empty = the names as written below
+  imagePullSecrets: []
+
+images:
+  sinks: dvw-sinks:0.4.0
+  tracker: dvw-tracker:0.1.0
+  jobs: dvw-jobs:0.1.0
+  flink: dvw-flink:0.1.0
+  redpanda: redpandadata/redpanda:v26.2.6       # init-topics Job (rpk)
+  clickhouse: clickhouse/clickhouse-server:24.8.14.39
+  postgis: ghcr.io/cloudnative-pg/postgis:16-3.4-86
+pullPolicy: IfNotPresent
+
+# The AIS day the Flink job validates event times against (AIS_DAY in .env).
+aisDay: "2026-10-28"
+
+kafka:
+  # Bootstrap servers. Empty = the bundled Redpanda subchart's internal service.
+  brokers: ""
+  partitions: 6               # never change without an ADR (ADR 0001)
+  replicas: 1
+  # The Flink job's transactions time out after 10 min; the broker must allow 15 (ADR 0014).
+  minTransactionMaxTimeoutMs: 900000
+  topics: [ais.raw, ais.enriched, ais.tracks, ais.alerts, ais.dlq, ais.dedup_counts]
+
+# Our long-running services, one Deployment each. resources.limits.memory equals the
+# compose mem_limit; requests equal limits so the scheduler reserves what Compose caps.
+services:
+  raw-sink:
+    image: sinks
+    args: ["raw"]
+    memory: 384Mi
+    cpu: 500m
+  tracks-alerts-sink:
+    image: sinks
+    args: ["alerts", "tracks"]
+    memory: 320Mi
+    cpu: 500m
+  vessels-sink:
+    image: sinks
+    command: ["python", "-m", "sinks.postgis_vessels"]
+    args: []
+    memory: 192Mi
+    cpu: 250m
+  tracker:
+    image: tracker
+    memory: 512Mi
+    cpu: "1"
+    env:
+      TRACKER_INPUT_TOPIC: ais.enriched
+    # RocksDB is a local copy of the changelog topic, rebuilt on start, so an emptyDir is
+    # correct; a PVC only shortens the rebuild.
+    stateVolume:
+      sizeLimit: 2Gi
+    # One worker per consumer group at a time: RocksDB is single-writer.
+    strategy: Recreate
+terminationGracePeriodSeconds: 30   # compose stop_grace_period
+
+# Our ClickHouse, as an Altinity ClickHouseInstallation (operator installed separately).
+clickhouse:
+  enabled: true
+  # Set host to use an existing ClickHouse instead (enabled: false).
+  host: ""
+  port: 8123
+  user: dvw
+  # Secret with key `password`. Created with a random password when empty.
+  existingSecret: ""
+  memory: 1280Mi
+  cpu: "2"
+  storage: 50Gi
+  storageClass: ""
+
+# PostGIS, as a CloudNativePG Cluster (operator installed separately).
+postgis:
+  enabled: true
+  host: ""                    # existing PostgreSQL when enabled: false
+  port: 5432
+  database: dvw
+  owner: dvw
+  # CloudNativePG creates <cluster>-app with keys username and password; for an external
+  # database name a secret with the same keys.
+  existingSecret: ""
+  instances: 1
+  memory: 512Mi
+  cpu: "1"
+  storage: 10Gi
+  storageClass: ""
+
+# The Flink enrichment job, as a FlinkDeployment (Flink Kubernetes Operator, installed
+# separately). Application mode: the job's main() runs in the JobManager.
+flink:
+  enabled: true
+  serviceAccount: flink
+  createRbac: true
+  parallelism: 4
+  checkpointInterval: 3s      # also fixed in EnrichmentJob (ADR 0014)
+  jobManager: { memory: 768m, cpu: 1 }
+  taskManager: { memory: 1280m, cpu: 2, slots: 4 }
+  # Checkpoints, savepoints and HA metadata. Must be shared by JobManager and TaskManager
+  # pods (ReadWriteMany: NFS, CephFS), since object storage is not assumed in the air gap.
+  stateStorage:
+    size: 20Gi
+    storageClass: ""
+    accessMode: ReadWriteMany
+  upgradeMode: savepoint
+
+# Input files, provided out of band (copied into the cluster by the operator).
+data:
+  # PVC holding aisdk-<day>.csv (read by the replay Job).
+  aisClaim: dvw-ais
+  # PVC holding packages/<version>/ zone packages (read by the refdata Job).
+  refdataClaim: dvw-refdata
+  # PVC for data/runs/<run_id>/: written by replay, read by reconcile-run. Created here.
+  runs:
+    size: 1Gi
+    storageClass: ""
+    accessMode: ReadWriteMany
+
+jobs:
+  # Hooks on every install and upgrade: topics, then ClickHouse and PostGIS migrations.
+  initTopics: { enabled: true }
+  migrate: { enabled: true, memory: 256Mi }
+  # Load and activate a zone package from data.refdataClaim (verified first).
+  refdataLoad:
+    enabled: false
+    package: ""               # packages/<version>; empty = packages/LATEST
+    memory: 512Mi
+  # One replay. Set enabled and runName per run; the run_id is chosen by the replayer.
+  replay:
+    enabled: false
+    runName: ""
+    speed: 10
+    limit: 0                  # 0 = the whole day
+    inject: true              # mix in the labelled anomalies
+    memory: 512Mi
+  # Reconcile one run (make reconcile-run): exits 1 on a failed check.
+  reconcile:
+    enabled: false
+    runId: ""
+    timeout: 600
+    memory: 512Mi
+
+# Off by default. On: METRICS_PORT on our services, the Flink Prometheus reporter,
+# PodMonitors for our pods, Flink and ClickHouse, the dashboard as a Grafana ConfigMap,
+# and the kube-prometheus-stack subchart.
+observability:
+  enabled: false
+  metricsPort: 9108
+  scrapeInterval: 15s
+
+# Bundled Redpanda (subchart). Set bundle.redpanda false and kafka.brokers to use an
+# existing cluster. (The flag lives outside `redpanda:`, whose schema allows no `enabled`.)
+bundle:
+  redpanda: true
+
+redpanda:
+  fullnameOverride: redpanda
+  image:
+    repository: redpandadata/redpanda
+    tag: v26.2.6
+  statefulset:
+    replicas: 1
+  tls:
+    enabled: false
+  external:
+    enabled: false
+  console:
+    enabled: false
+  resources:
+    cpu:
+      cores: 1
+      overprovisioned: true
+    # Compose: --memory=512M inside a 768m mem_limit. The chart's 2.5Gi default is a
+    # production recommendation; setting redpanda.memory turns off its 80% calculation.
+    memory:
+      container:
+        max: 768Mi
+      redpanda:
+        memory: 512Mi
+        reserveMemory: 200Mi
+  storage:
+    persistentVolume:
+      enabled: true
+      size: 20Gi
+  config:
+    cluster:
+      transaction_max_timeout_ms: 900000
+      enable_consumer_group_metrics: [group, partition, consumer_lag]
+  monitoring:
+    enabled: false
+
+kube-prometheus-stack:
+  fullnameOverride: kps
+  alertmanager:
+    enabled: false
+  grafana:
+    sidecar:
+      dashboards:
+        enabled: true
+        label: grafana_dashboard
+        searchNamespace: ALL
+  prometheus:
+    prometheusSpec:
+      # Pick up the PodMonitors in this release without extra labels.
+      podMonitorSelectorNilUsesHelmValues: false
+      serviceMonitorSelectorNilUsesHelmValues: false
+      retention: 7d

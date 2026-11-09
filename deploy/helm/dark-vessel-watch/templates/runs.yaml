@@ -1,0 +1,112 @@
+{{- /* One replay and its reconciliation (make replay, make reconcile-run). Not hooks: they
+       run once per values change. A run's name is part of the Job name, so each run is a
+       new Job; set jobs.replay.runName for each replay. */}}
+{{- $replay := .Values.jobs.replay }}
+{{- $rec := .Values.jobs.reconcile }}
+{{- if or $replay.enabled $rec.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "dvw.name" . }}-runs
+  labels: {{- include "dvw.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep   # each run's produced.json is the reconciliation's input
+spec:
+  accessModes: [{{ .Values.data.runs.accessMode }}]
+  {{- with .Values.data.runs.storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests: { storage: {{ .Values.data.runs.size }} }
+{{- end }}
+{{- if $replay.enabled }}
+{{- if not $replay.runName }}{{ fail "jobs.replay.runName is required when jobs.replay.enabled" }}{{ end }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "dvw.name" . }}-replay-{{ $replay.runName }}
+  labels: {{- include "dvw.labels" . | nindent 4 }}
+spec:
+  # A replay is not retried: a second attempt would be a second run with a new run_id.
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: {{- include "dvw.labels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      securityContext: {{- include "dvw.podSecurity" . | nindent 8 }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: replay
+          image: {{ include "dvw.image" (list . "jobs") }}
+          args:
+            - ingest.replayer
+            - --file
+            - /data/ais/aisdk-{{ .Values.aisDay }}.csv
+            - --speed
+            - {{ $replay.speed | quote }}
+            - --runs-dir
+            - /runs
+            {{- if $replay.limit }}
+            - --limit
+            - {{ $replay.limit | quote }}
+            {{- end }}
+            {{- if $replay.inject }}
+            - --inject
+            - /app/ingest/replayer/anomalies.yaml
+            {{- end }}
+          envFrom: {{- include "dvw.envFrom" . | nindent 12 }}
+          resources: {{- include "dvw.resources" (list $replay.memory "1") | nindent 12 }}
+          securityContext: {{- include "dvw.containerSecurity" . | nindent 12 }}
+          volumeMounts:
+            - { name: ais, mountPath: /data/ais, readOnly: true }
+            - { name: runs, mountPath: /runs }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: ais
+          persistentVolumeClaim: { claimName: {{ .Values.data.aisClaim }}, readOnly: true }
+        - name: runs
+          persistentVolumeClaim: { claimName: {{ include "dvw.name" . }}-runs }
+        - name: tmp
+          emptyDir: {}
+{{- end }}
+{{- if $rec.enabled }}
+{{- if not $rec.runId }}{{ fail "jobs.reconcile.runId is required when jobs.reconcile.enabled" }}{{ end }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "dvw.name" . }}-reconcile-{{ $rec.runId | lower | trunc 40 | trimSuffix "-" }}
+  labels: {{- include "dvw.labels" . | nindent 4 }}
+spec:
+  # Exit 1 is a failed check, not a crash: do not retry it into a different verdict.
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: {{- include "dvw.labels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      securityContext: {{- include "dvw.podSecurity" . | nindent 8 }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: reconcile
+          image: {{ include "dvw.image" (list . "jobs") }}
+          args: ["reconcile.job", {{ $rec.runId | quote }}, "--runs-dir", "/runs", "--timeout", {{ $rec.timeout | quote }}]
+          envFrom: {{- include "dvw.envFrom" . | nindent 12 }}
+          env: {{- include "dvw.env" . | nindent 12 }}
+          resources: {{- include "dvw.resources" (list $rec.memory "500m") | nindent 12 }}
+          securityContext: {{- include "dvw.containerSecurity" . | nindent 12 }}
+          volumeMounts:
+            - { name: runs, mountPath: /runs, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: runs
+          persistentVolumeClaim: { claimName: {{ include "dvw.name" . }}-runs }
+        - name: tmp
+          emptyDir: {}
+{{- end }}

@@ -1,0 +1,36 @@
+{{- if .Values.postgis.enabled }}
+# PostgreSQL 16 with PostGIS 3.4, managed by CloudNativePG (installed per cluster, ADR
+# 0024). The operator creates the <cluster>-rw service and the <cluster>-app secret
+# (username, password) the services read. Tables come from the migrate Job (sql/postgis).
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: {{ include "dvw.postgisCluster" . }}
+  labels: {{- include "dvw.labels" . | nindent 4 }}
+spec:
+  instances: {{ .Values.postgis.instances }}
+  imageName: {{ include "dvw.image" (list . "postgis") }}
+  {{- with .Values.global.imagePullSecrets }}
+  imagePullSecrets: {{- toYaml . | nindent 4 }}
+  {{- end }}
+  bootstrap:
+    initdb:
+      database: {{ .Values.postgis.database }}
+      owner: {{ .Values.postgis.owner }}
+      # As deploy/compose/postgis-init/20-extensions.sql.
+      postInitApplicationSQL:
+        - CREATE EXTENSION IF NOT EXISTS postgis
+  postgresql:
+    parameters:
+      # Sized for the 512Mi limit, as the Compose container's defaults are.
+      shared_buffers: 128MB
+      max_connections: "50"
+  resources: {{- include "dvw.resources" (list .Values.postgis.memory .Values.postgis.cpu) | nindent 4 }}
+  storage:
+    size: {{ .Values.postgis.storage }}
+    {{- with .Values.postgis.storageClass }}
+    storageClass: {{ . }}
+    {{- end }}
+  monitoring:
+    enablePodMonitor: {{ .Values.observability.enabled }}
+{{- end }}

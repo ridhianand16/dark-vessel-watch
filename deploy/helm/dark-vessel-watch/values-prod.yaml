@@ -1,0 +1,41 @@
+# A self-managed, air-gapped cluster. Images come from the local mirror (deploy/images.txt),
+# brokers and PostGIS are replicated, and metrics are on. Memory per pod stays at the
+# Compose limits; the pipeline scales by partitions, not by bigger pods (README).
+global:
+  imageRegistry: registry.internal:5000
+
+kafka:
+  replicas: 3
+
+redpanda:
+  image:
+    repository: registry.internal:5000/redpandadata/redpanda
+  statefulset:
+    replicas: 3
+  storage:
+    persistentVolume:
+      size: 200Gi
+  monitoring:
+    enabled: true
+
+postgis:
+  instances: 2          # a primary and a streaming replica; CloudNativePG fails over
+  storage: 50Gi
+
+clickhouse:
+  storage: 500Gi
+
+flink:
+  stateStorage:
+    size: 100Gi
+    accessMode: ReadWriteMany
+
+observability:
+  enabled: true
+
+kube-prometheus-stack:
+  global:
+    imageRegistry: registry.internal:5000
+  prometheus:
+    prometheusSpec:
+      retention: 30d

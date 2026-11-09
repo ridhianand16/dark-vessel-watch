@@ -1,0 +1,61 @@
+{{- if .Values.observability.enabled }}
+# Scrape targets for the Prometheus Operator (kube-prometheus-stack): the same endpoints
+# as deploy/observability/prometheus.yml. Redpanda's ServiceMonitor comes from its chart
+# (redpanda.monitoring.enabled), PostGIS's PodMonitor from CloudNativePG.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "dvw.name" . }}-pipeline
+  labels: {{- include "dvw.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      dvw.io/metrics: python
+  podMetricsEndpoints:
+    - port: metrics
+      interval: {{ .Values.observability.scrapeInterval }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "dvw.name" . }}-flink
+  labels: {{- include "dvw.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      dvw.io/metrics: flink
+  podMetricsEndpoints:
+    - port: metrics
+      interval: {{ .Values.observability.scrapeInterval }}
+{{- if .Values.clickhouse.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "dvw.name" . }}-clickhouse
+  labels: {{- include "dvw.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/name: clickhouse
+  podMetricsEndpoints:
+    - port: metrics
+      interval: {{ .Values.observability.scrapeInterval }}
+{{- end }}
+---
+# Picked up by Grafana's dashboard sidecar (label grafana_dashboard). The JSON is the one
+# Compose provisions: deploy/observability/dashboards, linked into files/.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "dvw.name" . }}-dashboard
+  labels:
+    {{- include "dvw.labels" . | nindent 4 }}
+    grafana_dashboard: "1"
+data:
+  dark-vessel-watch.json: |-
+    {{- .Files.Get "files/dashboards/dark-vessel-watch.json" | nindent 4 }}
+{{- end }}

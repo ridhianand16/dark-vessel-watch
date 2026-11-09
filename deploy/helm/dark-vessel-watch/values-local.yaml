@@ -1,0 +1,33 @@
+# A single-node cluster on one machine (kind, k3s, OrbStack's Kubernetes): the Compose
+# layout, one replica of everything, images loaded into the node instead of a registry.
+# Same memory as Compose; observability off.
+pullPolicy: Never
+
+kafka:
+  replicas: 1
+
+postgis:
+  instances: 1
+  storage: 5Gi
+
+clickhouse:
+  storage: 20Gi
+
+flink:
+  # Single node: both Flink pods land on it, so a ReadWriteOnce volume is enough.
+  stateStorage:
+    accessMode: ReadWriteOnce
+    size: 5Gi
+
+data:
+  runs:
+    accessMode: ReadWriteOnce
+
+redpanda:
+  statefulset:
+    replicas: 1
+  storage:
+    persistentVolume:
+      size: 10Gi
+  tuning:
+    tune_aio_events: false   # no privileged tuning container on a laptop node

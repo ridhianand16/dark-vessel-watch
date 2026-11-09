@@ -33,3 +33,6 @@ CLAUDE.md
 PROBLEM_STATEMENT.md
 docs/SETUP.md
 docs/design/
+
+# Vendored Helm dependencies: `helm dependency build` recreates them from Chart.lock
+deploy/helm/*/charts/

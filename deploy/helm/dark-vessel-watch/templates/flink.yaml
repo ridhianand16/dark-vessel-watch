@@ -1,0 +1,131 @@
+{{- if .Values.flink.enabled }}
+{{- $state := printf "%s-flink-state" (include "dvw.name" .) }}
+# The enrichment job as a FlinkDeployment (Flink Kubernetes Operator, installed per
+# cluster, ADR 0024). Application mode: one JobManager runs the job's main(), which reads
+# KAFKA_BROKERS, AIS_DAY and POSTGRES_* and waits for an active zone package (ADR 0018).
+#
+# upgradeMode savepoint: on an upgrade or spec change the operator stops the job with a
+# savepoint and starts the new one from it, the same as `make flink-restart`, so the Kafka
+# sinks commit their last transactions and nothing is repeated or skipped (ADR 0014, 0022).
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: {{ include "dvw.name" . }}-enrichment
+  labels: {{- include "dvw.labels" . | nindent 4 }}
+spec:
+  image: {{ include "dvw.image" (list . "flink") }}
+  imagePullPolicy: {{ .Values.pullPolicy }}
+  flinkVersion: v1_20
+  serviceAccount: {{ .Values.flink.serviceAccount }}
+  # Same settings as FLINK_PROPERTIES in deploy/compose/docker-compose.yml.
+  flinkConfiguration:
+    taskmanager.numberOfTaskSlots: {{ .Values.flink.taskManager.slots | quote }}
+    taskmanager.memory.managed.fraction: "0.1"
+    state.backend.type: hashmap
+    execution.checkpointing.interval: {{ .Values.flink.checkpointInterval }}
+    execution.checkpointing.mode: EXACTLY_ONCE
+    state.checkpoints.dir: file:///flink-data/checkpoints
+    state.savepoints.dir: file:///flink-data/savepoints
+    state.checkpoints.num-retained: "3"
+    execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+    restart-strategy.type: fixed-delay
+    restart-strategy.fixed-delay.attempts: "2147483647"
+    restart-strategy.fixed-delay.delay: 5 s
+    heartbeat.timeout: "20000"
+    # Unlike the Compose session cluster, the JobManager is highly available: its pointer to
+    # the latest checkpoint survives a JobManager restart, in ConfigMaps plus this directory.
+    high-availability.type: kubernetes
+    high-availability.storageDir: file:///flink-data/ha
+    {{- if .Values.observability.enabled }}
+    metrics.reporters: prom
+    metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+    metrics.reporter.prom.port: "9249"
+    {{- end }}
+  jobManager:
+    # The process size; the operator sets the pod limit to it, as Compose's mem_limit.
+    resource: { memory: {{ .Values.flink.jobManager.memory | quote }}, cpu: {{ .Values.flink.jobManager.cpu }} }
+  taskManager:
+    resource: { memory: {{ .Values.flink.taskManager.memory | quote }}, cpu: {{ .Values.flink.taskManager.cpu }} }
+  podTemplate:
+    metadata:
+      labels:
+        {{- include "dvw.labels" . | nindent 8 }}
+        dvw.io/metrics: flink
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        fsGroup: 9999   # the flink user, so it can write the state volume
+      containers:
+        - name: flink-main-container
+          envFrom: {{- include "dvw.envFrom" . | nindent 12 }}
+          env: {{- include "dvw.env" . | nindent 12 }}
+          {{- if .Values.observability.enabled }}
+          ports:
+            - { name: metrics, containerPort: 9249 }
+          {{- end }}
+          volumeMounts:
+            - { name: flink-data, mountPath: /flink-data }
+      volumes:
+        - name: flink-data
+          persistentVolumeClaim:
+            claimName: {{ $state }}
+  job:
+    jarURI: local:///opt/dvw/enrichment.jar
+    parallelism: {{ .Values.flink.parallelism }}
+    upgradeMode: {{ .Values.flink.upgradeMode }}
+    state: running
+    allowNonRestoredState: false
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $state }}
+  labels: {{- include "dvw.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep   # never delete the job's state with the release
+spec:
+  accessModes: [{{ .Values.flink.stateStorage.accessMode }}]
+  {{- with .Values.flink.stateStorage.storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests: { storage: {{ .Values.flink.stateStorage.size }} }
+{{- if .Values.flink.createRbac }}
+---
+# The JobManager creates TaskManager pods and keeps HA state in ConfigMaps.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.flink.serviceAccount }}
+  labels: {{- include "dvw.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "dvw.name" . }}-flink
+  labels: {{- include "dvw.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [pods, configmaps, services]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [apps]
+    resources: [deployments, deployments/finalizers]
+    verbs: [get, list, watch, create, update, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "dvw.name" . }}-flink
+  labels: {{- include "dvw.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "dvw.name" . }}-flink
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.flink.serviceAccount }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- end }}

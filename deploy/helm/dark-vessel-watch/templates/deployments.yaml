@@ -1,0 +1,70 @@
+{{- /* The sinks and the tracker: one Deployment and one replica each, as in Compose
+       (ADR 0008). Delivery does not depend on the pod: each commits offsets only after its
+       write, so a rescheduled pod re-reads at most one batch and the stores dedup it. */}}
+{{- range $name, $svc := .Values.services }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "dvw.name" $ }}-{{ $name }}
+  labels:
+    {{- include "dvw.labels" $ | nindent 4 }}
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/component: pipeline
+spec:
+  replicas: 1
+  strategy:
+    type: {{ $svc.strategy | default "RollingUpdate" }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+      app.kubernetes.io/name: {{ $name }}
+  template:
+    metadata:
+      labels:
+        {{- include "dvw.labels" $ | nindent 8 }}
+        app.kubernetes.io/name: {{ $name }}
+        app.kubernetes.io/component: pipeline
+        dvw.io/metrics: python
+      annotations:
+        checksum/env: {{ include (print $.Template.BasePath "/config.yaml") $ | sha256sum }}
+    spec:
+      {{- with $.Values.global.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ $.Values.terminationGracePeriodSeconds }}
+      securityContext: {{- include "dvw.podSecurity" $ | nindent 8 }}
+      containers:
+        - name: {{ $name }}
+          image: {{ include "dvw.image" (list $ $svc.image) }}
+          imagePullPolicy: {{ $.Values.pullPolicy }}
+          {{- with $svc.command }}
+          command: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          args: {{- toYaml $svc.args | nindent 12 }}
+          envFrom: {{- include "dvw.envFrom" $ | nindent 12 }}
+          env:
+            {{- include "dvw.env" $ | nindent 12 }}
+            {{- range $k, $v := $svc.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          {{- if $.Values.observability.enabled }}
+          ports:
+            - { name: metrics, containerPort: {{ $.Values.observability.metricsPort }} }
+          {{- end }}
+          resources: {{- include "dvw.resources" (list $svc.memory $svc.cpu) | nindent 12 }}
+          securityContext: {{- include "dvw.containerSecurity" $ | nindent 12 }}
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+            {{- if $svc.stateVolume }}
+            - { name: state, mountPath: /data }
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 64Mi }
+        {{- with $svc.stateVolume }}
+        - name: state
+          emptyDir: { sizeLimit: {{ .sizeLimit }} }
+        {{- end }}
+{{- end }}

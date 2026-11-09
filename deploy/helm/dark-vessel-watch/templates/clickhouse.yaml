@@ -1,0 +1,58 @@
+{{- if .Values.clickhouse.enabled }}
+# One ClickHouse server, managed by the Altinity ClickHouse operator (installed per cluster,
+# ADR 0024). The operator renders the server config, a StatefulSet and the service
+# clickhouse-<name>. Tables come from the migrate Job (sql/clickhouse), not from here.
+apiVersion: clickhouse.altinity.com/v1
+kind: ClickHouseInstallation
+metadata:
+  name: {{ include "dvw.name" . }}
+  labels: {{- include "dvw.labels" . | nindent 4 }}
+spec:
+  configuration:
+    users:
+      {{ .Values.clickhouse.user }}/k8s_secret_password: {{ .Release.Namespace }}/{{ include "dvw.clickhouseSecret" . }}/password
+      {{ .Values.clickhouse.user }}/networks/ip: ["::/0"]
+      {{ .Values.clickhouse.user }}/profile: default
+      {{ .Values.clickhouse.user }}/access_management: 1
+    settings:
+      # Built-in /metrics, as in Compose (deploy/compose/clickhouse-config/prometheus.xml).
+      prometheus/endpoint: /metrics
+      prometheus/port: 9363
+      prometheus/metrics: true
+      prometheus/events: true
+      prometheus/asynchronous_metrics: true
+    clusters:
+      - name: dvw
+        layout: { shardsCount: 1, replicasCount: 1 }
+  defaults:
+    templates:
+      podTemplate: clickhouse
+      dataVolumeClaimTemplate: data
+  templates:
+    podTemplates:
+      - name: clickhouse
+        metadata:
+          labels:
+            {{- include "dvw.labels" . | nindent 12 }}
+            app.kubernetes.io/name: clickhouse
+        spec:
+          {{- with .Values.global.imagePullSecrets }}
+          imagePullSecrets: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: clickhouse
+              image: {{ include "dvw.image" (list . "clickhouse") }}
+              # ClickHouse sizes its caches from the cgroup limit (90% of it), as in Compose.
+              resources: {{- include "dvw.resources" (list .Values.clickhouse.memory .Values.clickhouse.cpu) | nindent 16 }}
+              ports:
+                - { name: metrics, containerPort: 9363 }
+    volumeClaimTemplates:
+      - name: data
+        spec:
+          accessModes: [ReadWriteOnce]
+          {{- with .Values.clickhouse.storageClass }}
+          storageClassName: {{ . }}
+          {{- end }}
+          resources:
+            requests: { storage: {{ .Values.clickhouse.storage }} }
+{{- end }}

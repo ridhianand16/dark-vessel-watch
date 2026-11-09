@@ -1,0 +1,24 @@
+apiVersion: v2
+name: dark-vessel-watch
+description: >-
+  Dark Vessel Watch on Kubernetes: the sinks and the tracker as Deployments, schema
+  migrations, zone package load, replay and reconciliation as Jobs, and custom resources
+  for the ClickHouse, CloudNativePG and Flink operators. Validated in CI, not run on the
+  development laptop (docs/deploy.md).
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+
+# Pinned and optional. `helm dependency build` fetches exactly these versions (Chart.lock
+# holds their digests) into charts/, which is how they are vendored for an air-gapped
+# install. The operators (Altinity ClickHouse, CloudNativePG, Flink Kubernetes Operator) are
+# not dependencies: they are cluster-scoped and installed once per cluster (ADR 0024).
+dependencies:
+  - name: redpanda
+    version: 26.2.5
+    repository: https://charts.redpanda.com
+    condition: bundle.redpanda
+  - name: kube-prometheus-stack
+    version: 92.17.1
+    repository: https://prometheus-community.github.io/helm-charts
+    condition: observability.enabled
