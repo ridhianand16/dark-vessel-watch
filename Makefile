@@ -1,6 +1,6 @@
 COMPOSE := docker compose -f deploy/compose/docker-compose.yml --env-file .env
 
-.PHONY: hooks up down nuke topics ps console observability observability-down fetch fetch-refdata area refdata refdata-image refdata-key refdata-build refdata-verify refdata-load replay migrate migrate-postgis sink sink-logs tracks-alerts-sink tracks-alerts-sink-logs vessels-sink vessels-sink-logs tracker tracker-logs reconcile-run score flink-up flink-savepoint flink-restart flink-logs compare-tracks latency backfill-rollups ttl-demo test test-py test-flink typecheck
+.PHONY: hooks up down nuke topics ps console observability observability-down fetch fetch-refdata area refdata refdata-image refdata-key refdata-build refdata-verify refdata-load replay migrate migrate-postgis sink sink-logs tracks-alerts-sink tracks-alerts-sink-logs vessels-sink vessels-sink-logs tracker tracker-logs reconcile-run score flink-up flink-savepoint flink-restart flink-logs compare-tracks latency backfill-rollups ttl-demo test test-py test-flink typecheck validate-deploy
 
 .env:
 	@echo "Missing .env. Run: cp .env.example .env" >&2; exit 1
@@ -251,6 +251,41 @@ latency: .env
 	uv run python -m reconcile.latency $(RUN)
 
 PY_DIRS := common ingest refdata sql sinks reconcile stream
+
+## Check the deploy kit (deploy/helm, deploy/observability, deploy/images.txt) the way CI
+## does, with every tool in a pinned container: no helm, kubeconform or promtool on the
+## host. Online the first time (images, chart dependencies). Runs nothing on a cluster.
+CHART := deploy/helm/dark-vessel-watch
+HELM_RUN := docker run --rm -u $(shell id -u):$(shell id -g) -e HOME=/tmp -v $(CURDIR):/w -w /w/$(CHART)
+HELM := $(HELM_RUN) alpine/helm:3.19.0
+KUBECONFORM := docker run --rm -i ghcr.io/yannh/kubeconform:v0.7.0 -strict -summary -kubernetes-version 1.31.0 \
+	-schema-location default \
+	-schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/6ab3493622cd387923a2d0da5234f53e80e1bd28/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+PROMTOOL := docker run --rm -v $(CURDIR)/deploy/observability:/o:ro --entrypoint promtool prom/prometheus:v3.15.1
+# Every option on, so every template and every image is rendered.
+CHART_ALL := --set observability.enabled=true --set redpanda.monitoring.enabled=true \
+	--set jobs.refdataLoad.enabled=true --set jobs.replay.enabled=true --set jobs.replay.runName=ci \
+	--set jobs.reconcile.enabled=true --set jobs.reconcile.runId=ci
+VALUES_FILES := values-local.yaml values-prod.yaml
+validate-deploy:
+	$(HELM_RUN) --entrypoint sh alpine/helm:3.19.0 -c 'helm repo add redpanda https://charts.redpanda.com >/dev/null && \
+		helm repo add prometheus-community https://prometheus-community.github.io/helm-charts >/dev/null && \
+		helm dependency build'
+	@for v in $(VALUES_FILES); do \
+		echo "== helm lint and kubeconform: $$v"; \
+		$(HELM) lint --strict . -f $$v || exit 1; \
+		$(HELM) template dvw . -n dvw -f $$v | $(KUBECONFORM) - || exit 1; \
+	done
+	@echo "== kubeconform: every option on"
+	$(HELM) template dvw . -n dvw $(CHART_ALL) | $(KUBECONFORM) -
+	@echo "== every rendered image is in deploy/images.txt"
+	@$(HELM) template dvw . -n dvw $(CHART_ALL) \
+		| sed -nE 's/^[[:space:]]*-?[[:space:]]*(image|imageName):[[:space:]]*"?([^"[:space:]]+)"?.*/\2/p' | sort -u \
+		| while read -r img; do grep -qxF "$$img" deploy/images.txt || { echo "missing from deploy/images.txt: $$img" >&2; exit 1; }; done
+	@echo "== promtool"
+	$(PROMTOOL) check config /o/prometheus.yml
+	@echo "== dashboard JSON"
+	python3 -c "import json, sys; [json.load(open(f)) for f in sys.argv[1:]]; print('ok')" deploy/observability/dashboards/*.json
 
 test: test-py test-flink
 

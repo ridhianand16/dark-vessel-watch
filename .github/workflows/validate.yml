@@ -1,0 +1,50 @@
+# Checks that need no cluster and no AIS data: the deploy kit renders and validates, the
+# Python code type-checks and its unit tests pass. The deploy kit is validated here only;
+# it is not run on the development laptop (docs/deploy.md). Same commands as locally.
+name: validate
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-kit:
+    name: helm lint, kubeconform, images, promtool, dashboard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      # helm, kubeconform and promtool run from pinned images (Makefile: validate-deploy).
+      - run: make validate-deploy
+
+  jobs-image:
+    name: jobs image builds
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f deploy/docker/jobs.Dockerfile -t dvw-jobs:ci .
+      - name: every Job entry point starts
+        run: |
+          for m in sql.migrate refdata ingest.replayer reconcile.job; do
+            docker run --rm dvw-jobs:ci "$m" --help >/dev/null
+          done
+
+  python:
+    name: make test-py and make typecheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.13.6"
+      - run: uv sync --frozen
+      # Tests that need the local stack (PostGIS, the refdata-tools image) skip without it;
+      # the settings reader still wants a .env.
+      - run: cp .env.example .env
+      - run: make test-py
+      - run: make typecheck

@@ -21,4 +21,7 @@ dependencies:
   - name: kube-prometheus-stack
     version: 92.17.1
     repository: https://prometheus-community.github.io/helm-charts
-    condition: observability.enabled
+    # The first path that is set wins: kube-prometheus-stack.enabled=false keeps the
+    # monitors and dashboard (observability.enabled) on a cluster that already runs the
+    # Prometheus Operator.
+    condition: kube-prometheus-stack.enabled,observability.enabled

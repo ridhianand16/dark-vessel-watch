@@ -1,0 +1,53 @@
+# Every image the deploy kit needs, for mirroring into an air-gapped registry.
+# One reference per line; `grep -v '^#' deploy/images.txt | grep .` gives the plain list.
+# CI renders the chart with every option on and fails if it uses an image missing here.
+#
+# Mirror with any registry copy tool, e.g.:
+#   grep -v '^#' deploy/images.txt | grep . | while read -r img; do
+#     skopeo copy --all "docker://$img" "docker://registry.internal:5000/${img#*/}"; done
+# then install with values-prod.yaml (global.imageRegistry: registry.internal:5000).
+
+# Built from this repository (docker compose build; deploy/docker/jobs.Dockerfile).
+# Not on any public registry: push them to the mirror directly.
+dvw-sinks:0.4.0
+dvw-tracker:0.1.0
+dvw-flink:0.1.0
+dvw-jobs:0.1.0
+
+# Stores and broker, as in Compose.
+redpandadata/redpanda:v26.2.6
+docker.redpanda.com/redpandadata/redpanda-operator:v26.2.5
+clickhouse/clickhouse-server:24.8.14.39
+ghcr.io/cloudnative-pg/postgis:16-3.4-86
+
+# Operators, installed once per cluster (docs/deploy.md, ADR 0024).
+altinity/clickhouse-operator:0.27.4
+altinity/metrics-exporter:0.27.4
+ghcr.io/cloudnative-pg/cloudnative-pg:1.30.1
+apache/flink-kubernetes-operator:1.16.1
+
+# Observability (observability.enabled=true): kube-prometheus-stack 92.17.1.
+quay.io/prometheus-operator/prometheus-operator:v0.94.2
+quay.io/prometheus-operator/prometheus-config-reloader:v0.94.2
+quay.io/prometheus/prometheus:v3.15.1-distroless
+quay.io/prometheus/node-exporter:v1.12.1-distroless
+registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.20.0
+docker.io/grafana/grafana:13.3.0-distroless
+quay.io/kiwigrid/k8s-sidecar:2.14.3
+ghcr.io/jkroepke/kube-webhook-certgen:1.11.0
+
+# Only for `helm test` (the Grafana subchart's test pod).
+docker.io/bats/bats:1.14.0
+
+# Compose only (the local stack), not used by the chart.
+redpandadata/console:v3.13.1
+postgis/postgis:16-3.4
+prom/prometheus:v3.15.1
+grafana/grafana:13.2.5
+
+# Base images for building ours inside the air gap (every FROM in the repo). The Maven
+# build also needs its dependency cache; build dvw-flink outside and push the result.
+python:3.12.16-slim-bookworm
+flink:1.20.5-scala_2.12-java17
+maven:3.10.0-eclipse-temurin-17
+ghcr.io/osgeo/gdal:ubuntu-small-3.13.1
